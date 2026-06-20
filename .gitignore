@@ -1,0 +1,58 @@
+# Python virtual environment (venv at repo root)
+bin/
+lib/
+lib64/
+include/
+share/
+pyvenv.cfg
+.venv/
+venv/
+ENV/
+env/
+
+# Python build / cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# AWS SAM build output
+.aws-sam/
+samconfig.toml
+
+# Terraform / OpenTofu
+.terraform/
+# .terraform.lock.hcl is intentionally committed (pins provider versions + checksums).
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local tooling
+.claude/
+
+# Generated test corpus (regenerate with docs/fixtures/generate_test_corpus.py).
+# Excluded because it contains zip bombs (~1 MB each) and the EICAR string that some
+# scanners flag. The generator + runner + MANIFEST are committed.
+docs/test-corpus/clean/
+docs/test-corpus/adversarial/

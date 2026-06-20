@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# pre-push hook — block force-pushes (and deletions) to the protected branch(es).
+#
+# A client-side stand-in for server-side branch protection, which GitHub does not offer on
+# free private repos (see docs/00-production-readiness-index.md Known Gap #6). It only
+# protects the clone it is installed in — install it with: ./scripts/install-hooks.sh
+#
+# git invokes this with the remote name + URL as $1/$2 and feeds one line per ref on stdin:
+#   <local ref> <local sha> <remote ref> <remote sha>
+# We block a push to a protected branch when it is a DELETION or a NON-fast-forward
+# (i.e. a force-push that would rewrite history). Normal fast-forward pushes pass through.
+
+set -euo pipefail
+
+PROTECTED_BRANCHES="main"
+ZERO="0000000000000000000000000000000000000000"
+
+blocked=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # Identify the branch being updated on the remote (e.g. refs/heads/main -> main).
+  branch="${remote_ref#refs/heads/}"
+
+  # Only police the protected branches.
+  case " $PROTECTED_BRANCHES " in
+    *" $branch "*) ;;
+    *) continue ;;
+  esac
+
+  if [ "$local_sha" = "$ZERO" ]; then
+    echo "pre-push: BLOCKED — deleting the protected branch '$branch' is not allowed." >&2
+    blocked=1
+    continue
+  fi
+
+  if [ "$remote_sha" != "$ZERO" ]; then
+    # A force-push rewrites history: the remote tip is NOT an ancestor of what we're pushing.
+    # merge-base --is-ancestor returns 0 when remote_sha IS an ancestor (a safe fast-forward).
+    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+      echo "pre-push: BLOCKED — force-push (non-fast-forward) to protected branch '$branch'." >&2
+      echo "          This would rewrite history on the remote. If you are certain, bypass with:" >&2
+      echo "            git push --no-verify ...   (or unset/edit scripts/hooks/pre-push)" >&2
+      blocked=1
+    fi
+  fi
+done
+
+[ "$blocked" -eq 0 ] || exit 1
+exit 0

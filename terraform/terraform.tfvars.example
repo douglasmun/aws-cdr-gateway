@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars and fill in. Bucket names must be globally unique.
+
+aws_region            = "us-east-1"
+source_bucket_name    = "cdr-prod-source-<acct-or-org>"
+sanitised_bucket_name = "cdr-prod-sanitised-<acct-or-org>"
+
+# Optional — leave as "" to disable quarantine (no quarantine bucket is created).
+quarantine_bucket_name = "cdr-prod-quarantine-<acct-or-org>"
+
+# Optional tuning (defaults shown).
+# cdr_max_file_bytes             = 104857600   # 100 MB
+# cdr_max_entry_bytes            = 209715200   # 200 MB
+# lambda_memory_mb               = 1024
+# lambda_timeout_seconds         = 300
+# reserved_concurrent_executions = 20
+# enable_xray_tracing            = true
+# lambda_architecture            = "x86_64"    # or "arm64" — must match scripts/build.sh wheels
+
+# Path to the built Lambda package (produced by scripts/build.sh).
+# lambda_zip_path = "../build/lambda.zip"

@@ -1,0 +1,86 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: this workflow only reads the repo and uploads an artifact (which uses
+# the Actions API, not token write scope). No need for the default broader token.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Python 3.12 matches the Lambda runtime in src/template.yaml and the pinned
+    # pikepdf/Pillow wheels. Bump both together if the runtime changes.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/requirements.txt
+          pip install pytest
+
+      - name: Byte-compile (lint)
+        run: |
+          python -m py_compile \
+            src/lambda_function.py \
+            docs/benchmark.py \
+            docs/fixtures/generate_fixtures.py
+
+      - name: Run tests
+        working-directory: src
+        run: pytest test_cdr.py -v
+
+  build-package:
+    # Verify the Lambda deployment package builds with Linux wheels. Runs on Linux so the
+    # manylinux wheels are the native platform; catches dependency/packaging breakage.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build Lambda package
+        run: ./scripts/build.sh
+
+      - name: Check the package contains the handler and Linux binaries
+        run: |
+          # -Z1 lists bare archive paths one per line; -x matches the whole line so the
+          # handler check
+          unzip -Z1 build/lambda.zip | grep -qx "lambda_function.py"
+          # At least one cp312 x86_64 Linux shared object must be present.
+          unzip -Z1 build/lambda.zip | grep -q "cpython-312-x86_64-linux-gnu\.so$"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lambda-zip
+          path: build/lambda.zip
+          if-no-files-found: error

@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Keep the SHA-pinned GitHub Actions current (Dependabot bumps the pin + the # vX
+  # comment together, so pinning to a SHA stays low-maintenance).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+
+  # Surface CVE bumps for the Python deps. Note: build.sh installs from the hash-pinned
+  # scripts/lambda-requirements.txt; regenerate that file's hashes when bumping versions.
+  - package-ecosystem: pip
+    directory: "/src"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps

@@ -1,0 +1,24 @@
+# Hash-pinned, fully-resolved dependency set for the CDR Lambda package.
+# Used by scripts/build.sh with `pip install --require-hashes`, which forces every
+# package (including transitive deps) to match a known sha256 — a supply-chain guard.
+#
+# Targets the x86_64 / cp312 / manylinux_2_28 wheels (glibc 2.28; the Lambda python3.12
+# runtime is Amazon Linux 2023 / glibc 2.34, so these run). pikepdf 10.x dropped the older
+# manylinux2014 wheels, hence 2.28. If you switch the Lambda to arm64
+# (manylinux_2_28_aarch64), or bump a version, REGENERATE this file — wheel hashes differ
+# per platform and version:
+#   python3 -m pip install --dry-run \
+#     --platform manylinux_2_28_x86_64 --python-version 312 --implementation cp \
+#     --only-binary=:all: --target /tmp/x --report /tmp/r.json \
+#     pikepdf==10.9.1 Pillow==12.2.0 pyxlsb==1.0.10 openpyxl==3.1.5
+#   then read each package's download_info.archive_info.hashes.sha256 from /tmp/r.json.
+#
+# boto3 is intentionally absent — it is already in the Lambda runtime.
+
+pikepdf==10.9.1 --hash=sha256:3836fc0547af990a2b8a37cda63526ef095dd36b4599cf28cda070a9994241ef
+Pillow==12.2.0 --hash=sha256:62f5409336adb0663b7caa0da5c7d9e7bdbaae9ce761d34669420c2a801b2780
+pyxlsb==1.0.10 --hash=sha256:87c122a9a622e35ca5e741d2e541201d28af00fb46bec492cfa9586890b120b4
+openpyxl==3.1.5 --hash=sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2
+lxml==6.1.1 --hash=sha256:ebe6af670449830d6d9b752c256a983291c766a1365ba5d5460048f9e33a7818
+et_xmlfile==2.0.0 --hash=sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa
+packaging==26.2 --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e

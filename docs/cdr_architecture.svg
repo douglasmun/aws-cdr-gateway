@@ -1,0 +1,256 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 1020" width="900" height="1020" font-family="'Segoe UI', Arial, sans-serif">
+
+  <!-- Background -->
+  <rect width="900" height="1020" fill="#0f1117" rx="12"/>
+
+  <!-- ── TITLE ─────────────────────────────────────────────────────────────── -->
+  <text x="450" y="42" text-anchor="middle" font-size="17" font-weight="700" fill="#e2e8f0" letter-spacing="0.5">CDR Lambda — Content Disarmament &amp; Reconstruction</text>
+  <text x="450" y="62" text-anchor="middle" font-size="11" fill="#64748b">EventBridge fan-out · S3 ObjectCreated trigger</text>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       ROW 1 — Source Bucket
+  ══════════════════════════════════════════════════════════════════════════ -->
+
+  <!-- Shadow -->
+  <rect x="312" y="88" width="278" height="72" rx="10" fill="#1e293b" opacity="0.6"/>
+  <!-- Card -->
+  <rect x="308" y="84" width="278" height="72" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <!-- Icon area -->
+  <rect x="308" y="84" width="48" height="72" rx="10" fill="#0ea5e9" opacity="0.15"/>
+  <!-- S3 bucket icon -->
+  <ellipse cx="332" cy="108" rx="12" ry="5" fill="none" stroke="#0ea5e9" stroke-width="1.8"/>
+  <rect x="320" y="108" width="24" height="18" fill="none" stroke="#0ea5e9" stroke-width="1.8"/>
+  <ellipse cx="332" cy="126" rx="12" ry="5" fill="none" stroke="#0ea5e9" stroke-width="1.8"/>
+  <!-- Text -->
+  <text x="366" y="107" font-size="13" font-weight="700" fill="#e2e8f0">S3 Source Bucket</text>
+  <text x="366" y="124" font-size="10" fill="#94a3b8">upload-bucket / * (all prefixes)</text>
+  <text x="366" y="142" font-size="10" fill="#64748b">ObjectCreated: PutObject · CompleteMultipartUpload (Copy excluded)</text>
+
+  <!-- ── FLOW LABEL: EventBridge notification ── -->
+  <line x1="447" y1="156" x2="447" y2="194" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="447,197 442,186 452,186" fill="#0ea5e9"/>
+  <rect x="354" y="163" width="187" height="18" rx="4" fill="#0f172a"/>
+  <text x="448" y="175" text-anchor="middle" font-size="10" fill="#0ea5e9">① EventBridge notification enabled on bucket</text>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       ROW 2 — Amazon EventBridge
+  ══════════════════════════════════════════════════════════════════════════ -->
+
+  <rect x="312" y="198" width="278" height="72" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <rect x="312" y="198" width="48" height="72" rx="10" fill="#a855f7" opacity="0.15"/>
+  <!-- EventBridge icon (simplified bus) -->
+  <rect x="320" y="216" width="22" height="14" rx="3" fill="none" stroke="#a855f7" stroke-width="1.8"/>
+  <line x1="331" y1="230" x2="331" y2="240" stroke="#a855f7" stroke-width="1.8"/>
+  <circle cx="331" cy="243" r="3" fill="#a855f7"/>
+  <text x="370" y="221" font-size="13" font-weight="700" fill="#e2e8f0">Amazon EventBridge</text>
+  <text x="370" y="236" font-size="10" fill="#94a3b8">Rule: source = aws.s3</text>
+  <text x="370" y="250" font-size="10" fill="#64748b">detail-type = "Object Created"</text>
+  <text x="370" y="264" font-size="9" fill="#64748b">reason: PutObject · CompleteMultipartUpload</text>
+
+  <!-- ── Fan-out arrows ── -->
+  <!-- Left arrow to CDR -->
+  <line x1="360" y1="270" x2="210" y2="334" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="208,337 204,324 216,327" fill="#14b8a6"/>
+  <!-- Right arrow to Malware -->
+  <line x1="534" y1="270" x2="688" y2="334" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="690,337 680,327 692,324" fill="#f59e0b"/>
+
+  <!-- Flow label left -->
+  <rect x="248" y="284" width="96" height="18" rx="4" fill="#0f172a"/>
+  <text x="296" y="296" text-anchor="middle" font-size="10" fill="#14b8a6">② async invoke</text>
+  <!-- Flow label right -->
+  <rect x="556" y="284" width="96" height="18" rx="4" fill="#0f172a"/>
+  <text x="604" y="296" text-anchor="middle" font-size="10" fill="#f59e0b">② async invoke</text>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       ROW 3 — Two Lambda functions (parallel)
+  ══════════════════════════════════════════════════════════════════════════ -->
+
+  <!-- ── LEFT: CDR Lambda ── -->
+  <rect x="68" y="338" width="282" height="140" rx="10" fill="#1e293b" stroke="#14b8a6" stroke-width="1.5"/>
+  <rect x="68" y="338" width="282" height="32" rx="10" fill="#14b8a6" opacity="0.18"/>
+  <!-- Lambda λ icon -->
+  <text x="88" y="360" font-size="15" font-weight="900" fill="#14b8a6">λ</text>
+  <text x="106" y="360" font-size="12" font-weight="700" fill="#e2e8f0">CDR Lambda</text>
+  <text x="88" y="380" font-size="10" fill="#94a3b8">Strip active / executable content</text>
+
+  <!-- Sub-items -->
+  <!-- Office -->
+  <rect x="80" y="390" width="126" height="36" rx="6" fill="#0f172a" stroke="#1e40af" stroke-width="1"/>
+  <text x="143" y="404" text-anchor="middle" font-size="9" font-weight="700" fill="#60a5fa">OFFICE (docx xlsx pptx)</text>
+  <text x="143" y="416" text-anchor="middle" font-size="8.5" fill="#64748b">macros · OLE · ext links</text>
+  <text x="143" y="427" text-anchor="middle" font-size="8" fill="#334155">zipfile + ElementTree</text>
+
+  <!-- PDF -->
+  <rect x="214" y="390" width="126" height="36" rx="6" fill="#0f172a" stroke="#7c3aed" stroke-width="1"/>
+  <text x="277" y="404" text-anchor="middle" font-size="9" font-weight="700" fill="#a78bfa">PDF</text>
+  <text x="277" y="416" text-anchor="middle" font-size="8.5" fill="#64748b">JS · OpenAction · Launch</text>
+  <text x="277" y="427" text-anchor="middle" font-size="8" fill="#334155">pikepdf</text>
+
+  <!-- Image -->
+  <rect x="80" y="432" width="260" height="34" rx="6" fill="#0f172a" stroke="#0e7490" stroke-width="1"/>
+  <text x="210" y="446" text-anchor="middle" font-size="9" font-weight="700" fill="#22d3ee">IMAGE (jpg png gif bmp tiff webp)</text>
+  <text x="210" y="458" text-anchor="middle" font-size="8.5" fill="#64748b">EXIF · ICC profile · XMP → re-encode via Pillow</text>
+
+  <!-- ── RIGHT: Malware Scan Lambda ── -->
+  <rect x="548" y="338" width="282" height="140" rx="10" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5"/>
+  <rect x="548" y="338" width="282" height="32" rx="10" fill="#f59e0b" opacity="0.18"/>
+  <text x="568" y="360" font-size="15" font-weight="900" fill="#f59e0b">λ</text>
+  <text x="586" y="360" font-size="12" font-weight="700" fill="#e2e8f0">Malware Scan Lambda</text>
+  <text x="568" y="380" font-size="10" fill="#94a3b8">AV engine — detect known threats</text>
+
+  <!-- Engine options -->
+  <rect x="560" y="390" width="120" height="36" rx="6" fill="#0f172a" stroke="#b45309" stroke-width="1"/>
+  <text x="620" y="403" text-anchor="middle" font-size="9" font-weight="700" fill="#fbbf24">ClamAV Layer</text>
+  <text x="620" y="415" text-anchor="middle" font-size="8.5" fill="#64748b">Lambda Layer + S3 sigs</text>
+  <text x="620" y="426" text-anchor="middle" font-size="8" fill="#334155">cold start ~4 s</text>
+
+  <rect x="690" y="390" width="128" height="36" rx="6" fill="#0f172a" stroke="#b45309" stroke-width="1"/>
+  <text x="754" y="403" text-anchor="middle" font-size="9" font-weight="700" fill="#fbbf24">GuardDuty</text>
+  <text x="754" y="415" text-anchor="middle" font-size="8.5" fill="#64748b">Managed / no Lambda</text>
+  <text x="754" y="426" text-anchor="middle" font-size="8" fill="#334155">tag: MalwareScanStatus</text>
+
+  <rect x="560" y="432" width="258" height="34" rx="6" fill="#0f172a" stroke="#b45309" stroke-width="1"/>
+  <text x="689" y="446" text-anchor="middle" font-size="9" font-weight="700" fill="#fbbf24">External API (VirusTotal / Opswat)</text>
+  <text x="689" y="458" text-anchor="middle" font-size="8.5" fill="#64748b">HTTP call · 60+ AV engines · fastest cold start</text>
+
+  <!-- ── Converge arrows to Result Aggregator ── -->
+  <line x1="209" y1="478" x2="320" y2="554" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="322,557 313,545 325,545" fill="#e2e8f0"/>
+  <line x1="689" y1="478" x2="578" y2="554" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="576,557 576,545 588,545" fill="#e2e8f0"/>
+
+  <!-- Flow labels -->
+  <rect x="218" y="500" width="116" height="18" rx="4" fill="#0f172a"/>
+  <text x="276" y="512" text-anchor="middle" font-size="10" fill="#94a3b8">③ CDR result payload</text>
+  <rect x="566" y="500" width="116" height="18" rx="4" fill="#0f172a"/>
+  <text x="624" y="512" text-anchor="middle" font-size="10" fill="#94a3b8">③ scan result payload</text>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       ROW 4 — Result Aggregator Lambda
+  ══════════════════════════════════════════════════════════════════════════ -->
+
+  <rect x="248" y="558" width="404" height="72" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <rect x="248" y="558" width="404" height="32" rx="10" fill="#64748b" opacity="0.2"/>
+  <text x="268" y="580" font-size="15" font-weight="900" fill="#94a3b8">λ</text>
+  <text x="290" y="580" font-size="12" font-weight="700" fill="#e2e8f0">Result Aggregator Lambda</text>
+  <text x="268" y="600" font-size="10" fill="#94a3b8">Waits for both CDR + scan results · decides routing</text>
+  <text x="268" y="614" font-size="10" fill="#64748b">Step Functions Express WF (alt) · DynamoDB latch · SQS dedup</text>
+
+  <!-- ── Branch arrows from aggregator ── -->
+  <!-- Left: clean -->
+  <line x1="340" y1="630" x2="168" y2="690" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="165,692 162,679 174,682" fill="#22c55e"/>
+  <!-- Centre: CDR sanitised -->
+  <line x1="450" y1="630" x2="450" y2="690" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="450,693 444,680 456,680" fill="#3b82f6"/>
+  <!-- Right: malicious -->
+  <line x1="560" y1="630" x2="732" y2="690" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="735,692 726,682 738,679" fill="#ef4444"/>
+
+  <!-- Flow labels -->
+  <rect x="186" y="640" width="60" height="18" rx="4" fill="#0f172a"/>
+  <text x="216" y="652" text-anchor="middle" font-size="10" fill="#22c55e">④ clean</text>
+  <rect x="416" y="640" width="68" height="18" rx="4" fill="#0f172a"/>
+  <text x="450" y="652" text-anchor="middle" font-size="10" fill="#3b82f6">④ sanitised</text>
+  <rect x="654" y="640" width="72" height="18" rx="4" fill="#0f172a"/>
+  <text x="690" y="652" text-anchor="middle" font-size="10" fill="#ef4444">④ malicious</text>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       ROW 5 — Three destination buckets
+  ══════════════════════════════════════════════════════════════════════════ -->
+
+  <!-- CLEAN bucket -->
+  <rect x="62" y="694" width="212" height="72" rx="10" fill="#1e293b" stroke="#22c55e" stroke-width="1.5"/>
+  <rect x="62" y="694" width="44" height="72" rx="10" fill="#22c55e" opacity="0.15"/>
+  <ellipse cx="84" cy="716" rx="10" ry="4" fill="none" stroke="#22c55e" stroke-width="1.6"/>
+  <rect x="74" y="716" width="20" height="16" fill="none" stroke="#22c55e" stroke-width="1.6"/>
+  <ellipse cx="84" cy="732" rx="10" ry="4" fill="none" stroke="#22c55e" stroke-width="1.6"/>
+  <text x="114" y="716" font-size="11" font-weight="700" fill="#e2e8f0">Clean Bucket</text>
+  <text x="114" y="732" font-size="9" fill="#94a3b8">clean-files-bucket</text>
+  <text x="114" y="748" font-size="9" fill="#64748b">tag: cdr-status=clean</text>
+
+  <!-- SANITISED bucket -->
+  <rect x="338" y="694" width="224" height="72" rx="10" fill="#1e293b" stroke="#3b82f6" stroke-width="1.5"/>
+  <rect x="338" y="694" width="44" height="72" rx="10" fill="#3b82f6" opacity="0.15"/>
+  <ellipse cx="360" cy="716" rx="10" ry="4" fill="none" stroke="#3b82f6" stroke-width="1.6"/>
+  <rect x="350" y="716" width="20" height="16" fill="none" stroke="#3b82f6" stroke-width="1.6"/>
+  <ellipse cx="360" cy="732" rx="10" ry="4" fill="none" stroke="#3b82f6" stroke-width="1.6"/>
+  <text x="390" y="716" font-size="11" font-weight="700" fill="#e2e8f0">Sanitised Bucket</text>
+  <text x="390" y="732" font-size="9" fill="#94a3b8">sanitised-files-bucket</text>
+  <text x="390" y="748" font-size="9" fill="#64748b">tag: cdr-status=sanitised · cdr-removals=N</text>
+
+  <!-- QUARANTINE bucket -->
+  <rect x="626" y="694" width="212" height="72" rx="10" fill="#1e293b" stroke="#ef4444" stroke-width="1.5"/>
+  <rect x="626" y="694" width="44" height="72" rx="10" fill="#ef4444" opacity="0.15"/>
+  <ellipse cx="648" cy="716" rx="10" ry="4" fill="none" stroke="#ef4444" stroke-width="1.6"/>
+  <rect x="638" y="716" width="20" height="16" fill="none" stroke="#ef4444" stroke-width="1.6"/>
+  <ellipse cx="648" cy="732" rx="10" ry="4" fill="none" stroke="#ef4444" stroke-width="1.6"/>
+  <text x="678" y="716" font-size="11" font-weight="700" fill="#e2e8f0">Quarantine Bucket</text>
+  <text x="678" y="732" font-size="9" fill="#94a3b8">quarantine-bucket</text>
+  <text x="678" y="748" font-size="9" fill="#64748b">delete original · SNS alert</text>
+
+  <!-- ── Converge to Audit row ── -->
+  <line x1="168" y1="766" x2="340" y2="828" stroke="#334155" stroke-width="1.2" stroke-dasharray="3,3"/>
+  <line x1="450" y1="766" x2="450" y2="828" stroke="#334155" stroke-width="1.2" stroke-dasharray="3,3"/>
+  <line x1="732" y1="766" x2="560" y2="828" stroke="#334155" stroke-width="1.2" stroke-dasharray="3,3"/>
+  <polygon points="341,831 333,818 345,819" fill="#64748b"/>
+  <polygon points="450,831 444,818 456,818" fill="#64748b"/>
+  <polygon points="559,831 555,819 567,818" fill="#64748b"/>
+
+  <!-- Flow label -->
+  <rect x="368" y="788" width="164" height="18" rx="4" fill="#0f172a"/>
+  <text x="450" y="800" text-anchor="middle" font-size="10" fill="#64748b">⑤ write tags + emit log</text>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       ROW 6 — Audit / Observability
+  ══════════════════════════════════════════════════════════════════════════ -->
+
+  <rect x="100" y="832" width="700" height="68" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <rect x="100" y="832" width="700" height="28" rx="10" fill="#334155" opacity="0.4"/>
+  <text x="450" y="850" text-anchor="middle" font-size="11" font-weight="700" fill="#e2e8f0">Audit &amp; Observability</text>
+
+  <!-- Three audit components -->
+  <rect x="114" y="864" width="196" height="28" rx="6" fill="#0f172a"/>
+  <text x="212" y="876" text-anchor="middle" font-size="9" font-weight="600" fill="#94a3b8">S3 Object Tags</text>
+  <text x="212" y="887" text-anchor="middle" font-size="8.5" fill="#64748b">cdr-status · cdr-timestamp · cdr-removals</text>
+
+  <rect x="326" y="864" width="248" height="28" rx="6" fill="#0f172a"/>
+  <text x="450" y="876" text-anchor="middle" font-size="9" font-weight="600" fill="#94a3b8">CloudWatch Logs + Alarms</text>
+  <text x="450" y="887" text-anchor="middle" font-size="8.5" fill="#64748b">Lambda errors · p99 duration · throttles</text>
+
+  <rect x="590" y="864" width="196" height="28" rx="6" fill="#0f172a"/>
+  <text x="688" y="876" text-anchor="middle" font-size="9" font-weight="600" fill="#94a3b8">SNS Result Topic</text>
+  <text x="688" y="887" text-anchor="middle" font-size="8.5" fill="#64748b">CDR report · malware alert · error events</text>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       LEGEND
+  ══════════════════════════════════════════════════════════════════════════ -->
+  <rect x="100" y="914" width="700" height="90" rx="10" fill="#1e293b" stroke="#1e293b" stroke-width="1"/>
+  <text x="450" y="932" text-anchor="middle" font-size="10" font-weight="700" fill="#64748b" letter-spacing="1">LEGEND</text>
+
+  <!-- Lambda -->
+  <rect x="120" y="940" width="80" height="24" rx="5" fill="#0f172a" stroke="#14b8a6" stroke-width="1.2"/>
+  <text x="160" y="956" text-anchor="middle" font-size="9" fill="#14b8a6">CDR Lambda</text>
+  <rect x="214" y="940" width="80" height="24" rx="5" fill="#0f172a" stroke="#f59e0b" stroke-width="1.2"/>
+  <text x="254" y="956" text-anchor="middle" font-size="9" fill="#f59e0b">Scan Lambda</text>
+  <rect x="308" y="940" width="80" height="24" rx="5" fill="#0f172a" stroke="#22c55e" stroke-width="1.2"/>
+  <text x="348" y="956" text-anchor="middle" font-size="9" fill="#22c55e">Clean bucket</text>
+  <rect x="402" y="940" width="80" height="24" rx="5" fill="#0f172a" stroke="#3b82f6" stroke-width="1.2"/>
+  <text x="442" y="956" text-anchor="middle" font-size="9" fill="#3b82f6">Sanitised bucket</text>
+  <rect x="496" y="940" width="80" height="24" rx="5" fill="#0f172a" stroke="#ef4444" stroke-width="1.2"/>
+  <text x="536" y="956" text-anchor="middle" font-size="9" fill="#ef4444">Quarantine</text>
+  <rect x="590" y="940" width="80" height="24" rx="5" fill="#0f172a" stroke="#a855f7" stroke-width="1.2"/>
+  <text x="630" y="956" text-anchor="middle" font-size="9" fill="#a855f7">EventBridge</text>
+  <rect x="684" y="940" width="100" height="24" rx="5" fill="#0f172a" stroke="#64748b" stroke-width="1.2"/>
+  <text x="734" y="956" text-anchor="middle" font-size="9" fill="#94a3b8">Aggregator</text>
+
+  <!-- Flow line legend -->
+  <line x1="120" y1="984" x2="200" y2="984" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="202,984 193,979 193,989" fill="#94a3b8"/>
+  <text x="214" y="988" font-size="9" fill="#64748b">async event / data flow</text>
+
+  <text x="450" y="1010" text-anchor="middle" font-size="9" fill="#334155">github.com/douglasmun/aws-cdr-gateway · Python 3.12 · pikepdf · Pillow · SAM / OpenTofu</text>
+
+</svg>

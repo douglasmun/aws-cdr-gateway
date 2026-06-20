@@ -1,0 +1,367 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: CDR Lambda — Content Disarmament and Reconstruction
+
+Parameters:
+  SourceBucketName:
+    Type: String
+  SanitisedBucketName:
+    Type: String
+  QuarantineBucketName:
+    Type: String
+    Default: ""
+  CdrMaxFileBytes:
+    Type: Number
+    Default: 104857600   # 100 MB
+    Description: Pre-download size limit; files larger than this are quarantined without CDR
+  CdrMaxEntryBytes:
+    Type: Number
+    Default: 209715200   # 200 MB
+    Description: Per-ZIP-entry decompression bomb limit
+
+Conditions:
+  QuarantineEnabled: !Not [!Equals [!Ref QuarantineBucketName, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 300          # pikepdf on large PDFs can be slow; tune per p99 latency
+    MemorySize: 1024      # image re-encode is memory-bound; raise for large files
+    Tracing: Active       # X-Ray active tracing (SAM adds the X-Ray write policy)
+    Environment:
+      Variables:
+        SANITISED_BUCKET:    !Ref SanitisedBucketName
+        QUARANTINE_BUCKET:   !If [QuarantineEnabled, !Ref QuarantineBucketName, ""]
+        RESULT_TOPIC_ARN:    !Ref CdrResultTopic
+        CDR_MAX_FILE_BYTES:  !Ref CdrMaxFileBytes
+        CDR_MAX_ENTRY_BYTES: !Ref CdrMaxEntryBytes
+
+Resources:
+
+  # ── Source bucket ────────────────────────────────────────────────────────────
+  # NOTE: the source bucket is managed here so EventBridge notifications and
+  # encryption are enforced by IaC. If using a pre-existing bucket, remove this
+  # resource and configure EventBridge notifications manually.
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── Destination buckets ──────────────────────────────────────────────────────
+
+  SanitisedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SanitisedBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  QuarantineBucket:
+    Type: AWS::S3::Bucket
+    Condition: QuarantineEnabled
+    Properties:
+      BucketName: !Ref QuarantineBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Versioning on the evidence bucket too — preserves overwritten/deleted rejected files.
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── TLS-only bucket policies ─────────────────────────────────────────────────
+  # Deny any non-TLS request. Non-public policy, so BlockPublicPolicy does not interfere.
+
+  SourceBucketTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SourceBucket.Arn
+              - !Sub "${SourceBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  SanitisedBucketTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SanitisedBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SanitisedBucket.Arn
+              - !Sub "${SanitisedBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  QuarantineBucketTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: QuarantineEnabled
+    Properties:
+      Bucket: !Ref QuarantineBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt QuarantineBucket.Arn
+              - !Sub "${QuarantineBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # ── SNS topics ───────────────────────────────────────────────────────────────
+
+  CdrResultTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: cdr-result-topic
+      KmsMasterKeyId: alias/aws/sns   # SSE at rest with the AWS-managed key (free)
+
+  # Separate alarm topic so CloudWatch alarms don't pollute CDR result consumers
+  CdrAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: cdr-alarm-topic
+      KmsMasterKeyId: alias/aws/sns
+
+  # ── Dead-letter queue ─────────────────────────────────────────────────────────
+
+  CdrDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: cdr-lambda-dlq
+      MessageRetentionPeriod: 1209600   # 14 days
+      SqsManagedSseEnabled: true        # SSE at rest with the SQS-managed key (free)
+
+  # ── Lambda function ──────────────────────────────────────────────────────────
+
+  CdrFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: cdr-lambda
+      CodeUri: ./
+      Handler: lambda_function.handler
+      Description: Strip active content from Office, PDF, and image files
+      EphemeralStorage:
+        Size: 1024          # /tmp space for pikepdf temp files
+      ReservedConcurrentExecutions: 20  # prevent OOM-burst; tune per throughput SLA
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt CdrDlq.Arn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: !Sub "arn:aws:s3:::${SourceBucketName}/*"
+        - S3WritePolicy:
+            BucketName: !Ref SanitisedBucketName
+        - !If
+          - QuarantineEnabled
+          - S3WritePolicy:
+              BucketName: !Ref QuarantineBucketName
+          - !Ref AWS::NoValue
+        - !If
+          - QuarantineEnabled
+          # s3:CopyObject is not a real IAM action — a copy is authorised by s3:GetObject
+          # on the source and s3:PutObject on the destination. PutObjectTagging is also
+          # needed because the oversized-quarantine copy sets tags inline.
+          - Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${SourceBucketName}/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource: !Sub "arn:aws:s3:::${QuarantineBucketName}/*"
+          - !Ref AWS::NoValue
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt CdrResultTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: CDR/Validation
+        - Statement:
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt CdrDlq.Arn
+      Events:
+        S3Upload:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref SourceBucketName
+                reason:
+                  - PutObject
+                  - CompleteMultipartUpload
+
+  # ── CloudWatch alarms ────────────────────────────────────────────────────────
+
+  CdrErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cdr-lambda-errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CdrFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref CdrAlarmTopic   # separate from CdrResultTopic
+
+  CdrDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cdr-lambda-duration-p99
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CdrFunction
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 250000     # 250 s — alert before the 300 s timeout
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CdrAlarmTopic
+
+  CdrThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cdr-lambda-throttles
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CdrFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref CdrAlarmTopic
+
+  CdrDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cdr-lambda-dlq-depth
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt CdrDlq.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref CdrAlarmTopic
+
+  CdrPassthroughAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cdr-lambda-passthrough
+      MetricName: PassthroughFiles
+      Namespace: CDR/Validation
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CdrAlarmTopic
+
+  # Alerts on a spike of ZIP structural anomalies (malformed/zip-bomb/method-mismatch
+  # uploads). The files are hard-rejected regardless; this surfaces an attack campaign.
+  # _emit_zip_anomaly_metric emits a dimensionless datapoint, so no Dimensions block here.
+  CdrZipAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cdr-lambda-zip-anomalies
+      MetricName: ZipAnomalies
+      Namespace: CDR/Validation
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CdrAlarmTopic
+
+Outputs:
+  CdrFunctionArn:
+    Value: !GetAtt CdrFunction.Arn
+  CdrResultTopicArn:
+    Value: !Ref CdrResultTopic
+  CdrAlarmTopicArn:
+    Value: !Ref CdrAlarmTopic
+  SanitisedBucketArn:
+    Value: !GetAtt SanitisedBucket.Arn
+  CdrDlqArn:
+    Value: !GetAtt CdrDlq.Arn
