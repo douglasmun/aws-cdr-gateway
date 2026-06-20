@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 470" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="S3 CDR pipeline architecture">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 470" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="aws-cdr-gateway architecture">
   <rect width="920" height="470" fill="#0f172a"/>
 
   <!-- title -->
-  <text x="28" y="38" font-size="20" font-weight="700" fill="#e2e8f0">S3 CDR Pipeline — Architecture</text>
+  <text x="28" y="38" font-size="20" font-weight="700" fill="#e2e8f0">aws-cdr-gateway — Architecture</text>
   <text x="28" y="58" font-size="12" fill="#94a3b8">EventBridge-triggered Lambda · fail-closed routing · this repo = solid boxes; external/out-of-scope = dashed</text>
 
   <!-- ============ row 1: source -> eventbridge -> cdr ============ -->

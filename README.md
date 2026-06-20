@@ -1,4 +1,4 @@
-# S3 CDR Pipeline
+# aws-cdr-gateway
 
 ![banner](docs/social-preview.png)
 
