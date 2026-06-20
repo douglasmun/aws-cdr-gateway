@@ -1,5 +1,7 @@
 # S3 CDR Pipeline
 
+![banner](docs/social-preview.png)
+
 [![tests](https://github.com/douglasmun/aws-cdr-gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/douglasmun/aws-cdr-gateway/actions/workflows/tests.yml)
 
 A serverless AWS pipeline that performs **Content Disarmament and Reconstruction (CDR)**
