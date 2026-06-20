@@ -56,3 +56,8 @@ override.tf.json
 # scanners flag. The generator + runner + MANIFEST are committed.
 docs/test-corpus/clean/
 docs/test-corpus/adversarial/
+
+# Local-only AI-agent instruction files — kept for reference, never published.
+CLAUDE.md
+AGENTS.md
+GEMINI.md
