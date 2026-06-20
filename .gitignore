@@ -61,3 +61,9 @@ docs/test-corpus/adversarial/
 CLAUDE.md
 AGENTS.md
 GEMINI.md
+
+# Local-only dev extras carried over from the private repo — never published.
+scripts/make-public.sh
+docs/test-corpus/
+docs/superpowers/
+docs/progress.md
