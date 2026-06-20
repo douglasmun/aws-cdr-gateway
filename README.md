@@ -9,7 +9,7 @@ on files uploaded to S3. Files are structurally disarmed — active/executable c
 stripped — and routed to a sanitised or quarantine bucket. The pipeline is designed to
 **fail closed**: anything it cannot prove safe is quarantined, never labelled sanitised.
 
-> Status: production-ready code, **not yet deployed to any AWS account**. The deployment
+> Status: production-ready code, **Deployed and smoke tested on AWS**. Follow, the deployment
 > steps below require live AWS credentials and either the SAM CLI or OpenTofu/Terraform.
 
 ---
