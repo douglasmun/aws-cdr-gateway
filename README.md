@@ -87,7 +87,7 @@ source bin/activate
 # Install dependencies
 pip install -r src/requirements.txt
 
-# Run the full test suite (176 tests)
+# Run the full test suite (154 tests)
 
 # Run one class or test
 pytest test_cdr.py::TestOfficeCDR -v
