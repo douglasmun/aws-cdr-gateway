@@ -148,6 +148,87 @@ def clean_pptx() -> bytes:
     })
 
 
+def clean_docx_customxml() -> bytes:
+    """Regression for the customXml dangling-relationship bug: a docx with a customXml part
+    AND a document.xml.rels relationship pointing at it. CDR strips the customXml/ part — it
+    MUST also drop the relationship, or the dangling rel breaks strict OPC consumers
+    (python-docx/Word) with 'There is no item named customXml/item1.xml'. Expected: sanitised
+    AND still re-parseable, with no customXml part or rel remaining."""
+    doc = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body><w:p><w:r><w:t>Document with a customXml data island that must be stripped "
+        "cleanly, leaving a structurally valid file with no dangling relationship.</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    doc_rels = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{REL_NS}">'
+        f'<Relationship Id="rIdCx" '
+        f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml" '
+        f'Target="../customXml/item1.xml"/>'
+        f"</Relationships>"
+    ).encode()
+    return _ooxml({
+        "[Content_Types].xml": _ct(
+            ("/word/document.xml",
+             "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml")),
+        "_rels/.rels": _root_rels(
+            "rId1",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+            "word/document.xml"),
+        "word/document.xml": doc,
+        "word/_rels/document.xml.rels": doc_rels,
+        "customXml/item1.xml": b"<root><data>custom xml payload to be removed</data></root>",
+    })
+
+
+def clean_docx_field_keywords_in_styles() -> bytes:
+    """Regression for the field-scrub false-positive: a styles part containing field-code
+    KEYWORDS (link, autoRedefine, …) inside legitimate ELEMENT/ATTRIBUTE names. The keyword+
+    argument scrub must NOT touch these (it is scoped to <w:instrText>/<w:fldSimple w:instr>
+    field carriers) — the old raw-XML regex emitted a value-less _CDR_REMOVED_ attribute here,
+    producing invalid XML. Expected: sanitised and byte-stable styles (no _CDR_REMOVED_)."""
+    doc = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body><w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+        "<w:r><w:t>Body text with a heading style applied.</w:t></w:r></w:p></w:body></w:document>"
+    ).encode()
+    # 'w:link', 'w:autoRedefine' are real style-definition element/attr names that contain the
+    # LINK / AUTO field keywords — they must survive untouched.
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Heading1">'
+        '<w:name w:val="heading 1"/><w:link w:val="Heading1Char"/><w:autoRedefine/>'
+        '<w:rPr><w:rFonts w:hAnsi="Calibri Light"/></w:rPr></w:style>'
+        '<w:style w:type="character" w:styleId="Heading1Char"><w:name w:val="Heading 1 Char"/></w:style>'
+        "</w:styles>"
+    ).encode()
+    doc_rels = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{REL_NS}">'
+        f'<Relationship Id="rIdS" '
+        f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        f'Target="styles.xml"/></Relationships>'
+    ).encode()
+    return _ooxml({
+        "[Content_Types].xml": _ct(
+            ("/word/document.xml",
+             "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"),
+            ("/word/styles.xml",
+             "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml")),
+        "_rels/.rels": _root_rels(
+            "rId1",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+            "word/document.xml"),
+        "word/document.xml": doc,
+        "word/_rels/document.xml.rels": doc_rels,
+        "word/styles.xml": styles,
+    })
+
+
 def clean_pdf() -> bytes:
     pdf = pikepdf.Pdf.new()
     pdf.add_blank_page(page_size=(612, 792))
@@ -340,6 +421,12 @@ def main() -> None:
     _write(CLEAN, "clean.bmp", _clean_image("BMP"), "sanitised, re-encoded")
     _write(CLEAN, "clean.tiff", _clean_image("TIFF"), "sanitised, re-encoded")
     _write(CLEAN, "clean.webp", _clean_image("WEBP"), "sanitised, re-encoded")
+    _write(CLEAN, "regression_customxml_rel.docx", clean_docx_customxml(),
+           "sanitised + re-parseable — customXml part AND its dangling relationship dropped "
+           "(regression for the customXml dangling-rel bug)")
+    _write(CLEAN, "regression_styles_field_keywords.docx", clean_docx_field_keywords_in_styles(),
+           "sanitised, styles.xml byte-stable (no _CDR_REMOVED_) — field-code keywords inside "
+           "element/attr names must NOT be corrupted (regression for the field-scrub false positive)")
 
     print("\n== ADVERSARIAL (expect: sanitised / rejected / quarantined — never a clean pass) ==")
     _write(ADV, "zipbomb.docx", adv_zip_bomb_docx(),
