@@ -120,6 +120,11 @@ STRIP_ZIP_ENTRIES: set[str] = {
     "word/webextensions/",
     "xl/webextensions/",
     "ppt/webextensions/",
+    # PostScript/EPS image parts (typically under <app>/media/). EPS is a Turing-complete
+    # interpreter language and a historic RCE surface — drop the payload bytes; the
+    # matching [Content_Types].xml declaration is stripped in _sanitise_content_types.
+    ".eps",
+    ".ps",
 }
 
 OFFICE_EXTS: set[str] = {
@@ -129,6 +134,18 @@ OFFICE_EXTS: set[str] = {
 }
 
 LEGACY_EXTS: set[str] = {"doc", "xls", "ppt"}
+
+# Formats DELIBERATELY rejected — never given a CDR handler. These carry active content
+# as loose, parser-divergent structure (embedded/linked OLE, remote-template refs, control
+# words a forgiving consumer acts on) rather than as cleanly-excisable content. A
+# reconstruction pass can only defend the grammar IT parses; the attacker targets the
+# grammar the *consumer* parses. RTF history bears this out: CVE-2017-0199 (remote OLE
+# template), CVE-2017-11882 / CVE-2018-0802 (Equation Editor), CVE-2023-21716 (heap
+# corruption in the font table). They are quarantined fail-closed by a dedicated handler
+# block that runs BEFORE ZIP validation and the unknown-extension gate — listed explicitly
+# so the rejection is a documented, order-independent decision, not an accidental gap a
+# future contributor "fixes" by adding a handler. See pitfall #38.
+FAIL_CLOSED_EXTS: set[str] = {"rtf"}
 
 EXT_REMAP: dict[str, str] = {
     "docm": "docx", "dotm": "dotx",
@@ -173,6 +190,24 @@ MACRO_CONTENT_TYPE_REMAP: dict[str, str] = {
     "application/vnd.ms-powerpoint.addin.macroEnabled.12":
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
+
+# PostScript/EPS content types (lowercased). EPS is a Turing-complete interpreter
+# language and a historic RCE surface; a valid OOXML package can legitimately declare
+# such a part, so we strip both the [Content_Types].xml declaration and the part bytes.
+POSTSCRIPT_CONTENT_TYPES: set[str] = {
+    "application/postscript",
+    "application/eps",
+    "application/x-eps",
+    "image/eps",
+    "image/x-eps",
+}
+
+
+def _is_postscript_ct(ct: str) -> bool:
+    """True if ``ct`` is a PostScript/EPS content type. Normalises case, surrounding
+    whitespace, and any RFC-2045 parameter suffix (``;charset=…``) before comparison so
+    a declaration like ``application/postscript; charset=utf-8`` cannot evade the set."""
+    return ct.split(";", 1)[0].strip().lower() in POSTSCRIPT_CONTENT_TYPES
 
 _ZIP_MAGIC           = b"\x50\x4b\x03\x04"
 _SAFE_COMPRESS_METHODS = {0, 8}  # stored, deflate
@@ -241,6 +276,27 @@ def handler(event: dict, context) -> dict:
         _delete_source_safe(bucket, key)
         return {"status": "unsupported-format", "reason": "OLE binary format not supported"}
 
+    # ── Deliberately-rejected carriers — FAIL CLOSED (highest priority) ───────
+    # RTF (and any other FAIL_CLOSED_EXTS member) is rejected BY DESIGN — never given a
+    # CDR handler. This check runs FIRST, before ZIP validation and the unknown-extension
+    # gate, so the rejection is order-independent: even if a future edit wrongly adds the
+    # extension to OFFICE_EXTS, it lands here and never reaches cdr_office(). See pitfall #38.
+    if ext in FAIL_CLOSED_EXTS:
+        logger.warning("Deliberately-rejected format — quarantine (fail closed): "
+                       "key=%s ext=%s", key, ext)
+        _emit_passthrough_metric(ext)
+        if QUARANTINE_BUCKET:
+            try:
+                _upload(QUARANTINE_BUCKET, f"unsupported/{key}", file_bytes, content_type,
+                        {"cdr-status": "unsupported-format", "cdr-original-ext": ext,
+                         "cdr-timestamp": _now()})
+            except Exception as q_exc:
+                logger.warning("Quarantine upload failed: key=%s error=%s", key, q_exc)
+        _publish_result_safe(bucket, key, "unsupported-format",
+                             {"reason": f"format rejected by design: {ext}", "original_ext": ext})
+        _delete_source_safe(bucket, key)
+        return {"status": "unsupported-format", "reason": f"format rejected by design: {ext}"}
+
     # ── ZIP structural validation ─────────────────────────────────────────────
     if ext in OFFICE_EXTS:
         valid, zip_anomalies = _validate_zip_structure(file_bytes)
@@ -264,10 +320,11 @@ def handler(event: dict, context) -> dict:
 
     # ── Unknown extension — FAIL CLOSED ───────────────────────────────────────
     # A CDR gate must never label content it did not disarm as "sanitised". An
-    # unrecognised extension (.rtf, .svg, .html, .lnk, .iso, …) is quarantined with the
-    # source preserved-then-deleted — it must NOT reach SANITISED_BUCKET. Carriers like
-    # RTF/SVG/HTML are active-content vectors; passing them through inverts the trust
-    # label on the sanitised bucket. The detective passthrough metric still fires.
+    # unrecognised extension (.svg, .html, .lnk, .iso, …) is quarantined with the source
+    # preserved-then-deleted — it must NOT reach SANITISED_BUCKET. Carriers like SVG/HTML
+    # are active-content vectors; passing them through inverts the trust label on the
+    # sanitised bucket. (RTF and other deliberately-rejected carriers are already handled
+    # by the FAIL_CLOSED_EXTS block above.) The detective passthrough metric still fires.
     if (
         ext not in OFFICE_EXTS
         and ext != "pdf"
@@ -347,6 +404,33 @@ def handler(event: dict, context) -> dict:
 
 # ── Office CDR ─────────────────────────────────────────────────────────────────
 
+def _postscript_override_parts(ct_xml: bytes) -> set[str]:
+    """Parse ``[Content_Types].xml`` and return the set of normalised part names (lower,
+    leading '/' stripped) declared with a PostScript/EPS content type via an ``Override``.
+
+    This is the authoritative signal for the part-byte strip: an OOXML ``Override`` binds a
+    content type to an exact PartName regardless of file extension, so an EPS payload can be
+    declared PostScript while stored as ``word/media/image1.png``. The ``.eps``/``.ps``
+    suffix rule in STRIP_ZIP_ENTRIES would miss that; this closes the bypass. Returns an
+    empty set on unparseable XML (the ZIP validator already requires a present, well-formed
+    Content-Types part, and the suffix rule remains as a backstop)."""
+    parts: set[str] = set()
+    try:
+        root = ET.fromstring(ct_xml)
+    except ET.ParseError:
+        return parts
+    ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+    for child in root:
+        if child.tag != f"{{{ns}}}Override":
+            continue
+        if not _is_postscript_ct(child.get("ContentType", "")):
+            continue
+        pn = child.get("PartName", "").replace("\\", "/").lstrip("/").lower()
+        if pn:
+            parts.add(pn)
+    return parts
+
+
 def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
     """Disarm an OOXML (ZIP) Office file by rebuilding the archive entry-by-entry.
 
@@ -361,6 +445,18 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
     out_buf = io.BytesIO()
 
     with zipfile.ZipFile(io.BytesIO(data), "r") as src:
+        # Pre-pass: resolve which parts [Content_Types].xml declares as PostScript via an
+        # Override on an arbitrary PartName. infolist() order is not guaranteed, so this
+        # must run before the main loop to drop such parts wherever they appear.
+        ps_parts: set[str] = set()
+        for item in src.infolist():
+            if item.filename.replace("\\", "/").lower() == "[content_types].xml":
+                try:
+                    ps_parts = _postscript_override_parts(_read_zip_entry_safe(src, item))
+                except ValueError:
+                    ps_parts = set()  # bomb-guard trip; suffix rule remains the backstop
+                break
+
         with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as dst:
             for item in src.infolist():
                 # Normalise backslashes: spec mandates forward slashes
@@ -380,6 +476,12 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
                             skip = True
                             break
                 if skip:
+                    continue
+
+                # 1b. Drop parts declared PostScript/EPS by an Override (content-type
+                #     -driven, regardless of file extension — closes the Override bypass).
+                if name_lower in ps_parts:
+                    removed.append(item.filename)
                     continue
 
                 # 2. Drop ActiveX control bins/xmls
@@ -567,6 +669,15 @@ def _sanitise_content_types(data: bytes) -> tuple[bytes, list[str]]:
             removed.append(f"content-type removed: {ct}")
 
         elif child.tag == f"{{{ns}}}Override" and "activex" in ct.lower():
+            to_remove.append(child)
+            removed.append(f"content-type removed: {ct}")
+
+        # PostScript/EPS parts declare a Turing-complete interpreter language (the
+        # GhostScript -dSAFER bypass family is real history). Drop the declaration in
+        # both Default and Override forms. Part bytes are dropped by STRIP_ZIP_ENTRIES
+        # (suffix) AND by the content-type-driven pre-pass in cdr_office (which catches a
+        # PostScript Override on an arbitrarily-named part, e.g. /word/media/image1.png).
+        elif _is_postscript_ct(ct):
             to_remove.append(child)
             removed.append(f"content-type removed: {ct}")
 
