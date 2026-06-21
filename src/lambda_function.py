@@ -83,6 +83,13 @@ STRIP_REL_TYPES: set[str] = {
     # Office Web Add-in (task pane / web extension) relationships.
     "http://schemas.microsoft.com/office/2011/relationships/webextensiontaskpanes",
     "http://schemas.microsoft.com/office/2011/relationships/webextension",
+    # customXml parts are stripped by STRIP_ZIP_ENTRIES ("customXml/"). Their relationships
+    # MUST be dropped here too, or the surviving rel dangles at the deleted part and breaks
+    # strict OPC consumers (python-docx, Word) — corrupting otherwise-legitimate documents.
+    # customXml is a data-island carrier (custom doc properties / content-control databinding),
+    # safe to remove wholesale. Both the 2006 type and the 2010 customXmlProps variant.
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps",
 }
 
 # External hyperlink relationship type. NOT in STRIP_REL_TYPES because deleting the rel
@@ -759,6 +766,14 @@ def _strip_xml_macros(data: bytes, filename: str) -> tuple[bytes, list[str]]:
     if n_ent:
         removed.append(f"{filename}: {n_ent} entity-encoded field code(s)")
 
+    # KNOWN ISSUE (tracked separately): the keyword+argument scrub below runs as a regex
+    # over the RAW XML of the part, so keywords like LINK/AUTO/DDE/HYPERLINK can match inside
+    # legitimate element/attribute names and the `\S+` swallows XML markup, replacing it with
+    # a bare `_CDR_REMOVED_` token → invalid XML (e.g. a value-less attribute) that strict
+    # consumers (python-docx/Word) reject. Observed false-positives in python-docx-authored
+    # word/styles.xml. Proper fix: scope field-code neutralisation to actual field carriers
+    # (<w:instrText>, <w:fldSimple w:instr="…">) instead of the whole part. Not changed here.
+    #
     # Auto-execute names that carry no argument (AUTOOPEN fires on document open, etc.)
     cleaned, n_auto = re.subn(
         r'\b(AUTOOPEN|AUTOEXIT|AUTOCLOSE|AUTONEW)\b',

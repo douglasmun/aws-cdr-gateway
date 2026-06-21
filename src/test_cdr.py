@@ -335,6 +335,36 @@ class TestOfficeCDR:
             "customXml/ entries still present after CDR"
         assert any("customXml" in r for r in report["removed"])
 
+    def test_custom_xml_relationship_also_dropped(self):
+        """Regression: stripping the customXml PART must also drop the relationship that
+        references it, or the surviving rel dangles at a deleted part and breaks strict OPC
+        consumers (python-docx / Word) — corrupting otherwise-legitimate documents."""
+        ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+        cx_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml"
+        doc_rels = (
+            f'<?xml version="1.0"?><Relationships xmlns="{ns}">'
+            f'<Relationship Id="rId1" Type="{cx_type}" Target="../customXml/item1.xml"/>'
+            f'</Relationships>'
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", _minimal_content_types())
+            z.writestr("_rels/.rels", _minimal_rels())
+            z.writestr("word/document.xml", "<w:document/>")
+            z.writestr("word/_rels/document.xml.rels", doc_rels)
+            z.writestr("customXml/item1.xml", "<root><data>payload</data></root>")
+            z.writestr("customXml/_rels/item1.xml.rels", _minimal_rels())
+
+        clean, report = cdr.cdr_office(buf.getvalue(), "docx")
+
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            names = z.namelist()
+            doc_rels_out = z.read("word/_rels/document.xml.rels")
+        # Part gone AND the dangling relationship to it gone.
+        assert not any(n.startswith("customXml/") for n in names)
+        assert b"customXml" not in doc_rels_out, \
+            "dangling customXml relationship survived — would corrupt the document"
+
     def test_external_links_dir_stripped(self):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as z:
