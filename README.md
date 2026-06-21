@@ -68,6 +68,7 @@ audited and hardened. See [`docs/progress.md`](docs/progress.md).
 | `docs/05-alarm-demo-walkthrough.md` | Subscribe to alarm notifications + fire the ZIP-anomaly alarm (live demo) |
 | `docs/benchmark.py` | Standalone load benchmark with tuning recommendations |
 | `docs/fixtures/` | Threat fixtures + generator covering every CDR path |
+| `docs/comparison-docbleach.md` | CDR coverage compared against DocBleach (per-format, with audit rationale) |
 
 ---
 
