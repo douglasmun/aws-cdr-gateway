@@ -739,6 +739,66 @@ def _neutralise_encoded_field_codes(text: str) -> tuple[str, int]:
     return _NUMERIC_ENTITY_RUN.sub(_replace, text), count
 
 
+# Auto-execute field names that carry no argument (AUTOOPEN fires on document open, etc.).
+_FIELD_AUTOEXEC_RE = re.compile(r'\b(AUTOOPEN|AUTOEXIT|AUTOCLOSE|AUTONEW)\b', re.IGNORECASE)
+
+# Keyword + argument field codes. Neutralise the argument, preserving the keyword so the
+# field structure stays well-formed. INCLUDE*/LINK fetch external resources (SSRF/exfil);
+# WEBSERVICE auto-fetches a URL on open; HYPERLINK UNC paths trigger NTLM credential theft.
+# `[^\s<>]+` (not `\S+`) bounds the argument so a match can never cross an XML tag boundary
+# even if a field carrier somehow contained one.
+_FIELD_KEYWORD_ARG_RE = re.compile(
+    r'\b(MACROBUTTON|DDE|DDEAUTO|AUTO|EXEC|INCLUDE|INCLUDETEXT|INCLUDEPICTURE|LINK'
+    r'|WEBSERVICE|HYPERLINK)\s+[^\s<>]+',
+    re.IGNORECASE,
+)
+
+# Field-code CARRIERS: the only places Word evaluates a field code.
+#   <w:instrText …>…</w:instrText>  — the run that holds the field instruction text
+#   <w:fldSimple … w:instr="…" …>   — the simple-field instruction attribute
+# Namespace prefix is matched loosely ([A-Za-z0-9]*:) so non-"w" prefixes are still covered.
+_INSTRTEXT_RE = re.compile(
+    r'(<[A-Za-z0-9]*:?instrText\b[^>]*>)(.*?)(</[A-Za-z0-9]*:?instrText\s*>)',
+    re.IGNORECASE | re.DOTALL,
+)
+_FLDSIMPLE_INSTR_RE = re.compile(
+    r'(\b[A-Za-z0-9]*:?instr=")([^"]*)(")',
+    re.IGNORECASE,
+)
+
+
+def _scrub_field_string(s: str) -> tuple[str, int]:
+    """Neutralise auto-exec + keyword-argument field codes inside a single field-code
+    string (the content of an instrText element or a fldSimple instr attribute). Returns
+    (scrubbed, count). Operates only on field-code text, so it can never corrupt markup."""
+    s, n1 = _FIELD_AUTOEXEC_RE.subn(r'\1_CDR_REMOVED_', s)
+    s, n2 = _FIELD_KEYWORD_ARG_RE.subn(r'\1 _CDR_REMOVED_', s)
+    return s, n1 + n2
+
+
+def _scrub_field_code_carriers(text: str) -> tuple[str, int]:
+    """Run the auto-exec / keyword-argument field-code scrub ONLY inside field carriers
+    (<w:instrText> content and <w:fldSimple w:instr="…">), leaving all other XML untouched.
+    Returns (text, total_count)."""
+    total = 0
+
+    def _instr_el(m: "re.Match[str]") -> str:
+        nonlocal total
+        body, n = _scrub_field_string(m.group(2))
+        total += n
+        return m.group(1) + body + m.group(3)
+
+    def _fldsimple_attr(m: "re.Match[str]") -> str:
+        nonlocal total
+        val, n = _scrub_field_string(m.group(2))
+        total += n
+        return m.group(1) + val + m.group(3)
+
+    text = _INSTRTEXT_RE.sub(_instr_el, text)
+    text = _FLDSIMPLE_INSTR_RE.sub(_fldsimple_attr, text)
+    return text, total
+
+
 def _strip_xml_macros(data: bytes, filename: str) -> tuple[bytes, list[str]]:
     """Neutralise dangerous content inside an Office XML part via text-level regex passes.
 
@@ -766,34 +826,17 @@ def _strip_xml_macros(data: bytes, filename: str) -> tuple[bytes, list[str]]:
     if n_ent:
         removed.append(f"{filename}: {n_ent} entity-encoded field code(s)")
 
-    # KNOWN ISSUE (tracked separately): the keyword+argument scrub below runs as a regex
-    # over the RAW XML of the part, so keywords like LINK/AUTO/DDE/HYPERLINK can match inside
-    # legitimate element/attribute names and the `\S+` swallows XML markup, replacing it with
-    # a bare `_CDR_REMOVED_` token → invalid XML (e.g. a value-less attribute) that strict
-    # consumers (python-docx/Word) reject. Observed false-positives in python-docx-authored
-    # word/styles.xml. Proper fix: scope field-code neutralisation to actual field carriers
-    # (<w:instrText>, <w:fldSimple w:instr="…">) instead of the whole part. Not changed here.
-    #
-    # Auto-execute names that carry no argument (AUTOOPEN fires on document open, etc.)
-    cleaned, n_auto = re.subn(
-        r'\b(AUTOOPEN|AUTOEXIT|AUTOCLOSE|AUTONEW)\b',
-        r'\1_CDR_REMOVED_',
-        text,
-        flags=re.IGNORECASE,
-    )
-    # Keyword + argument form: neutralise the argument, preserving field structure.
-    # INCLUDE/INCLUDETEXT/INCLUDEPICTURE/LINK — fetch external resources (SSRF/exfil).
-    # WEBSERVICE — auto-fetches a URL when document opens, direct SSRF; the no-parens
-    #   Word field form is not caught by the n3 pattern which requires '('.
-    # HYPERLINK — UNC paths trigger NTLM credential theft; include the no-parens form.
-    cleaned, n_kw = re.subn(
-        r'\b(MACROBUTTON|DDE|DDEAUTO|AUTO|EXEC|INCLUDE|INCLUDETEXT|INCLUDEPICTURE|LINK'
-        r'|WEBSERVICE|HYPERLINK)\s+\S+',
-        r'\1 _CDR_REMOVED_',
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    n = n_auto + n_kw
+    # Auto-exec + keyword-argument field codes are neutralised ONLY inside the parts of the
+    # XML where Word actually evaluates field codes — never over the raw part. A field code
+    # lives in a `<w:instrText>…</w:instrText>` run, or in the `w:instr="…"` attribute of a
+    # `<w:fldSimple>`. Scanning the whole part (the prior approach) matched keywords like
+    # LINK/AUTO/HYPERLINK inside legitimate element/attribute NAMES, and the `\S+` swallowed
+    # XML markup, emitting a value-less `_CDR_REMOVED_` token → invalid XML that strict
+    # consumers (python-docx/Word) reject (false positives in python-docx-authored styles.xml).
+    # Scoping to the field carriers keeps detection on real field codes while never touching
+    # markup. (Excel cell-formula field forms like DDE/WEBSERVICE(...) and the DDE pipe form
+    # are still handled by the n3 pass below, which is XML-boundary-safe.)
+    cleaned, n = _scrub_field_code_carriers(text)
     if n:
         removed.append(f"{filename}: {n} dangerous field code(s)")
 
