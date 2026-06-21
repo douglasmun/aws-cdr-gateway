@@ -91,8 +91,8 @@ CI runs the test suite and a Linux package build on every push/PR; both must be 
 ## Reporting a security issue
 
 If you believe you've found a way to bypass CDR (active content surviving into the
-sanitised output), please **do not open a public issue**. Open a private security advisory
-via the repository's *Security* tab instead.
+sanitised output), please **do not open a public issue**. See [`SECURITY.md`](SECURITY.md)
+for how to report privately (GitHub Security tab → *Report a vulnerability*, or email).
 
 ## License
 
