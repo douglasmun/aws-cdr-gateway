@@ -538,6 +538,127 @@ class TestContentTypesSanitisation:
         assert removed == []
 
 
+class TestPostScriptStrip:
+    """PostScript/EPS is a Turing-complete interpreter language and a historic RCE
+    surface. Both the [Content_Types].xml declaration and the part bytes must be dropped."""
+
+    def test_postscript_default_entry_removed(self):
+        data = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="eps" ContentType="application/postscript"/>'
+            '</Types>'
+        ).encode()
+        clean, removed = cdr._sanitise_content_types(data)
+        assert b"postscript" not in clean.lower(), "PostScript Default entry survived"
+        assert any("postscript" in r.lower() for r in removed)
+
+    def test_postscript_override_entry_removed(self):
+        data = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Override PartName="/word/media/image1.eps" ContentType="image/x-eps"/>'
+            '</Types>'
+        ).encode()
+        clean, removed = cdr._sanitise_content_types(data)
+        assert b"x-eps" not in clean.lower(), "PostScript Override entry survived"
+        assert len(removed) == 1
+
+    def test_clean_content_types_with_no_postscript_unchanged(self):
+        data = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="png" ContentType="image/png"/>'
+            '</Types>'
+        ).encode()
+        _, removed = cdr._sanitise_content_types(data)
+        assert removed == []
+
+    def test_eps_part_bytes_dropped_by_cdr_office(self):
+        """End-to-end: an .eps part in <app>/media/ is removed from the rebuilt archive."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml",
+                       '<?xml version="1.0"?>'
+                       '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                       '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                       '<Default Extension="eps" ContentType="application/postscript"/>'
+                       '</Types>')
+            z.writestr("_rels/.rels", _minimal_rels())
+            z.writestr("word/media/image1.eps",
+                       b"%!PS-Adobe-3.0 EPSF-3.0\n(%pipe%cmd) (w) file\n")
+            z.writestr("word/document.xml",
+                       '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                       'wordprocessingml/2006/main"><w:body/></w:document>')
+        clean, report = cdr.cdr_office(buf.getvalue(), "docx")
+
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            names = z.namelist()
+            content_types = z.read("[Content_Types].xml")
+        assert "word/media/image1.eps" not in names, "EPS part bytes survived CDR"
+        assert b"postscript" not in content_types.lower(), "PostScript declaration survived"
+
+    @staticmethod
+    def _docx_with_ps_override(content_type: str, part_name: str) -> bytes:
+        """A .docx declaring `part_name` as PostScript via an Override, with the payload
+        stored under that (arbitrary) name — the extension need not be .eps."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml",
+                       '<?xml version="1.0"?>'
+                       '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                       '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                       f'<Override PartName="/{part_name}" ContentType="{content_type}"/>'
+                       '</Types>')
+            z.writestr("_rels/.rels", _minimal_rels())
+            z.writestr(part_name, b"%!PS-Adobe-3.0 EPSF-3.0 evil payload")
+            z.writestr("word/document.xml",
+                       '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                       'wordprocessingml/2006/main"><w:body/></w:document>')
+        return buf.getvalue()
+
+    def test_override_postscript_on_nonexps_partname_stripped(self):
+        """BYPASS REGRESSION: an Override binding a non-.eps part (e.g. image1.png) to
+        application/postscript must still drop the part bytes — the suffix rule alone
+        misses this; the content-type pre-pass must catch it."""
+        data = self._docx_with_ps_override("application/postscript", "word/media/image1.png")
+        clean, _ = cdr.cdr_office(data, "docx")
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            names = z.namelist()
+            content_types = z.read("[Content_Types].xml")
+        assert "word/media/image1.png" not in names, "PostScript payload survived via Override"
+        assert b"postscript" not in content_types.lower()
+
+    def test_override_postscript_no_extension_stripped(self):
+        data = self._docx_with_ps_override("application/postscript", "word/media/blob")
+        clean, _ = cdr.cdr_office(data, "docx")
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            assert "word/media/blob" not in z.namelist()
+
+    def test_evasive_content_type_with_parameter_stripped(self):
+        """BYPASS REGRESSION: a parameterised/whitespaced content type
+        (`application/postscript; charset=utf-8`) must not evade detection."""
+        data = self._docx_with_ps_override(
+            "application/postscript; charset=utf-8", "word/media/pic.png")
+        clean, removed = cdr.cdr_office(data, "docx")
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            names = z.namelist()
+            content_types = z.read("[Content_Types].xml")
+        assert "word/media/pic.png" not in names, "evasive-CT PostScript payload survived"
+        assert b"postscript" not in content_types.lower()
+
+    def test_is_postscript_ct_normalisation(self):
+        assert cdr._is_postscript_ct("application/postscript")
+        assert cdr._is_postscript_ct("APPLICATION/POSTSCRIPT")
+        assert cdr._is_postscript_ct("  application/postscript  ")
+        assert cdr._is_postscript_ct("application/postscript;charset=utf-8")
+        assert cdr._is_postscript_ct("image/x-eps")
+        assert not cdr._is_postscript_ct("image/png")
+        assert not cdr._is_postscript_ct("application/vnd.ms-postscript-lookalike")
+
+
 class TestContentTypeRealOfficeTypes:
     """Validate MACRO_CONTENT_TYPE_REMAP against the actual content type strings
     that Microsoft Office writes into [Content_Types].xml for every macro-enabled format.
@@ -898,6 +1019,41 @@ class TestHandler:
             for call in mock_ul.call_args_list:
                 assert call[0][0] != cdr.SANITISED_BUCKET, f"{key} reached SANITISED_BUCKET"
             assert mock_pub.call_args[0][2] == "unsupported-format"
+
+
+class TestRtfDeliberatelyFailClosed:
+    """RTF is rejected BY DESIGN, not by accident. Its threats (embedded/linked OLE,
+    remote-template refs, control words a forgiving parser acts on — CVE-2017-0199,
+    CVE-2017-11882, CVE-2023-21716) are parser-divergent structure that a reconstruction
+    pass cannot guarantee away. These tests pin the decision so a future contributor
+    cannot silently add an RTF handler without the test going red."""
+
+    def _event(self, key: str) -> dict:
+        return {"detail": {"bucket": {"name": "src"}, "object": {"key": key, "size": 1024}}}
+
+    def test_rtf_is_in_fail_closed_set(self):
+        assert "rtf" in cdr.FAIL_CLOSED_EXTS
+        assert "rtf" not in cdr.OFFICE_EXTS
+
+    @patch.object(cdr, "s3")
+    @patch.object(cdr, "_publish_result_safe")
+    @patch.object(cdr, "_upload")
+    @patch.object(cdr, "_download")
+    def test_rtf_fails_closed_even_if_added_to_office_exts(
+        self, mock_dl, mock_ul, mock_pub, mock_s3
+    ):
+        """Belt-and-braces: the explicit FAIL_CLOSED_EXTS check must reject RTF even if a
+        future edit wrongly adds 'rtf' to OFFICE_EXTS. RTF must never reach cdr_office()."""
+        mock_dl.return_value = (b"{\\rtf1 {\\object \\objupdate ...}}", "application/rtf")
+        mock_s3.delete_object.return_value = {}
+        with patch.object(cdr, "OFFICE_EXTS", cdr.OFFICE_EXTS | {"rtf"}), \
+             patch.object(cdr, "cdr_office", side_effect=AssertionError("cdr_office reached")):
+            result = cdr.handler(self._event("memo.rtf"), None)
+        assert result["status"] == "unsupported-format"
+        for call in mock_ul.call_args_list:
+            assert call[0][0] != cdr.SANITISED_BUCKET
+        assert mock_pub.call_args[0][2] == "unsupported-format"
+        mock_s3.delete_object.assert_called_once_with(Bucket="src", Key="memo.rtf")
 
 
 class TestReDoSBounded:
