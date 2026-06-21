@@ -15,7 +15,7 @@ stripped — and routed to a sanitised or quarantine bucket. The pipeline is des
 ---
 
 ## How it works
-
+Detailed diagrams of the full dual-layer (CDR + malware scan + aggregator) design:
 ![CDR pipeline architecture](docs/architecture.svg)
 
 EventBridge fires on S3 `ObjectCreated` (`PutObject` / `CompleteMultipartUpload`) and
@@ -23,10 +23,6 @@ invokes the CDR Lambda, which strips active content and routes each file to the 
 or quarantine bucket. **This repo contains the CDR Lambda and its infrastructure** — the
 malware-scan Lambda, result aggregator, and presigned-upload backend are out of scope
 (see [Known gaps](docs/00-production-readiness-index.md)).
-
-> **Detailed diagrams** of the full dual-layer (CDR + malware scan + aggregator) design:
-> the general pipeline — [`docs/cdr_architecture.svg`](docs/cdr_architecture.svg); the
-> [`docs/cdr_xlsx_architecture.svg`](docs/cdr_xlsx_architecture.svg).
 
 ### CDR by format
 
