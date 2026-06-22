@@ -290,6 +290,94 @@ class TestSizeLimit:
         under = _FakeUpload(b"z" * 1024, local_app._READ_CHUNK)
         assert asyncio.run(local_app._read_bounded(under, 1024)) == b"z" * 1024
 
+    def test_oversize_rejected_before_handler_runs(self, monkeypatch):
+        # The Codex finding: the limit must be enforced BEFORE the multipart parser / route
+        # function. Prove the route function never runs on an oversize upload by tripping a
+        # sentinel inside cdr_dispatch — it must stay False, and the response must be 413.
+        monkeypatch.setattr(cdr, "_MAX_FILE_BYTES", 1024)
+        reached = {"handler": False}
+
+        def _spy(*a, **k):
+            reached["handler"] = True
+            raise AssertionError("cdr_dispatch must not run on an oversize upload")
+        monkeypatch.setattr(cdr, "cdr_dispatch", _spy)
+
+        r = client.post("/sanitise",
+                        files={"file": ("big.pdf", b"x" * 8192, "application/pdf")})
+        assert r.status_code == 413
+        assert reached["handler"] is False  # middleware short-circuited before the route
+
+    def test_middleware_rejects_honest_content_length_without_reading_body(self):
+        # An honest oversize Content-Length is rejected by the middleware without ever
+        # pulling the body off the wire (no receive() call). Drive the ASGI app directly.
+        import asyncio
+        old = cdr._MAX_FILE_BYTES
+        cdr._MAX_FILE_BYTES = 1024
+        try:
+            received = {"status": None, "receive_called": False}
+
+            async def receive():
+                received["receive_called"] = True
+                return {"type": "http.request", "body": b"y" * 8192, "more_body": False}
+
+            async def send(msg):
+                if msg["type"] == "http.response.start":
+                    received["status"] = msg["status"]
+
+            scope = {
+                "type": "http", "http_version": "1.1", "method": "POST",
+                "path": "/sanitise", "raw_path": b"/sanitise", "query_string": b"",
+                "scheme": "http",
+                "headers": [
+                    (b"host", b"testserver"),
+                    (b"content-type", b"multipart/form-data; boundary=B"),
+                    (b"content-length", b"8192"),  # honest, oversize
+                ],
+                "client": ("127.0.0.1", 1), "server": ("testserver", 80),
+            }
+            asyncio.run(local_app.app(scope, receive, send))
+            assert received["status"] == 413
+            assert received["receive_called"] is False  # body never read off the wire
+        finally:
+            cdr._MAX_FILE_BYTES = old
+
+    def test_middleware_catches_understated_content_length(self):
+        # A lying (understated) Content-Length must NOT bypass the guard: the byte counter
+        # over the streamed body is authoritative and trips 413.
+        import asyncio
+        old = cdr._MAX_FILE_BYTES
+        cdr._MAX_FILE_BYTES = 1024
+        try:
+            result = {"status": None}
+            boundary = "B"
+            part = (f"--{boundary}\r\n"
+                    'Content-Disposition: form-data; name="file"; filename="x.pdf"\r\n'
+                    "Content-Type: application/pdf\r\n\r\n").encode() + b"y" * 8192 + \
+                   f"\r\n--{boundary}--\r\n".encode()
+
+            async def receive():
+                return {"type": "http.request", "body": part, "more_body": False}
+
+            async def send(msg):
+                if msg["type"] == "http.response.start":
+                    result["status"] = msg["status"]
+
+            scope = {
+                "type": "http", "http_version": "1.1", "method": "POST",
+                "path": "/sanitise", "raw_path": b"/sanitise", "query_string": b"",
+                "scheme": "http",
+                "headers": [
+                    (b"host", b"testserver"),
+                    (b"content-type", f"multipart/form-data; boundary={boundary}".encode()),
+                    (b"content-length", b"10"),  # lies low
+                ],
+                "client": ("127.0.0.1", 1), "server": ("testserver", 80),
+            }
+            asyncio.run(local_app.app(scope, receive, send))
+            assert result["status"] == 413  # counter caught it despite CL=10
+        finally:
+            cdr._MAX_FILE_BYTES = old
+
 
 class TestContentDispositionHardening:
     def test_quote_in_filename_cannot_break_out(self):

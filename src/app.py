@@ -57,7 +57,7 @@ os.environ.setdefault("AWS_ACCESS_KEY_ID", "local")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "local")
 os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse, Response
 from urllib.parse import quote
 
@@ -67,9 +67,94 @@ logger = logging.getLogger("cdr.local")
 
 app = FastAPI(
     title="Local CDR Gateway",
-    version="1.1.0",
+    version="1.2.0",
     description="Content Disarmament & Reconstruction — local variant of the AWS pipeline.",
 )
+
+
+class BodySizeLimitMiddleware:
+    """Pure-ASGI middleware that bounds the request body BEFORE any parser sees it.
+
+    FastAPI resolves ``UploadFile = File(...)`` by running Starlette's multipart parser
+    over the whole body *before* the route function executes — so an in-handler size check
+    cannot stop an oversize upload from first being consumed/spooled. This middleware sits
+    above routing: it rejects an oversize ``Content-Length`` immediately, and otherwise
+    wraps the ASGI ``receive`` callable with a running byte counter so the request is
+    aborted with 413 the moment the streamed body exceeds the limit — the multipart parser
+    never receives the excess bytes. The limit is read per-request from
+    ``cdr._MAX_FILE_BYTES`` so it tracks the same env-tunable bound as the Lambda and so
+    tests can monkeypatch it.
+    """
+
+    def __init__(self, app, limit_getter):
+        self.app = app
+        self._limit_getter = limit_getter
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        limit = self._limit_getter()
+
+        # 1) Fast path: an honest, oversize Content-Length is rejected without reading body.
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    if int(value) > limit:
+                        await _send_413(send)
+                        return
+                except ValueError:
+                    pass  # malformed — fall through to the authoritative counted read
+                break
+
+        # 2) Authoritative path: count actual streamed bytes; Content-Length is advisory.
+        counter = {"total": 0, "tripped": False}
+
+        async def counting_receive():
+            message = await receive()
+            if message["type"] == "http.request":
+                counter["total"] += len(message.get("body", b""))
+                if counter["total"] > limit:
+                    counter["tripped"] = True
+            return message
+
+        sent_413 = {"done": False}
+
+        async def guarded_send(message):
+            # If the limit tripped, the downstream app may still try to respond; suppress
+            # its output and emit a single 413 instead.
+            if counter["tripped"]:
+                if not sent_413["done"]:
+                    sent_413["done"] = True
+                    await _send_413(send)
+                return
+            await send(message)
+
+        try:
+            await self.app(scope, counting_receive, guarded_send)
+        finally:
+            # If the body overran but the downstream app never produced a response (e.g. it
+            # awaited more body and got cut off), make sure the client still gets a 413.
+            if counter["tripped"] and not sent_413["done"]:
+                sent_413["done"] = True
+                await _send_413(send)
+
+
+async def _send_413(send) -> None:
+    body = b'{"status":"rejected","reason":"file too large"}'
+    await send({
+        "type": "http.response.start",
+        "status": 413,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+app.add_middleware(BodySizeLimitMiddleware, limit_getter=lambda: cdr._MAX_FILE_BYTES)
 
 _CONTENT_TYPE_FALLBACK = "application/octet-stream"
 
@@ -148,29 +233,23 @@ def healthz() -> dict:
 
 
 @app.post("/sanitise")
-async def sanitise(request: Request, file: UploadFile = File(...)) -> Response:
+async def sanitise(file: UploadFile = File(...)) -> Response:
     """Disarm an uploaded file.
 
     Success (status == "sanitised"): 200, body = clean file bytes, headers:
         X-CDR-Status, X-CDR-Original-Ext, X-CDR-Sanitised-Ext, X-CDR-Mode,
         X-CDR-Removals, X-CDR-Report (JSON; omitted if too large or non-printable).
-    Oversize upload: 413 JSON {status: "rejected", reason: "file too large"}.
+    Oversize upload: 413 JSON {status: "rejected", reason: "file too large"} — enforced by
+        BodySizeLimitMiddleware BEFORE the multipart parser runs (see that class). The
+        bounded read below is a defence-in-depth backstop on the assembled bytes.
     Rejected / unsupported: 422 JSON {status, reason, original_ext, sanitised_ext}.
     Internal disarm error (e.g. corrupt file): 500 JSON {status: "error"}.
     """
     limit = cdr._MAX_FILE_BYTES
 
-    # ── Early Content-Length reject (advisory) ────────────────────────────────
-    declared = request.headers.get("content-length")
-    if declared is not None:
-        try:
-            if int(declared) > limit:
-                return JSONResponse(status_code=413,
-                                    content={"status": "rejected", "reason": "file too large"})
-        except ValueError:
-            pass  # malformed header — fall through to the authoritative counted read
-
-    # ── Bounded read (authoritative; does not trust Content-Length) ───────────
+    # The middleware has already aborted any oversize body before this point. This bounded
+    # read is a redundant safety net (it never trusts a declared size) so the assembled
+    # `data` object can never exceed the limit even if the middleware were bypassed.
     data = await _read_bounded(file, limit)
     if data is None:
         return JSONResponse(status_code=413,
