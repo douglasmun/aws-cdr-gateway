@@ -2227,7 +2227,9 @@ class TestDenylistGaps:
         ).encode()
         clean, removed = cdr._strip_rels(rels)
         assert b"aFChunk" not in clean
-        assert any("aFChunk" in r for r in removed)
+        # The removed-log records the namespace-independent local name (lowercased), so
+        # Word's aFChunk and the ISO-standard afChunk produce one stable message.
+        assert any("afchunk" in r.lower() for r in removed)
 
     def test_external_hyperlink_target_neutralised(self):
         """External hyperlink rel: Target rewritten to inert, rel KEPT so r:id doesn't
@@ -2652,3 +2654,116 @@ class TestVbaProjectOpenxmlNamespace:
         doc = docx.Document(io.BytesIO(clean))
         # Was: ValueError "There is no item named 'word/vbaProject.bin' in the archive".
         assert [p.text for p in doc.paragraphs] == ["hello"]
+
+
+class TestRelLocalNameMatching:
+    """The CDR rel-strip matches by namespace-independent LOCAL NAME (_rel_local), so the
+    same logical relationship is stripped regardless of which interchangeable namespace a
+    producer emits it under — transitional (openxmlformats), Microsoft (schemas.microsoft.com,
+    incl. 2019/04 long-path), and ISO/IEC-29500 Strict (purl.oclc.org). Regression coverage
+    for the gateway rel-namespace audit (2026-06-22): closes the dual-namespace bug class and
+    the stripped-part/surviving-rel dangling-rel class."""
+
+    NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    def _rels(self, *pairs) -> bytes:
+        rels = "".join(
+            f'<Relationship Id="rId{i}" Type="{t}" Target="{tgt}"/>'
+            for i, (t, tgt) in enumerate(pairs, 1)
+        )
+        return (f'<?xml version="1.0"?><Relationships xmlns="{self.NS}">{rels}'
+                f'</Relationships>').encode()
+
+    def test_localname_set_has_no_missing_audit_names(self):
+        need = {
+            "vbaproject", "oleobject", "externallink", "externallinkpath", "afchunk",
+            "customxml", "customxmlprops", "xlmacrosheet", "xlintlmacrosheet", "tags",
+            "activexcontrolbinary", "externallinklongpath", "oleobjectlinklongpath",
+            "xlstartup", "xlalternatestartup", "xlpathmissing", "xllibrary", "control",
+            "package", "attachedtemplate", "subdocument", "frame", "querytable",
+            "connections", "attachedtoolbars", "webextension", "webextensiontaskpanes",
+        }
+        assert need <= cdr.STRIP_REL_LOCALNAMES, need - cdr.STRIP_REL_LOCALNAMES
+
+    def test_hyperlink_not_in_strip_localnames(self):
+        # Hyperlinks are neutralised in place, never stripped — must NOT be in the set.
+        assert cdr.HYPERLINK_REL_LOCALNAME not in cdr.STRIP_REL_LOCALNAMES
+
+    def test_strict_namespace_vbaproject_stripped(self):
+        # ISO Strict (purl.oclc.org) sibling of the vbaProject rel — previously survived.
+        rels = self._rels((
+            "http://purl.oclc.org/ooxml/officeDocument/relationships/vbaProject",
+            "vbaProject.bin",
+        ))
+        clean, removed = cdr._strip_rels(rels)
+        assert "vbaProject".lower() not in clean.decode().lower()
+        assert any("vbaproject" in r.lower() for r in removed)
+
+    def test_standard_lowercase_afchunk_stripped(self):
+        # Word emits aFChunk (capital F); the ISO standard mandates afChunk (lowercase).
+        # The altChunk active-content vector must strip under BOTH spellings.
+        for tail in ("aFChunk", "afChunk"):
+            rels = self._rels((
+                f"http://schemas.openxmlformats.org/officeDocument/2006/relationships/{tail}",
+                "afchunk/import1.html",
+            ))
+            clean, removed = cdr._strip_rels(rels)
+            assert removed, f"{tail} not stripped"
+            assert "Relationship Id" not in clean.decode(), f"{tail} rel survived"
+
+    def test_xl_macrosheet_rel_stripped(self):
+        rels = self._rels((
+            "http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet",
+            "macrosheets/sheet1.xml",
+        ), (
+            "http://schemas.microsoft.com/office/2006/relationships/xlIntlMacrosheet",
+            "macrosheets/intlsheet1.xml",
+        ))
+        clean, removed = cdr._strip_rels(rels)
+        assert "Relationship Id" not in clean.decode(), "macrosheet rels survived"
+        assert len(removed) == 2
+
+    def test_ppt_tags_rel_stripped(self):
+        rels = self._rels((
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/tags",
+            "tags/tag1.xml",
+        ))
+        clean, removed = cdr._strip_rels(rels)
+        assert "Relationship Id" not in clean.decode(), "tags rel survived"
+        assert removed
+
+    def test_activex_control_binary_rel_stripped(self):
+        rels = self._rels((
+            "http://schemas.microsoft.com/office/2006/relationships/activeXControlBinary",
+            "activeX1.bin",
+        ))
+        clean, removed = cdr._strip_rels(rels)
+        assert "Relationship Id" not in clean.decode(), "activeXControlBinary rel survived"
+        assert removed
+
+    def test_excel_longpath_external_and_ole_rels_stripped(self):
+        rels = self._rels(
+            ("http://schemas.microsoft.com/office/2019/04/relationships/externalLinkLongPath",
+             "externalLinks/externalLink1.xml"),
+            ("http://schemas.microsoft.com/office/2019/04/relationships/oleObjectLinkLongPath",
+             "embeddings/oleObject1.bin"),
+            ("http://schemas.microsoft.com/office/2019/04/relationships/xlExternalLinkLongPath/xlStartup",
+             "x"),
+            ("http://schemas.microsoft.com/office/2009/04/relationships/xlExternalLinkLongPath/xlPathMissing",
+             "y"),
+        )
+        clean, removed = cdr._strip_rels(rels)
+        assert "Relationship Id" not in clean.decode(), "long-path rels survived"
+        assert len(removed) == 4
+
+    def test_hyperlink_still_neutralised_not_stripped(self):
+        # Behaviour preservation: external hyperlink Target rewritten, rel KEPT.
+        rels = self._rels((cdr.HYPERLINK_REL_TYPE, "https://evil.example/x"))
+        # add TargetMode=External
+        rels = rels.replace(b'Target="https://evil.example/x"',
+                            b'Target="https://evil.example/x" TargetMode="External"')
+        clean, removed = cdr._strip_rels(rels)
+        decoded = clean.decode()
+        assert "Relationship Id" in decoded, "hyperlink rel was wrongly stripped"
+        assert "_CDR_REMOVED_" in decoded, "hyperlink target not neutralised"
+        assert "evil.example" not in decoded

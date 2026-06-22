@@ -95,14 +95,57 @@ STRIP_REL_TYPES: set[str] = {
     # safe to remove wholesale. Both the 2006 type and the 2010 customXmlProps variant.
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml",
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps",
+    # ── Dangling-rel siblings of parts dropped by STRIP_ZIP_ENTRIES ───────────────
+    # Each of these points at a part the byte-strip removes; if the rel survives, the
+    # reconstructed package dangles and strict OPC consumers (python-docx, Word) reject
+    # it — the same failure mode as vbaProject/customXml above. (Matching is by LOCAL
+    # NAME — see STRIP_REL_LOCALNAMES — so namespace variants are covered automatically;
+    # these full URIs are kept for documentation and the membership tests.)
+    "http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet",        # xl/macrosheets/
+    "http://schemas.microsoft.com/office/2006/relationships/xlIntlMacrosheet",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/tags",   # ppt/tags/
+    "http://schemas.microsoft.com/office/2006/relationships/activeXControlBinary",  # <app>/activeX*.bin
+    # Excel long-path (>218 char) external-link / OLE-link rels — [MS-OI29500] §12.4.
+    # Note the deliberately mixed year segments (2019/04 vs 2009/04) per the spec.
+    "http://schemas.microsoft.com/office/2019/04/relationships/externalLinkLongPath",
+    "http://schemas.microsoft.com/office/2019/04/relationships/oleObjectLinkLongPath",
+    "http://schemas.microsoft.com/office/2019/04/relationships/xlExternalLinkLongPath/xlStartup",
+    "http://schemas.microsoft.com/office/2019/04/relationships/xlExternalLinkLongPath/xlAlternateStartup",
+    "http://schemas.microsoft.com/office/2009/04/relationships/xlExternalLinkLongPath/xlPathMissing",
+    "http://schemas.microsoft.com/office/2009/04/relationships/xlExternalLinkLongPath/xlLibrary",
 }
 
-# External hyperlink relationship type. NOT in STRIP_REL_TYPES because deleting the rel
-# would dangle the document's r:id reference — instead its Target is rewritten to inert in
-# _strip_rels (UNC paths leak NTLM creds; arbitrary URLs enable phishing/SSRF).
+
+def _rel_local(rel_type: str) -> str:
+    """Reduce an OPC relationship-type URI to its lowercased local name (the final path
+    segment). Relationship Types are namespaced URIs, but the SAME logical relationship
+    ships under multiple interchangeable namespaces in the wild — transitional
+    (``schemas.openxmlformats.org/officeDocument/2006/…``), Microsoft
+    (``schemas.microsoft.com/office/{2006,2011,2019/04}/…``), and ISO/IEC-29500 Strict
+    (``purl.oclc.org/ooxml/officeDocument/…``, emitted after a Word "Strict Open XML"
+    save). Matching on the namespace-independent local name catches all of them with one
+    entry instead of enumerating every URI per type — and closes the dual-namespace bug
+    class (vbaProject under both ms-office and openxmlformats was the original instance).
+
+    Lowercased so Word's ``aFChunk`` and the ISO-standard ``afChunk`` both normalise to
+    one value (altChunk is an active-content import vector — both spellings must strip).
+    """
+    return rel_type.rsplit("/", 1)[-1].lower()
+
+
+# Local names matched by _strip_rels (namespace-independent — see _rel_local). Derived
+# from the documented full-URI set above, so adding a URI there is enough; the extra
+# literals below are local names with no single canonical URI in STRIP_REL_TYPES.
+STRIP_REL_LOCALNAMES: set[str] = {_rel_local(t) for t in STRIP_REL_TYPES}
+
+# External hyperlink relationship type. NOT stripped (deleting the rel would dangle the
+# document's r:id reference) — instead its Target is rewritten to inert in _strip_rels
+# (UNC paths leak NTLM creds; arbitrary URLs enable phishing/SSRF). Matched by local name
+# so the transitional/strict namespace variants are all covered.
 HYPERLINK_REL_TYPE = (
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
 )
+HYPERLINK_REL_LOCALNAME = _rel_local(HYPERLINK_REL_TYPE)
 
 STRIP_ZIP_ENTRIES: set[str] = {
     "word/vbaProject.bin",
@@ -627,16 +670,17 @@ def _strip_rels(data: bytes) -> tuple[bytes, list[str]]:
     to_remove = []
     for child in list(root):
         rel_type = child.get("Type", "")
-        if rel_type in STRIP_REL_TYPES:
+        local = _rel_local(rel_type)
+        if local in STRIP_REL_LOCALNAMES:
             to_remove.append(child)
-            removed.append(f"rel:{child.get('Id')} type={rel_type.split('/')[-1]}")
+            removed.append(f"rel:{child.get('Id')} type={local}")
             continue
 
         # External hyperlinks: neutralise the Target in place rather than deleting the rel
         # (deleting would dangle the document's r:id reference). UNC targets (\\host\share)
         # leak NTLM credentials; arbitrary URLs enable phishing/SSRF on click.
         if (
-            rel_type == HYPERLINK_REL_TYPE
+            local == HYPERLINK_REL_LOCALNAME
             and child.get("TargetMode") == "External"
             and child.get("Target")
         ):
