@@ -346,4 +346,9 @@ def _rename_output(filename: str, sanitised_ext: str) -> str:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Bind host/port from env so the same entrypoint works locally (default loopback —
+    # never exposed by accident) and in a container (set CDR_HOST=0.0.0.0). The service has
+    # no built-in auth; only bind 0.0.0.0 behind your own network controls / reverse proxy.
+    host = os.environ.get("CDR_HOST", "127.0.0.1")
+    port = int(os.environ.get("CDR_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)

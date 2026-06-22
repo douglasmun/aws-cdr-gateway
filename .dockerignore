@@ -1,0 +1,23 @@
+# Keep the build context tiny and the image clean — only src/ is needed by the Dockerfile.
+.git
+.github
+build/
+docs/
+terraform/
+scripts/
+test-corpus/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.DS_Store
+*.md
+src/test_cdr.py
+src/test_cdr_local.py
+src/conftest.py
+src/template.yaml
+bin/
+lib/
+include/
+pyvenv.cfg
+.venv/
+venv/

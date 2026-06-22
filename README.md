@@ -64,6 +64,9 @@ audited and hardened. See [`docs/progress.md`](docs/progress.md).
 | `src/test_cdr_local.py` | Tests for the local service + `cdr_dispatch` core (own file, per the per-module rule) |
 | `docs/local-cdr.md` | **Local CDR service guide** — run, configure, embed, proxy, API contract, security model |
 | `docs/local_cdr_architecture.svg` | "One core, two front-ends" diagram (cloud `handler` + local `app.py` over `cdr_dispatch`) |
+| `Dockerfile` | Container image for the local CDR service (slim, non-root, healthcheck) |
+| `docker-compose.yml` | Runnable sidecar example (hardened: read-only, cap-drop, healthcheck) |
+| `docs/deploy-container.md` | Container / Compose / Kubernetes-sidecar deploy guide + hardening checklist |
 | `src/template.yaml` | AWS SAM infrastructure (buckets, IAM, DLQ, alarms, EventBridge) |
 | `terraform/` | Terraform port of the SAM template (parallel deploy path) |
 | `scripts/build.sh` | Builds the Lambda zip with Linux wheels (for the Terraform path) |
@@ -109,12 +112,28 @@ deliberately excluded from the deployed Lambda package.
 
 ## Local CDR service (no AWS account)
 
-The same disarm engine runs as a local HTTP service. The Lambda's CDR routing — size
-guard, fail-closed unknown-extension gate, RTF/legacy rejection, ZIP structural
-validation, and the per-format disarm of Office/PDF/images — is factored into a **pure,
-I/O-free function** `cdr_dispatch(data, ext)` in `lambda_function.py`. The cloud
-`handler` and the local `app.py` both call it, so the two **cannot drift** on a security
-decision; there is no second CDR implementation.
+**Drop-in file disarming for any app — one `POST`, no AWS, no state.** Run it as a
+container sidecar next to your service: every upload goes through CDR before you trust it,
+and you get back a clean file (or a fail-closed rejection). Same disarm engine as the AWS
+pipeline, on plain HTTP, in any language.
+
+- 🛡️ **Same engine as the cloud** — the local service and the Lambda share one pure,
+  I/O-free core (`cdr_dispatch`), so a file disarmed locally is disarmed by *identical*
+  logic. No second implementation to drift or fall behind.
+- 🔌 **Language-agnostic** — it's an HTTP endpoint. `POST` bytes, read bytes. Python, Go,
+  Node, Java, a shell script — all integrate the same way.
+- ☁️ **Zero AWS** — no account, no credentials, no S3/SNS. Runs on a laptop, in CI, on-prem,
+  or air-gapped.
+- 📦 **Container-ready** — a small, non-root, read-only-capable image with a built-in
+  healthcheck. `docker run` and you have a disarming sidecar.
+- 🔒 **Fail-closed by design** — anything it can't disarm (RTF, legacy OLE, unknown
+  extensions, malformed archives) is *rejected*, never passed through as "clean".
+
+The Lambda's CDR routing — size guard, fail-closed unknown-extension gate, RTF/legacy
+rejection, ZIP structural validation, and the per-format disarm of Office/PDF/images — is
+factored into a **pure, I/O-free function** `cdr_dispatch(data, ext)` in
+`lambda_function.py`. The cloud `handler` and the local `app.py` both call it, so the two
+**cannot drift** on a security decision; there is no second CDR implementation.
 
 ![One core, two front-ends](docs/local_cdr_architecture.svg)
 
@@ -166,6 +185,24 @@ returns the right status for every routing branch:
 ```bash
 cd src && pytest test_cdr_local.py -v
 ```
+
+### Run as a container / sidecar
+
+A small, non-root, healthcheck-equipped image makes the service a drop-in disarming sidecar:
+
+```bash
+docker build -t cdr-gateway:local .
+docker run --rm -p 8000:8000 cdr-gateway:local
+curl -sS -o clean.docx -F file=@dirty.docm http://localhost:8000/sanitise
+
+# or wire it next to your app (with hardening) via Compose:
+docker compose up --build
+```
+
+Your app calls `http://cdr:8000/sanitise` and uses the disarmed response — see the
+commented `app:` service in [`docker-compose.yml`](docker-compose.yml). Full container,
+Compose, and Kubernetes-sidecar guidance (plus the hardening checklist) is in
+[`docs/deploy-container.md`](docs/deploy-container.md).
 
 ### Git hooks
 

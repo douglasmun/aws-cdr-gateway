@@ -90,3 +90,31 @@ jobs:
           name: lambda-zip
           path: build/lambda.zip
           if-no-files-found: error
+
+  docker-build:
+    # Build the local CDR service container image and verify it serves /healthz. Guards the
+    # Dockerfile / local-service deps from rotting; the build is the real regression check
+    # for the container/sidecar artifacts (Dockerfile, docker-compose.yml).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build image
+        run: docker build -t cdr-gateway:ci .
+
+      - name: Run container and check /healthz
+        run: |
+          docker run -d --rm --name cdr-ci -p 8000:8000 cdr-gateway:ci
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/healthz && break
+            sleep 1
+          done
+          # Assert the service is actually up and reports ok.
+          curl -sf http://127.0.0.1:8000/healthz | grep -q '"status":"ok"'
+          # Assert it runs as the non-root cdr user (uid 10001).
+          test "$(docker exec cdr-ci id -u)" = "10001"
+          docker stop cdr-ci
+
+      - name: Validate docker-compose.yml
+        run: docker compose config >/dev/null
