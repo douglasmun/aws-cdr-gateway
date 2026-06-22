@@ -17,6 +17,7 @@ order listed. Do not skip ahead — each manual assumes the previous one is done
 | 04 | `03-security-iam-review.md` | IAM least-privilege, bucket hardening, EventBridge scope, alarm wiring | Security / DevOps |
 | 05 | `04-operations-runbook.md` | Incident response for every alarm type; rollback; quarantine review; maintenance schedule | On-call engineer |
 | — | `../terraform/README.md` | OpenTofu/Terraform deploy reference (alternative to SAM) | DevOps |
+| — | `local-cdr.md` | Local CDR HTTP service (`app.py`) — run, configure, embed, deploy-behind-proxy, API contract, security model. Same `cdr_dispatch` core as the Lambda; no AWS account | App devs / integrators |
 
 **Choose an IaC path before starting.** The stack can be deployed with **AWS SAM**
 (`src/template.yaml`) or **OpenTofu/Terraform** (`terraform/`). They provision the same

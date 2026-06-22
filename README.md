@@ -61,6 +61,9 @@ audited and hardened. See [`docs/progress.md`](docs/progress.md).
 | `src/lambda_function.py` | General CDR Lambda — all Office/PDF/image formats; exposes the pure `cdr_dispatch` decision core |
 | `src/app.py` | **Local CDR service** — FastAPI wrapper around `cdr_dispatch`; disarm files over HTTP with no AWS account |
 | `src/requirements-local.txt` | Extra deps for the local service (`fastapi`, `uvicorn`) — not part of the Lambda layer |
+| `src/test_cdr_local.py` | Tests for the local service + `cdr_dispatch` core (own file, per the per-module rule) |
+| `docs/local-cdr.md` | **Local CDR service guide** — run, configure, embed, proxy, API contract, security model |
+| `docs/local_cdr_architecture.svg` | "One core, two front-ends" diagram (cloud `handler` + local `app.py` over `cdr_dispatch`) |
 | `src/template.yaml` | AWS SAM infrastructure (buckets, IAM, DLQ, alarms, EventBridge) |
 | `terraform/` | Terraform port of the SAM template (parallel deploy path) |
 | `scripts/build.sh` | Builds the Lambda zip with Linux wheels (for the Terraform path) |
@@ -83,20 +86,24 @@ newer. Dependencies are pinned in `src/requirements.txt`.
 # Activate the virtual environment (venv at repo root)
 source bin/activate
 
-# Install dependencies
-pip install -r src/requirements.txt
+# Install dependencies (Lambda + local-service deps)
+pip install -r src/requirements.txt -r src/requirements-local.txt
 
-# Run the full test suite (154 tests)
+# Run the full test suite (227 tests: 178 CDR Lambda + 49 local variant)
+cd src && pytest test_cdr.py test_cdr_local.py -v
 
 # Run one class or test
-pytest test_cdr.py::TestOfficeCDR -v
-pytest test_cdr.py::TestOfficeCDR::test_vba_macro_removed -v
+cd src && pytest test_cdr.py::TestOfficeCDR -v
+cd src && pytest test_cdr.py::TestOfficeCDR::test_vba_macro_removed -v
 
 # Lint (byte-compile)
+cd src && python -m py_compile lambda_function.py app.py
 ```
 
 Tests construct malicious fixtures entirely in memory; S3/SNS are mocked. No live AWS
-credentials are needed to run them.
+credentials are needed to run them. `src/requirements-local.txt` (FastAPI/uvicorn) is only
+needed for the [local CDR service](#local-cdr-service-no-aws-account) and its tests — it is
+deliberately excluded from the deployed Lambda package.
 
 ---
 
@@ -108,6 +115,12 @@ validation, and the per-format disarm of Office/PDF/images — is factored into 
 I/O-free function** `cdr_dispatch(data, ext)` in `lambda_function.py`. The cloud
 `handler` and the local `app.py` both call it, so the two **cannot drift** on a security
 decision; there is no second CDR implementation.
+
+![One core, two front-ends](docs/local_cdr_architecture.svg)
+
+> **Full reference:** [`docs/local-cdr.md`](docs/local-cdr.md) — run, configure, embed,
+> deploy-behind-a-proxy, the API contract, the security model, and the threat/hardening
+> matrix.
 
 `app.py` is a thin [FastAPI](https://fastapi.tiangolo.com/) wrapper: it never touches S3,
 SNS, or any AWS service. Any local app can disarm a file by POSTing it.
