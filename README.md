@@ -77,6 +77,7 @@ audited and hardened. See [`docs/progress.md`](docs/progress.md).
 | `docs/benchmark.py` | Standalone load benchmark with tuning recommendations |
 | `docs/fixtures/` | Threat fixtures + generator covering every CDR path |
 | `docs/comparison-docbleach.md` | CDR coverage compared against DocBleach (per-format, with audit rationale) |
+| `docs/cdr-gap-analysis-stevens.md` | Gap analysis vs Didier Stevens' maldoc toolkit (oledump/pdfid/zipdump/emldump) — what's caught, where, and the JBIG2/JPX hardening |
 
 ---
 
