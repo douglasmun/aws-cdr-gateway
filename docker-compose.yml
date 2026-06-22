@@ -1,0 +1,58 @@
+# Sidecar example: your application + the CDR gateway, side by side.
+#
+# The pattern: your app accepts file uploads but never trusts them. Before storing or
+# forwarding a file, it POSTs the bytes to the CDR sidecar at http://cdr:8000/sanitise and
+# uses the disarmed response. The sidecar has no AWS dependency and holds no state.
+#
+#   docker compose up --build
+#   curl -F file=@dirty.docm http://localhost:8000/sanitise   # exposed for the demo
+#
+# In production you would NOT publish the cdr port to the host — keep it on the internal
+# network and let only your app reach it (drop the `ports:` block below).
+
+services:
+  cdr:
+    build: .
+    image: cdr-gateway:local
+    # Exposed here for the demo / quickstart. Remove in production: the sidecar should be
+    # reachable only by your app over the internal `appnet`, never from the host.
+    ports:
+      - "8000:8000"
+    environment:
+      # Tune the upload ceiling without rebuilding (default 100 MB).
+      CDR_MAX_FILE_BYTES: "104857600"
+    networks:
+      - appnet
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    # Defence-in-depth hardening for an upload-disarming service.
+    read_only: true          # immutable rootfs
+    tmpfs:
+      - /tmp                  # writable scratch for the multipart spool / libs
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # ── Your application (placeholder) ──────────────────────────────────────────
+  # Uncomment and point CDR_URL at the sidecar. Your app calls:
+  #   requests.post(os.environ["CDR_URL"], files={"file": (name, data)})
+  # and uses the returned bytes (200) or handles the rejection (413/422/500).
+  #
+  # app:
+  #   image: your-app:latest
+  #   environment:
+  #     CDR_URL: "http://cdr:8000/sanitise"
+  #   depends_on:
+  #     cdr:
+  #       condition: service_healthy
+  #   networks:
+  #     - appnet
+
+networks:
+  appnet:
+    driver: bridge

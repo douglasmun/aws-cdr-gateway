@@ -18,6 +18,7 @@ order listed. Do not skip ahead — each manual assumes the previous one is done
 | 05 | `04-operations-runbook.md` | Incident response for every alarm type; rollback; quarantine review; maintenance schedule | On-call engineer |
 | — | `../terraform/README.md` | OpenTofu/Terraform deploy reference (alternative to SAM) | DevOps |
 | — | `local-cdr.md` | Local CDR HTTP service (`app.py`) — run, configure, embed, deploy-behind-proxy, API contract, security model. Same `cdr_dispatch` core as the Lambda; no AWS account | App devs / integrators |
+| — | `deploy-container.md` | Containerise the local service as a sidecar — Docker, Compose, Kubernetes, hardening checklist | App devs / DevOps |
 
 **Choose an IaC path before starting.** The stack can be deployed with **AWS SAM**
 (`src/template.yaml`) or **OpenTofu/Terraform** (`terraform/`). They provision the same
