@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 760" width="900" height="760" font-family="'Segoe UI', Arial, sans-serif">
+
+  <!-- Background -->
+  <rect width="900" height="760" fill="#0f1117" rx="12"/>
+
+  <!-- ── TITLE ─────────────────────────────────────────────────────────────── -->
+  <text x="450" y="42" text-anchor="middle" font-size="17" font-weight="700" fill="#e2e8f0" letter-spacing="0.5">CDR — One Core, Two Front-Ends</text>
+  <text x="450" y="62" text-anchor="middle" font-size="11" fill="#64748b">cdr_dispatch() is a pure, I/O-free decision core; the cloud and local entry points only wrap it</text>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       ROW 1 — Two front-ends (cloud · local)
+  ══════════════════════════════════════════════════════════════════════════ -->
+
+  <!-- ░░ LEFT LANE: AWS cloud front-end ░░ -->
+  <!-- Trigger card -->
+  <rect x="64" y="92" width="320" height="84" rx="10" fill="#1e293b" opacity="0.6"/>
+  <rect x="60" y="88" width="320" height="84" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <rect x="60" y="88" width="48" height="84" rx="10" fill="#0ea5e9" opacity="0.15"/>
+  <ellipse cx="84" cy="116" rx="12" ry="5" fill="none" stroke="#0ea5e9" stroke-width="1.8"/>
+  <rect x="72" y="116" width="24" height="18" fill="none" stroke="#0ea5e9" stroke-width="1.8"/>
+  <ellipse cx="84" cy="134" rx="12" ry="5" fill="none" stroke="#0ea5e9" stroke-width="1.8"/>
+  <text x="120" y="113" font-size="13" font-weight="700" fill="#e2e8f0">AWS cloud front-end</text>
+  <text x="120" y="131" font-size="10" fill="#94a3b8">S3 ObjectCreated → EventBridge → Lambda</text>
+  <text x="120" y="148" font-size="10" fill="#64748b">handler(event, context)</text>
+  <text x="120" y="164" font-size="10" fill="#64748b">downloads from S3 · publishes SNS · deletes source</text>
+
+  <!-- ░░ RIGHT LANE: Local HTTP front-end ░░ -->
+  <rect x="520" y="92" width="320" height="84" rx="10" fill="#1e293b" opacity="0.6"/>
+  <rect x="516" y="88" width="320" height="84" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <rect x="516" y="88" width="48" height="84" rx="10" fill="#22c55e" opacity="0.15"/>
+  <!-- globe / HTTP icon -->
+  <circle cx="540" cy="124" r="13" fill="none" stroke="#22c55e" stroke-width="1.8"/>
+  <ellipse cx="540" cy="124" rx="5" ry="13" fill="none" stroke="#22c55e" stroke-width="1.4"/>
+  <line x1="527" y1="124" x2="553" y2="124" stroke="#22c55e" stroke-width="1.4"/>
+  <text x="576" y="113" font-size="13" font-weight="700" fill="#e2e8f0">Local HTTP front-end</text>
+  <text x="576" y="131" font-size="10" fill="#94a3b8">app.py — FastAPI · uvicorn · no AWS account</text>
+  <text x="576" y="148" font-size="10" fill="#64748b">POST /sanitise (multipart file) · GET /healthz</text>
+  <text x="576" y="164" font-size="10" fill="#64748b">BodySizeLimitMiddleware (pre-parse 413 guard)</text>
+
+  <!-- ── FLOW LABELS into the core ── -->
+  <line x1="220" y1="172" x2="220" y2="244" stroke="#0ea5e9" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="220,247 215,236 225,236" fill="#0ea5e9"/>
+  <rect x="120" y="196" width="200" height="34" rx="4" fill="#0f172a"/>
+  <text x="220" y="210" text-anchor="middle" font-size="10" fill="#0ea5e9">① bytes + extension</text>
+  <text x="220" y="224" text-anchor="middle" font-size="9" fill="#64748b">from S3 object (key → ext)</text>
+
+  <line x1="680" y1="172" x2="680" y2="244" stroke="#22c55e" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="680,247 675,236 685,236" fill="#22c55e"/>
+  <rect x="580" y="196" width="200" height="34" rx="4" fill="#0f172a"/>
+  <text x="680" y="210" text-anchor="middle" font-size="10" fill="#22c55e">① bytes + extension</text>
+  <text x="680" y="224" text-anchor="middle" font-size="9" fill="#64748b">from upload (filename → ext)</text>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       ROW 2 — THE SHARED PURE CORE
+  ══════════════════════════════════════════════════════════════════════════ -->
+
+  <rect x="124" y="256" width="652" height="220" rx="12" fill="#1e293b" opacity="0.6"/>
+  <rect x="120" y="252" width="652" height="220" rx="12" fill="#172033" stroke="#a855f7" stroke-width="2"/>
+
+  <text x="446" y="282" text-anchor="middle" font-size="14" font-weight="700" fill="#e2e8f0">cdr_dispatch(data, ext)  —  pure, no I/O</text>
+  <text x="446" y="300" text-anchor="middle" font-size="10" fill="#a855f7">no S3 · no SNS · no CloudWatch · returns a decision, never performs a side effect</text>
+
+  <!-- Decision steps (left column) -->
+  <rect x="148" y="316" width="280" height="26" rx="5" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="160" y="333" font-size="10.5" fill="#cbd5e1">① size guard  ·  ② legacy OLE (doc/xls/ppt) reject</text>
+  <rect x="148" y="348" width="280" height="26" rx="5" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="160" y="365" font-size="10.5" fill="#cbd5e1">③ RTF fail-closed  ·  ④ ZIP structural validation</text>
+  <rect x="148" y="380" width="280" height="26" rx="5" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="160" y="397" font-size="10.5" fill="#cbd5e1">⑤ unknown extension → FAIL CLOSED</text>
+
+  <!-- Disarm engines (right column) -->
+  <rect x="468" y="316" width="280" height="26" rx="5" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="480" y="333" font-size="10.5" fill="#cbd5e1">OFFICE — macros · OLE · ext links (zipfile + ET)</text>
+  <rect x="468" y="348" width="280" height="26" rx="5" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="480" y="365" font-size="10.5" fill="#cbd5e1">PDF — JS · OpenAction · Launch (pikepdf)</text>
+  <rect x="468" y="380" width="280" height="26" rx="5" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="480" y="397" font-size="10.5" fill="#cbd5e1">IMAGE — EXIF · ICC · XMP → re-encode (Pillow)</text>
+
+  <!-- Return shape -->
+  <rect x="148" y="420" width="600" height="36" rx="6" fill="#0f172a" stroke="#475569" stroke-width="1"/>
+  <text x="160" y="436" font-size="10" fill="#94a3b8">returns →  { status: sanitised | rejected | unsupported-format,  data,  report,</text>
+  <text x="160" y="450" font-size="10" fill="#94a3b8">            metric (caller emits),  delete_source (caller acts) }</text>
+
+  <!-- ── FLOW LABELS out of the core ── -->
+  <line x1="220" y1="476" x2="220" y2="552" stroke="#0ea5e9" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="220,555 215,544 225,544" fill="#0ea5e9"/>
+  <rect x="116" y="500" width="208" height="34" rx="4" fill="#0f172a"/>
+  <text x="220" y="514" text-anchor="middle" font-size="10" fill="#0ea5e9">② handler maps to S3 / SNS</text>
+  <text x="220" y="528" text-anchor="middle" font-size="9" fill="#64748b">emits metric · deletes source</text>
+
+  <line x1="680" y1="476" x2="680" y2="552" stroke="#22c55e" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="680,555 675,544 685,544" fill="#22c55e"/>
+  <rect x="576" y="500" width="208" height="34" rx="4" fill="#0f172a"/>
+  <text x="680" y="514" text-anchor="middle" font-size="10" fill="#22c55e">② app.py maps to HTTP</text>
+  <text x="680" y="528" text-anchor="middle" font-size="9" fill="#64748b">status → code · report → headers</text>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       ROW 3 — Outcomes
+  ══════════════════════════════════════════════════════════════════════════ -->
+
+  <!-- Cloud outcomes -->
+  <rect x="60" y="560" width="320" height="92" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="76" y="582" font-size="12" font-weight="700" fill="#e2e8f0">Cloud outcome (S3 routing)</text>
+  <rect x="76" y="594" width="138" height="22" rx="5" fill="#064e3b"/>
+  <text x="145" y="609" text-anchor="middle" font-size="10" fill="#6ee7b7">sanitised → SANITISED_BUCKET</text>
+  <rect x="222" y="594" width="142" height="22" rx="5" fill="#3f1d1d"/>
+  <text x="293" y="609" text-anchor="middle" font-size="10" fill="#fca5a5">rejected → QUARANTINE_BUCKET</text>
+  <text x="76" y="636" font-size="9.5" fill="#64748b">unsupported-format → quarantine + delete source · error → error/ + retry/DLQ</text>
+
+  <!-- Local outcomes -->
+  <rect x="516" y="560" width="320" height="92" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="532" y="582" font-size="12" font-weight="700" fill="#e2e8f0">Local outcome (HTTP response)</text>
+  <rect x="532" y="594" width="64" height="22" rx="5" fill="#064e3b"/>
+  <text x="564" y="609" text-anchor="middle" font-size="10" fill="#6ee7b7">200 clean</text>
+  <rect x="604" y="594" width="56" height="22" rx="5" fill="#3f3a1d"/>
+  <text x="632" y="609" text-anchor="middle" font-size="10" fill="#fde68a">413 big</text>
+  <rect x="668" y="594" width="72" height="22" rx="5" fill="#3f1d1d"/>
+  <text x="704" y="609" text-anchor="middle" font-size="10" fill="#fca5a5">422 reject</text>
+  <rect x="748" y="594" width="72" height="22" rx="5" fill="#3f1d1d"/>
+  <text x="784" y="609" text-anchor="middle" font-size="10" fill="#fca5a5">500 error</text>
+  <text x="532" y="636" font-size="9.5" fill="#64748b">clean bytes + X-CDR-* headers (RFC 6266 filename · nosniff · sanitised report)</text>
+
+  <!-- ── KEY INVARIANT CALLOUT ─────────────────────────────────────────────── -->
+  <rect x="60" y="676" width="780" height="56" rx="10" fill="#172033" stroke="#a855f7" stroke-width="1.3"/>
+  <text x="80" y="699" font-size="11.5" font-weight="700" fill="#c4b5fd">Invariant — a security decision lives in exactly one place</text>
+  <text x="80" y="717" font-size="10" fill="#94a3b8">Both front-ends route through the same cdr_dispatch, so cloud and local can never drift. Never re-implement routing/disarm in a wrapper. (CLAUDE.md pitfall #41)</text>
+
+  <!-- Footer -->
+  <text x="840" y="750" text-anchor="end" font-size="9" fill="#475569">aws-cdr-gateway · docs/local-cdr.md</text>
+</svg>
