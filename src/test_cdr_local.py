@@ -378,6 +378,54 @@ class TestSizeLimit:
         finally:
             cdr._MAX_FILE_BYTES = old
 
+    def test_middleware_stops_feeding_body_after_limit(self):
+        # ultrareview finding: merely flagging "tripped" while still returning every chunk
+        # lets the multipart parser drain the WHOLE oversize body into its buffer. The
+        # middleware must STOP forwarding the body once the limit trips. Feed the body in
+        # small ASGI chunks and assert only a bounded prefix is ever pulled off the wire.
+        import asyncio
+        old = cdr._MAX_FILE_BYTES
+        cdr._MAX_FILE_BYTES = 1024
+        try:
+            boundary = "B"
+            head = (f"--{boundary}\r\n"
+                    'Content-Disposition: form-data; name="file"; filename="x.pdf"\r\n'
+                    "Content-Type: application/pdf\r\n\r\n").encode()
+            payload = head + b"y" * 8192 + f"\r\n--{boundary}--\r\n".encode()
+            chunks = [payload[i:i + 256] for i in range(0, len(payload), 256)]
+            total = len(chunks)
+            pulled = {"n": 0}
+            status = {"v": None}
+
+            async def receive():
+                pulled["n"] += 1
+                body = chunks.pop(0) if chunks else b""
+                return {"type": "http.request", "body": body, "more_body": bool(chunks)}
+
+            async def send(msg):
+                if msg["type"] == "http.response.start":
+                    status["v"] = msg["status"]
+
+            # NO content-length header at all (the chunked-Transfer-Encoding vector the
+            # reviewer flagged) — forces the counted path with no honest size to short out.
+            scope = {
+                "type": "http", "http_version": "1.1", "method": "POST",
+                "path": "/sanitise", "raw_path": b"/sanitise", "query_string": b"",
+                "scheme": "http",
+                "headers": [
+                    (b"host", b"testserver"),
+                    (b"content-type", f"multipart/form-data; boundary={boundary}".encode()),
+                ],
+                "client": ("127.0.0.1", 1), "server": ("testserver", 80),
+            }
+            asyncio.run(local_app.app(scope, receive, send))
+            assert status["v"] == 413
+            # Only a bounded prefix is read — never the whole body. With a 1024-byte limit
+            # over 256-byte chunks the stream is cut within the first handful of chunks.
+            assert pulled["n"] <= 8 and pulled["n"] < total // 2
+        finally:
+            cdr._MAX_FILE_BYTES = old
+
 
 class TestContentDispositionHardening:
     def test_quote_in_filename_cannot_break_out(self):
@@ -398,6 +446,23 @@ class TestContentDispositionHardening:
         assert "\r" not in cd and "\n" not in cd
         assert "/" not in cd  # basename + replacement removes path separators
         assert cd.startswith("attachment; ")
+
+    def test_non_latin1_filename_header_is_encodable(self):
+        # ultrareview finding: a non-Latin-1 filename (CJK) left raw in the legacy
+        # filename="…" value makes the ASGI server's latin-1 header encode RAISE — a 500
+        # that loses the disarmed file. The ascii fallback must be latin-1-safe; the true
+        # name is carried in the RFC 5987 filename* form.
+        cd = local_app._content_disposition("文件.docx")
+        cd.encode("latin-1")  # must not raise
+        assert "filename=\"__.docx\"" in cd
+        assert "filename*=UTF-8''%E6%96%87%E4%BB%B6.docx" in cd
+
+    def test_non_latin1_filename_end_to_end_200(self):
+        # End-to-end: a CJK-named upload is disarmed and returned (200), not crashed (500).
+        r = client.post("/sanitise",
+                        files={"file": ("文件.docx", _make_docx_with_macro(), "application/zip")})
+        assert r.status_code == 200
+        r.headers["content-disposition"].encode("latin-1")  # response header is sane
 
     def test_basename_strips_directories(self):
         cd = local_app._content_disposition("/etc/passwd")

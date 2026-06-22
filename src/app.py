@@ -76,12 +76,16 @@ class BodySizeLimitMiddleware:
     """Pure-ASGI middleware that bounds the request body BEFORE any parser sees it.
 
     FastAPI resolves ``UploadFile = File(...)`` by running Starlette's multipart parser
-    over the whole body *before* the route function executes — so an in-handler size check
-    cannot stop an oversize upload from first being consumed/spooled. This middleware sits
-    above routing: it rejects an oversize ``Content-Length`` immediately, and otherwise
-    wraps the ASGI ``receive`` callable with a running byte counter so the request is
-    aborted with 413 the moment the streamed body exceeds the limit — the multipart parser
-    never receives the excess bytes. The limit is read per-request from
+    over the body *before* the route function executes — so an in-handler size check cannot
+    stop an oversize upload from first being consumed/spooled. This middleware sits above
+    routing: it rejects an oversize ``Content-Length`` immediately (no body read at all),
+    and otherwise wraps the ASGI ``receive`` callable with a running byte counter. The
+    moment the counted bytes exceed the limit it stops forwarding the body — it returns an
+    EOF (``more_body=False``) message to the parser instead of the overrunning chunk and
+    every subsequent chunk — so the parser cannot keep buffering the rest of the upload. A
+    413 is then emitted (``guarded_send``) in place of whatever the truncated parse would
+    have produced. The parser still sees at most the bytes up to the limit plus the head of
+    the tripping chunk, never the full oversize body. The limit is read per-request from
     ``cdr._MAX_FILE_BYTES`` so it tracks the same env-tunable bound as the Lambda and so
     tests can monkeypatch it.
     """
@@ -109,14 +113,26 @@ class BodySizeLimitMiddleware:
                 break
 
         # 2) Authoritative path: count actual streamed bytes; Content-Length is advisory.
+        # Once the running total exceeds the limit we STOP feeding the body downstream — we
+        # hand the multipart parser a truncated, EOF-terminated stream so it cannot keep
+        # buffering the rest of an oversize upload into memory/spool. (Merely flagging a
+        # boolean while still returning every chunk would let the parser drain the whole
+        # body before the 413 — the bug this guards against.)
         counter = {"total": 0, "tripped": False}
 
         async def counting_receive():
+            if counter["tripped"]:
+                # Already over the limit: present EOF so the parser unwinds immediately
+                # instead of pulling (and buffering) more body bytes.
+                return {"type": "http.request", "body": b"", "more_body": False}
             message = await receive()
             if message["type"] == "http.request":
                 counter["total"] += len(message.get("body", b""))
                 if counter["total"] > limit:
                     counter["tripped"] = True
+                    # Drop the overrunning chunk's body and signal EOF; the 413 is emitted
+                    # by guarded_send. Do not pass these excess bytes to the parser.
+                    return {"type": "http.request", "body": b"", "more_body": False}
             return message
 
         sent_413 = {"done": False}
@@ -191,14 +207,19 @@ def _is_clean_header_value(value: str) -> bool:
 def _content_disposition(filename: str) -> str:
     """Build a safe ``Content-Disposition: attachment`` value.
 
-    The filename is attacker-controlled (multipart part header). A literal ``"`` would
-    otherwise break out of the quoted-string form (``filename="foo".docx"``). We emit BOTH
-    a sanitised ASCII ``filename=`` (quotes/backslashes/controls/path-separators removed)
-    for legacy clients AND an RFC 5987 ``filename*=UTF-8''…`` percent-encoded form for the
-    true name — neither can inject header structure."""
+    The filename is attacker-controlled (multipart part header). Two hazards:
+      * a literal ``"`` would break out of the quoted-string form (``filename="foo".docx"``);
+      * a non-Latin-1 character (e.g. CJK) in the legacy ``filename="…"`` value makes the
+        ASGI server's ``.encode('latin-1')`` of the header RAISE — turning a successful
+        disarm into a 500 that loses the cleaned file.
+    So the legacy ``filename=`` value is reduced to printable ASCII only (everything outside
+    0x20–0x7E, plus ``"``/``\\``/``/``, replaced with ``_``); the true Unicode name is carried
+    losslessly in the RFC 5987 ``filename*=UTF-8''…`` percent-encoded form, which every
+    modern client prefers. Neither form can inject header structure or non-Latin-1 bytes."""
     base = os.path.basename(filename or "") or "file"
-    ascii_name = re.sub(r'[\\"\x00-\x1f\x7f/]', "_", base)
-    star = quote(base, safe="")  # percent-encode everything unsafe, incl. quotes/CR/LF
+    # ASCII-only fallback: replace any non-printable-ASCII byte and the structural chars.
+    ascii_name = re.sub(r'[^\x20-\x7e]|["\\/]', "_", base) or "file"
+    star = quote(base, safe="")  # percent-encode everything unsafe, incl. quotes/CR/LF/UTF-8
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{star}"
 
 
