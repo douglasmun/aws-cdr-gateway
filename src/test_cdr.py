@@ -2584,3 +2584,71 @@ class TestTruncateRemoved:
         serialised = len(__import__("json").dumps(result["report"]["removed"]))
         assert serialised <= cdr._SNS_REMOVED_BYTE_BUDGET
         assert "truncated" in result["report"]["removed"][-1]
+
+
+class TestVbaProjectOpenxmlNamespace:
+    """Regression: real-world macro docs (LibreOffice / python-docx authored) emit the
+    vbaProject relationship under the openxmlformats.org officeDocument/2006 namespace,
+    not the microsoft.com office/2006 one. Both must be stripped; otherwise the rel and
+    the /word/vbaProject.bin content-type Override dangle at the removed part and a strict
+    OPC consumer (python-docx, Word) rejects the reconstructed file with
+    "There is no item named 'word/vbaProject.bin' in the archive"."""
+
+    def _make_docm_openxml_vba(self) -> bytes:
+        ns_pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+        # NOTE: openxmlformats namespace, not microsoft.com — this is the form that escaped CDR.
+        vba_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vbaProject"
+        rels_xml = (
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<Relationships xmlns="{ns_pkg}">'
+            f'<Relationship Id="rId1" Type="{vba_rel}" Target="vbaProject.bin"/>'
+            f'</Relationships>'
+        )
+        ct_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/>'
+            '<Override PartName="/word/document.xml" ContentType="application/vnd.ms-word.document.macroEnabled.main+xml"/>'
+            '<Override PartName="/word/vbaProject.bin" ContentType="application/vnd.ms-office.vbaProject"/>'
+            '</Types>'
+        )
+        doc_xml = (
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:body><w:p><w:r><w:t>hello</w:t></w:r></w:p></w:body></w:document>'
+        )
+        root_rels = (
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<Relationships xmlns="{ns_pkg}">'
+            f'<Relationship Id="rIdMain"'
+            f' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"'
+            f' Target="word/document.xml"/>'
+            f'</Relationships>'
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", ct_xml)
+            z.writestr("_rels/.rels", root_rels)
+            z.writestr("word/_rels/document.xml.rels", rels_xml)
+            z.writestr("word/vbaProject.bin", b"\xd0\xcf\x11\xe0MACRO_PAYLOAD")
+            z.writestr("word/document.xml", doc_xml)
+        return buf.getvalue()
+
+    def test_openxml_vba_rel_and_override_stripped(self):
+        clean, report = cdr.cdr_office(self._make_docm_openxml_vba(), "docm")
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            names    = [n.lower() for n in z.namelist()]
+            ct_xml   = z.read("[Content_Types].xml").decode()
+            rels_xml = z.read("word/_rels/document.xml.rels").decode()
+        assert not any("vbaproject.bin" in n for n in names), "VBA part still present"
+        assert "vbaProject" not in rels_xml, "openxmlformats vbaProject rel not stripped"
+        assert "vbaProject" not in ct_xml, "vbaProject content-type (Default/Override) not removed"
+        assert any("vbaProject" in r for r in report["removed"]), "rel removal not reported"
+
+    def test_sanitised_docm_opens_in_python_docx(self):
+        clean, _ = cdr.cdr_office(self._make_docm_openxml_vba(), "docm")
+        docx = pytest.importorskip("docx")
+        doc = docx.Document(io.BytesIO(clean))
+        # Was: ValueError "There is no item named 'word/vbaProject.bin' in the archive".
+        assert [p.text for p in doc.paragraphs] == ["hello"]
