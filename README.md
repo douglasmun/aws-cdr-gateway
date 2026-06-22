@@ -3,6 +3,8 @@
 ![banner](docs/social-preview.png)
 
 [![tests](https://github.com/douglasmun/aws-cdr-gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/douglasmun/aws-cdr-gateway/actions/workflows/tests.yml)
+[![release](https://img.shields.io/github/v/release/douglasmun/aws-cdr-gateway?sort=semver)](https://github.com/douglasmun/aws-cdr-gateway/releases/latest)
+[![GHCR image](https://img.shields.io/badge/ghcr.io-aws--cdr--gateway-blue?logo=docker)](https://github.com/douglasmun/aws-cdr-gateway/pkgs/container/aws-cdr-gateway)
 
 A serverless AWS pipeline that performs **Content Disarmament and Reconstruction (CDR)**
 on files uploaded to S3. Files are structurally disarmed — active/executable content is
