@@ -64,7 +64,12 @@ _MAX_ENTRY_BYTES = int(os.environ.get("CDR_MAX_ENTRY_BYTES", str(200 * 1024 * 10
 
 # ── OOXML (Office) dangerous relationship types ────────────────────────────────
 STRIP_REL_TYPES: set[str] = {
+    # vbaProject ships under two interchangeable rel-type URIs in the wild: the Microsoft
+    # office/2006 form AND the openxmlformats officeDocument/2006 form (LibreOffice and
+    # python-docx-authored macro docs emit the latter). Both must be stripped, or the rel
+    # dangles at the removed vbaProject.bin part and python-docx/Word reject the doc.
     "http://schemas.microsoft.com/office/2006/relationships/vbaProject",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vbaProject",
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject",
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink",
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath",
@@ -675,7 +680,12 @@ def _sanitise_content_types(data: bytes) -> tuple[bytes, list[str]]:
             to_remove.append(child)
             removed.append(f"content-type removed: {ct}")
 
-        elif child.tag == f"{{{ns}}}Override" and "activex" in ct.lower():
+        elif child.tag == f"{{{ns}}}Override" and (
+            "activex" in ct.lower() or "vba" in ct.lower()
+        ):
+            # An Override pinning a content type to /word/vbaProject.bin dangles once the
+            # part is stripped (some authors emit one alongside the Default Extension="bin"
+            # entry). Drop it for the same reason as the Default vba branch above.
             to_remove.append(child)
             removed.append(f"content-type removed: {ct}")
 
