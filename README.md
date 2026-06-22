@@ -191,6 +191,10 @@ cd src && pytest test_cdr_local.py -v
 A small, non-root, healthcheck-equipped image makes the service a drop-in disarming sidecar:
 
 ```bash
+# Pull the published multi-arch image (amd64 + arm64)
+docker run --rm -p 8000:8000 ghcr.io/douglasmun/aws-cdr-gateway:latest
+
+# …or build from source
 docker build -t cdr-gateway:local .
 docker run --rm -p 8000:8000 cdr-gateway:local
 curl -sS -o clean.docx -F file=@dirty.docm http://localhost:8000/sanitise

@@ -14,14 +14,28 @@ for the "one core, two front-ends" picture.
 
 ## Quickstart
 
+Pull the published image (multi-arch: amd64 + arm64):
+
+```bash
+docker run --rm -p 8000:8000 ghcr.io/douglasmun/aws-cdr-gateway:latest
+```
+
+…or build it yourself from source:
+
 ```bash
 docker build -t cdr-gateway:local .
 docker run --rm -p 8000:8000 cdr-gateway:local
+```
 
-# in another shell
+Then:
+
+```bash
 curl -sS http://localhost:8000/healthz
 curl -sS -o clean.docx -F file=@dirty.docm http://localhost:8000/sanitise
 ```
+
+> Images are published to GHCR by the `docker-publish` workflow on a version tag
+> (`git tag v1.0.0 && git push origin v1.0.0` → `:1.0.0`, `:1.0`, `:1`, `:latest`).
 
 Or with Compose (includes the sidecar wiring and hardening):
 
