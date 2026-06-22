@@ -190,6 +190,8 @@ OFFICE_EXTS: set[str] = {
 
 LEGACY_EXTS: set[str] = {"doc", "xls", "ppt"}
 
+IMAGE_EXTS: set[str] = {"jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"}
+
 # Formats DELIBERATELY rejected — never given a CDR handler. These carry active content
 # as loose, parser-divergent structure (embedded/linked OLE, remote-template refs, control
 # words a forgiving consumer acts on) rather than as cleanly-excisable content. A
@@ -267,6 +269,94 @@ def _is_postscript_ct(ct: str) -> bool:
 _ZIP_MAGIC           = b"\x50\x4b\x03\x04"
 _SAFE_COMPRESS_METHODS = {0, 8}  # stored, deflate
 
+# ── Pure CDR decision core ──────────────────────────────────────────────────────
+
+# Disposition values returned by cdr_dispatch in result["status"]:
+#   "sanitised"          — content disarmed; result["data"] is the clean bytes
+#   "rejected"           — ZIP structural anomaly; hard reject (source must be deleted)
+#   "unsupported-format" — legacy OLE, fail-closed carrier (RTF), or unknown extension
+# cdr_dispatch performs NO I/O (no S3/SNS/CloudWatch). It is the single decision path
+# shared by the Lambda handler and any local consumer (e.g. the FastAPI service in
+# app.py), so the two can never drift apart on a security decision. Side-effect signals
+# the caller may need to act on are returned, not emitted:
+#   result["metric"]     — "zip-anomaly" | "passthrough" | None  (caller emits to CloudWatch)
+#   result["delete_source"] — bool: whether the source object should be deleted on this path
+
+def cdr_dispatch(data: bytes, ext: str, *, max_file_bytes: Optional[int] = None) -> dict:
+    """Pure CDR gate: decide and (if applicable) disarm ``data`` for extension ``ext``.
+
+    Mirrors the routing in ``handler`` exactly — size guard, legacy-OLE reject,
+    fail-closed carrier reject, ZIP structural validation, unknown-extension fail-close,
+    then format-specific CDR — but performs no I/O. Returns a dict:
+
+        {
+          "status": "sanitised" | "rejected" | "unsupported-format",
+          "data":   bytes | None,        # clean output (only when sanitised)
+          "original_ext":  str,
+          "sanitised_ext": str,
+          "cdr_mode":   str | None,
+          "report":     dict | None,
+          "reason":     str | None,      # why rejected/unsupported
+          "metric":     str | None,      # "zip-anomaly" | "passthrough"
+          "delete_source": bool,
+        }
+
+    Raises whatever the format CDR functions raise (e.g. on a corrupt PDF) — the caller
+    decides quarantine-and-reraise vs. surface-the-error, matching the Lambda error path.
+    """
+    ext           = ext.lower()
+    sanitised_ext = EXT_REMAP.get(ext, ext)
+    limit         = _MAX_FILE_BYTES if max_file_bytes is None else max_file_bytes
+
+    def _result(status, **kw):
+        base = {
+            "status": status, "data": None, "original_ext": ext,
+            "sanitised_ext": sanitised_ext, "cdr_mode": None, "report": None,
+            "reason": None, "metric": None, "delete_source": False,
+        }
+        base.update(kw)
+        return base
+
+    # ── Pre-CDR size guard ────────────────────────────────────────────────────
+    if len(data) > limit:
+        return _result("rejected", reason="file too large", delete_source=False)
+
+    # ── Legacy binary (OLE) formats — unsupported, fail closed ────────────────
+    if ext in LEGACY_EXTS:
+        return _result("unsupported-format",
+                       reason="OLE binary format not supported", delete_source=True)
+
+    # ── Deliberately-rejected carriers (RTF) — FAIL CLOSED (highest priority) ──
+    if ext in FAIL_CLOSED_EXTS:
+        return _result("unsupported-format",
+                       reason=f"format rejected by design: {ext}",
+                       metric="passthrough", delete_source=True)
+
+    # ── ZIP structural validation (Office only) ───────────────────────────────
+    if ext in OFFICE_EXTS:
+        valid, zip_anomalies = _validate_zip_structure(data)
+        if not valid:
+            return _result("rejected", reason=zip_anomalies[0],
+                           metric="zip-anomaly", delete_source=True)
+
+    # ── Unknown extension — FAIL CLOSED ───────────────────────────────────────
+    if ext not in OFFICE_EXTS and ext != "pdf" and ext not in IMAGE_EXTS:
+        return _result("unsupported-format",
+                       reason=f"unsupported extension: {ext}",
+                       metric="passthrough", delete_source=True)
+
+    # ── CDR dispatch ──────────────────────────────────────────────────────────
+    if ext in OFFICE_EXTS:
+        clean_bytes, report = cdr_office(data, ext)
+    elif ext == "pdf":
+        clean_bytes, report = cdr_pdf(data)
+    else:  # one of IMAGE_EXTS, per the fail-closed guard above
+        clean_bytes, report = cdr_image(data, ext)
+
+    return _result("sanitised", data=clean_bytes, report=report,
+                   cdr_mode=report.get("cdr_mode", "full"), delete_source=True)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def handler(event: dict, context) -> dict:
@@ -313,100 +403,13 @@ def handler(event: dict, context) -> dict:
         raise
 
     ext           = key.rsplit(".", 1)[-1].lower() if "." in key else ""
-    sanitised_ext = EXT_REMAP.get(ext, ext)
-    zip_anomalies: list[str] = []
 
-    # ── Legacy binary formats ─────────────────────────────────────────────────
-    if ext in LEGACY_EXTS:
-        logger.warning("Unsupported legacy format: key=%s ext=%s", key, ext)
-        if QUARANTINE_BUCKET:
-            try:
-                _upload(QUARANTINE_BUCKET, f"unsupported/{key}", file_bytes, content_type,
-                        {"cdr-status": "unsupported-format", "cdr-original-ext": ext,
-                         "cdr-timestamp": _now()})
-            except Exception as q_exc:
-                logger.warning("Quarantine upload failed: key=%s error=%s", key, q_exc)
-        _publish_result_safe(bucket, key, "unsupported-format",
-                             {"reason": "OLE binary format not supported", "original_ext": ext})
-        _delete_source_safe(bucket, key)
-        return {"status": "unsupported-format", "reason": "OLE binary format not supported"}
-
-    # ── Deliberately-rejected carriers — FAIL CLOSED (highest priority) ───────
-    # RTF (and any other FAIL_CLOSED_EXTS member) is rejected BY DESIGN — never given a
-    # CDR handler. This check runs FIRST, before ZIP validation and the unknown-extension
-    # gate, so the rejection is order-independent: even if a future edit wrongly adds the
-    # extension to OFFICE_EXTS, it lands here and never reaches cdr_office(). See pitfall #38.
-    if ext in FAIL_CLOSED_EXTS:
-        logger.warning("Deliberately-rejected format — quarantine (fail closed): "
-                       "key=%s ext=%s", key, ext)
-        _emit_passthrough_metric(ext)
-        if QUARANTINE_BUCKET:
-            try:
-                _upload(QUARANTINE_BUCKET, f"unsupported/{key}", file_bytes, content_type,
-                        {"cdr-status": "unsupported-format", "cdr-original-ext": ext,
-                         "cdr-timestamp": _now()})
-            except Exception as q_exc:
-                logger.warning("Quarantine upload failed: key=%s error=%s", key, q_exc)
-        _publish_result_safe(bucket, key, "unsupported-format",
-                             {"reason": f"format rejected by design: {ext}", "original_ext": ext})
-        _delete_source_safe(bucket, key)
-        return {"status": "unsupported-format", "reason": f"format rejected by design: {ext}"}
-
-    # ── ZIP structural validation ─────────────────────────────────────────────
-    if ext in OFFICE_EXTS:
-        valid, zip_anomalies = _validate_zip_structure(file_bytes)
-        if not valid:
-            logger.warning("ZIP validation failed: key=%s reason=%s", key, zip_anomalies)
-            _emit_zip_anomaly_metric()
-            if QUARANTINE_BUCKET:
-                try:
-                    _upload(QUARANTINE_BUCKET, f"rejected/{key}", file_bytes, content_type,
-                            {"cdr-status": "rejected", "cdr-reason": zip_anomalies[0][:256],
-                             "cdr-timestamp": _now()})
-                except Exception as q_exc:
-                    logger.warning("Quarantine upload failed: key=%s error=%s", key, q_exc)
-            _publish_result_safe(bucket, key, "rejected",
-                                 {"reason": zip_anomalies[0], "original_ext": ext})
-            _delete_source_safe(bucket, key)
-            return {"status": "rejected", "reason": zip_anomalies[0]}
-        # _validate_zip_structure returns (False, [anomaly]) on any anomaly (hard reject
-        # above) or (True, []) when clean — it never returns (True, non-empty). So past
-        # this point zip_anomalies is always empty; there is no "valid-but-anomalous" path.
-
-    # ── Unknown extension — FAIL CLOSED ───────────────────────────────────────
-    # A CDR gate must never label content it did not disarm as "sanitised". An
-    # unrecognised extension (.svg, .html, .lnk, .iso, …) is quarantined with the source
-    # preserved-then-deleted — it must NOT reach SANITISED_BUCKET. Carriers like SVG/HTML
-    # are active-content vectors; passing them through inverts the trust label on the
-    # sanitised bucket. (RTF and other deliberately-rejected carriers are already handled
-    # by the FAIL_CLOSED_EXTS block above.) The detective passthrough metric still fires.
-    if (
-        ext not in OFFICE_EXTS
-        and ext != "pdf"
-        and ext not in ("jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp")
-    ):
-        logger.warning("Unknown extension — quarantine (fail closed): key=%s ext=%s", key, ext)
-        _emit_passthrough_metric(ext)
-        if QUARANTINE_BUCKET:
-            try:
-                _upload(QUARANTINE_BUCKET, f"unsupported/{key}", file_bytes, content_type,
-                        {"cdr-status": "unsupported-format", "cdr-original-ext": ext,
-                         "cdr-timestamp": _now()})
-            except Exception as q_exc:
-                logger.warning("Quarantine upload failed: key=%s error=%s", key, q_exc)
-        _publish_result_safe(bucket, key, "unsupported-format",
-                             {"reason": f"unsupported extension: {ext}", "original_ext": ext})
-        _delete_source_safe(bucket, key)
-        return {"status": "unsupported-format", "reason": f"unsupported extension: {ext}"}
-
-    # ── CDR dispatch ──────────────────────────────────────────────────────────
+    # ── Pure CDR decision core ────────────────────────────────────────────────
+    # cdr_dispatch makes every routing/disarm decision with NO I/O; the handler maps
+    # its result onto S3/SNS/CloudWatch. The CDR functions can still raise (corrupt PDF
+    # etc.) — that is the error path below.
     try:
-        if ext in OFFICE_EXTS:
-            clean_bytes, report = cdr_office(file_bytes, ext)
-        elif ext == "pdf":
-            clean_bytes, report = cdr_pdf(file_bytes)
-        else:  # one of the image extensions, per the guard above
-            clean_bytes, report = cdr_image(file_bytes, ext)
+        decision = cdr_dispatch(file_bytes, ext)
     except Exception as exc:
         logger.exception("CDR processing failed: key=%s error=%s", key, exc)
         if QUARANTINE_BUCKET:
@@ -418,9 +421,39 @@ def handler(event: dict, context) -> dict:
         _publish_result_safe(bucket, key, "error", {"error": str(exc), "original_ext": ext})
         raise
 
-    # ── Upload sanitised output ───────────────────────────────────────────────
+    sanitised_ext = decision["sanitised_ext"]
+
+    # Emit the side-effect metric the decision asked for (CloudWatch — caller's job).
+    if decision["metric"] == "zip-anomaly":
+        _emit_zip_anomaly_metric()
+    elif decision["metric"] == "passthrough":
+        _emit_passthrough_metric(ext)
+
+    # ── Reject / unsupported routing ──────────────────────────────────────────
+    if decision["status"] != "sanitised":
+        reason       = decision["reason"]
+        status       = decision["status"]
+        prefix       = "rejected" if status == "rejected" else "unsupported"
+        tag_status   = "rejected" if status == "rejected" else "unsupported-format"
+        logger.warning("CDR %s: key=%s ext=%s reason=%s", status, key, ext, reason)
+        if QUARANTINE_BUCKET:
+            try:
+                _upload(QUARANTINE_BUCKET, f"{prefix}/{key}", file_bytes, content_type,
+                        {"cdr-status": tag_status, "cdr-reason": str(reason)[:256],
+                         "cdr-original-ext": ext, "cdr-timestamp": _now()})
+            except Exception as q_exc:
+                logger.warning("Quarantine upload failed: key=%s error=%s", key, q_exc)
+        _publish_result_safe(bucket, key, status, {"reason": reason, "original_ext": ext})
+        if decision["delete_source"]:
+            _delete_source_safe(bucket, key)
+        return {"status": status, "reason": reason}
+
+    # ── Sanitised output ──────────────────────────────────────────────────────
+    clean_bytes           = decision["data"]
+    report                = decision["report"]
+    zip_anomalies: list[str] = []
     dest_key              = _sanitised_key(key, sanitised_ext)
-    cdr_mode              = report.get("cdr_mode", "full")
+    cdr_mode              = decision["cdr_mode"]
     sanitised_content_type = _content_type_for_ext(sanitised_ext, content_type)
     removal_count         = len(report.get("removed", []))
 

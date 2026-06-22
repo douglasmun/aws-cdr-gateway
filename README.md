@@ -58,7 +58,9 @@ audited and hardened. See [`docs/progress.md`](docs/progress.md).
 
 | Path | Purpose |
 |---|---|
-| `src/lambda_function.py` | General CDR Lambda — all Office/PDF/image formats |
+| `src/lambda_function.py` | General CDR Lambda — all Office/PDF/image formats; exposes the pure `cdr_dispatch` decision core |
+| `src/app.py` | **Local CDR service** — FastAPI wrapper around `cdr_dispatch`; disarm files over HTTP with no AWS account |
+| `src/requirements-local.txt` | Extra deps for the local service (`fastapi`, `uvicorn`) — not part of the Lambda layer |
 | `src/template.yaml` | AWS SAM infrastructure (buckets, IAM, DLQ, alarms, EventBridge) |
 | `terraform/` | Terraform port of the SAM template (parallel deploy path) |
 | `scripts/build.sh` | Builds the Lambda zip with Linux wheels (for the Terraform path) |
@@ -95,6 +97,62 @@ pytest test_cdr.py::TestOfficeCDR::test_vba_macro_removed -v
 
 Tests construct malicious fixtures entirely in memory; S3/SNS are mocked. No live AWS
 credentials are needed to run them.
+
+---
+
+## Local CDR service (no AWS account)
+
+The same disarm engine runs as a local HTTP service. The Lambda's CDR routing — size
+guard, fail-closed unknown-extension gate, RTF/legacy rejection, ZIP structural
+validation, and the per-format disarm of Office/PDF/images — is factored into a **pure,
+I/O-free function** `cdr_dispatch(data, ext)` in `lambda_function.py`. The cloud
+`handler` and the local `app.py` both call it, so the two **cannot drift** on a security
+decision; there is no second CDR implementation.
+
+`app.py` is a thin [FastAPI](https://fastapi.tiangolo.com/) wrapper: it never touches S3,
+SNS, or any AWS service. Any local app can disarm a file by POSTing it.
+
+```bash
+cd src
+pip install -r requirements.txt -r requirements-local.txt
+uvicorn app:app --host 127.0.0.1 --port 8000      # or: python app.py
+```
+
+```bash
+# Disarm a macro-enabled doc → get a clean .docx back (note the extension remap)
+curl -sS -o clean.docx -D - -F file=@dirty.docm http://127.0.0.1:8000/sanitise
+#   200 OK
+#   x-cdr-status: sanitised
+#   x-cdr-sanitised-ext: docx
+#   x-cdr-removals: 1
+#   x-cdr-report: {"format":"docm","removed":["word/vbaProject.bin"],...}
+
+# Fail-closed: RTF and unknown extensions are rejected, never "sanitised"
+curl -sS -F file=@evil.rtf http://127.0.0.1:8000/sanitise
+#   422 {"status":"unsupported-format","reason":"format rejected by design: rtf",...}
+```
+
+| Endpoint | Behaviour |
+|---|---|
+| `POST /sanitise` (multipart `file`) | **200** + clean bytes (`X-CDR-*` headers carry status/report) on success; **413** JSON when the upload exceeds `CDR_MAX_FILE_BYTES`; **422** JSON for rejected/unsupported input; **500** JSON for an unparseable file |
+| `GET /healthz` | Liveness + the formats this build will attempt to disarm |
+
+This is a single-process service for **trusted local/internal use** (a sidecar, a desktop
+integration, a batch tool) — it has no built-in auth or rate limiting. Put it behind your
+own controls before exposing it beyond localhost. The HTTP layer is nonetheless hardened:
+the body is size-bounded **before** it is fully buffered (early `Content-Length` reject
+plus an authoritative counted read, so a multi-GB upload can't OOM the process); the
+`Content-Disposition` filename is RFC 6266/5987 encoded (no header-injection via a crafted
+filename); response headers carry only sanitised, length-capped values; and internal
+errors return a generic message (the real exception is logged server-side only).
+
+Tests for the local variant live in `src/test_cdr_local.py` (its own file, per the
+per-module test rule) and prove both that `cdr_dispatch` does no I/O and that the endpoint
+returns the right status for every routing branch:
+
+```bash
+cd src && pytest test_cdr_local.py -v
+```
 
 ### Git hooks
 

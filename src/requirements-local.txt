@@ -1,0 +1,10 @@
+# Local CDR service (app.py) dependencies — NOT part of the Lambda layer.
+# Install on top of requirements.txt for the FastAPI local variant:
+#   pip install -r requirements.txt -r requirements-local.txt
+# The Lambda build (template.yaml) uses requirements.txt only, so these never bloat the
+# deployed package.
+
+fastapi==0.115.6         # local HTTP CDR service framework
+uvicorn==0.34.0          # ASGI server for app.py
+python-multipart==0.0.20 # multipart/form-data parsing for file uploads
+httpx==0.28.1            # FastAPI TestClient dependency (test_cdr_local.py)

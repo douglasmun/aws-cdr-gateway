@@ -41,18 +41,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r src/requirements.txt
+          # Local CDR service deps (FastAPI/uvicorn/httpx) — needed to import src/app.py
+          # and run src/test_cdr_local.py. Kept out of the Lambda layer (requirements.txt).
+          pip install -r src/requirements-local.txt
           pip install pytest
 
       - name: Byte-compile (lint)
         run: |
           python -m py_compile \
             src/lambda_function.py \
+            src/app.py \
             docs/benchmark.py \
             docs/fixtures/generate_fixtures.py
 
       - name: Run tests
         working-directory: src
-        run: pytest test_cdr.py -v
+        # Both suites: the CDR Lambda (test_cdr.py) and the local FastAPI service +
+        # cdr_dispatch core (test_cdr_local.py).
+        run: pytest test_cdr.py test_cdr_local.py -v
 
   build-package:
     # Verify the Lambda deployment package builds with Linux wheels. Runs on Linux so the
