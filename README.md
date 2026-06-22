@@ -134,12 +134,17 @@ curl -sS -F file=@evil.rtf http://127.0.0.1:8000/sanitise
 
 | Endpoint | Behaviour |
 |---|---|
-| `POST /sanitise` (multipart `file`) | **200** + clean bytes (`X-CDR-*` headers carry status/report) on success; **422** JSON for rejected/unsupported input; **500** JSON for an unparseable file |
+| `POST /sanitise` (multipart `file`) | **200** + clean bytes (`X-CDR-*` headers carry status/report) on success; **413** JSON when the upload exceeds `CDR_MAX_FILE_BYTES`; **422** JSON for rejected/unsupported input; **500** JSON for an unparseable file |
 | `GET /healthz` | Liveness + the formats this build will attempt to disarm |
 
 This is a single-process service for **trusted local/internal use** (a sidecar, a desktop
 integration, a batch tool) — it has no built-in auth or rate limiting. Put it behind your
-own controls before exposing it beyond localhost.
+own controls before exposing it beyond localhost. The HTTP layer is nonetheless hardened:
+the body is size-bounded **before** it is fully buffered (early `Content-Length` reject
+plus an authoritative counted read, so a multi-GB upload can't OOM the process); the
+`Content-Disposition` filename is RFC 6266/5987 encoded (no header-injection via a crafted
+filename); response headers carry only sanitised, length-capped values; and internal
+errors return a generic message (the real exception is logged server-side only).
 
 Tests for the local variant live in `src/test_cdr_local.py` (its own file, per the
 per-module test rule) and prove both that `cdr_dispatch` does no I/O and that the endpoint
