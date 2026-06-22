@@ -2767,3 +2767,165 @@ class TestRelLocalNameMatching:
         assert "Relationship Id" in decoded, "hyperlink rel was wrongly stripped"
         assert "_CDR_REMOVED_" in decoded, "hyperlink target not neutralised"
         assert "evil.example" not in decoded
+
+
+class TestStevensGapRegressions:
+    """Regression coverage for the parser-strength PDF cases and ZIP-polyglot identified in
+    docs/cdr-gap-analysis-stevens.md. These behaviours already work because cdr_pdf parses
+    the object model (not string-scans) and cdr_office rebuilds the archive — these tests
+    pin them so a future pikepdf/zipfile change can't silently regress them."""
+
+    # ── PDF: JS hidden in an object stream (/ObjStm) ────────────────────────────
+    def test_js_in_objstm_removed(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        js = pdf.make_indirect(pikepdf.Dictionary(
+            S=pikepdf.Name("/JavaScript"), JS=pikepdf.String("app.alert('pwned');")))
+        pdf.Root["/OpenAction"] = js
+        buf = io.BytesIO()
+        # Pack objects into a compressed object stream — the thing pdfid flags as /ObjStm.
+        pdf.save(buf, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+        raw = buf.getvalue()
+        assert b"/ObjStm" in raw  # precondition: the payload really is in an object stream
+
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"app.alert" not in clean, "JS payload in /ObjStm survived CDR"
+        assert b"/OpenAction" not in clean
+        assert "/OpenAction" in report["removed"]
+
+    # ── PDF: hex-obfuscated action name (/J#61vaScript == /JavaScript) ───────────
+    def test_hex_obfuscated_name_action_removed(self):
+        raw = (
+            b"%PDF-1.7\n"
+            b"1 0 obj<</Type/Catalog/Pages 2 0 R/OpenAction 4 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+            b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\n"
+            b"4 0 obj<</S/J#61vaScript/JS(app.alert\\('x'\\);)>>endobj\n"
+            b"xref\n0 5\n0000000000 65535 f \n"
+            b"trailer<</Root 1 0 R/Size 5>>\nstartxref\n0\n%%EOF"
+        )
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"app.alert" not in clean, "obfuscated-name JS action survived CDR"
+        assert b"avaScript" not in clean and b"#61" not in clean
+        assert "/OpenAction" in report["removed"]
+
+    # ── PDF: encrypted with empty user password is disarmed (pikepdf opens it) ───
+    def test_encrypted_empty_password_disarmed(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.Root["/OpenAction"] = pdf.make_indirect(pikepdf.Dictionary(
+            S=pikepdf.Name("/JavaScript"), JS=pikepdf.String("app.alert('e');")))
+        buf = io.BytesIO()
+        pdf.save(buf, encryption=pikepdf.Encryption(owner="o", user="", R=4))
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert b"app.alert" not in clean
+        assert "/OpenAction" in report["removed"]
+
+    # ── PDF: unknown-password PDF fails closed (raises → handler quarantines) ────
+    def test_unknown_password_pdf_raises(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        buf = io.BytesIO()
+        pdf.save(buf, encryption=pikepdf.Encryption(owner="secret123", user="secret123", R=4))
+        with pytest.raises(pikepdf.PasswordError):
+            cdr.cdr_pdf(buf.getvalue())
+
+    # ── PDF: JBIG2 / JPX decoder-RCE image filters are neutralised ──────────────
+    def _pdf_with_image_filter(self, filter_name: str) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        img = pdf.make_stream(
+            b"\x00\x01\x02DECODERPAYLOAD",
+            Type=pikepdf.Name("/XObject"), Subtype=pikepdf.Name("/Image"),
+            Width=4, Height=4, BitsPerComponent=1,
+            ColorSpace=pikepdf.Name("/DeviceGray"),
+            Filter=pikepdf.Name(filter_name),
+        )
+        pdf.pages[0].Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Im0=img))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+    def test_jbig2_image_filter_neutralised(self):
+        raw = self._pdf_with_image_filter("/JBIG2Decode")
+        assert b"/JBIG2Decode" in raw  # precondition
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"/JBIG2Decode" not in clean, "JBIG2 filter survived CDR"
+        assert b"DECODERPAYLOAD" not in clean, "JBIG2 stream payload survived CDR"
+        assert any("risky image filter" in r for r in report["removed"])
+        # output must still be a valid, openable PDF
+        with pikepdf.open(io.BytesIO(clean)) as p:
+            assert len(p.pages) == 1
+
+    def test_jpx_image_filter_neutralised(self):
+        raw = self._pdf_with_image_filter("/JPXDecode")
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"/JPXDecode" not in clean, "JPX (JPEG2000) filter survived CDR"
+        assert b"DECODERPAYLOAD" not in clean
+        assert any("risky image filter" in r for r in report["removed"])
+
+    def test_clean_pdf_has_no_risky_filter_removal(self):
+        # A normal PDF (no JBIG2/JPX) must not trip the risky-filter sweep.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        buf = io.BytesIO()
+        pdf.save(buf)
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert not any("risky image filter" in r for r in report["removed"])
+
+    # ── Audit fix: inline-image JBIG2 in a content stream bypasses the object sweep
+    #    (it lives in operator tokens, survives pdf.save) — must be hard-rejected ──
+    def test_inline_image_jbig2_rejected(self):
+        content = b"q\nBI /W 4 /H 4 /CS /G /BPC 1 /F /JBIG2Decode ID INLINEXX EI\nQ\n"
+        obj4 = (b"4 0 obj<</Length " + str(len(content)).encode()
+                + b">>stream\n" + content + b"endstream endobj\n")
+        raw = (
+            b"%PDF-1.7\n"
+            b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+            b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents 4 0 R>>endobj\n"
+            + obj4 + b"trailer<</Root 1 0 R/Size 5>>\n%%EOF"
+        )
+        with pytest.raises(ValueError, match="inline image with decoder-RCE filter"):
+            cdr.cdr_pdf(raw)
+
+    def test_inline_image_benign_filter_not_rejected(self):
+        # A benign inline image (no risky filter) must NOT be rejected — no false positive.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.pages[0].Contents = pdf.make_stream(
+            b"q\nBI /W 1 /H 1 /CS /G /BPC 8 ID \x80 EI\nQ\n")
+        buf = io.BytesIO()
+        pdf.save(buf)
+        clean, _ = cdr.cdr_pdf(buf.getvalue())  # must not raise
+        assert clean
+
+    # ── Audit fix: a risky-looking stream whose /Filter can't be trusted must FAIL
+    #    CLOSED (raise), never be silently passed through (the swallow was fail-open) ─
+    def test_malformed_filter_fails_closed(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        s = pdf.make_stream(b"data")
+        s[pikepdf.Name("/Filter")] = pikepdf.String("JBIG2Decode")  # spec-violating type
+        pdf.Root["/CDRtest"] = pdf.make_indirect(s)
+        buf = io.BytesIO()
+        pdf.save(buf)
+        with pytest.raises(ValueError):
+            cdr.cdr_pdf(buf.getvalue())
+
+    # ── ZIP polyglot: bytes appended after the archive are dropped by the rebuild ─
+    def test_zip_polyglot_appended_bytes_dropped(self):
+        office = _make_docx_with_macro()
+        polyglot = office + b"APPENDED_TRAILING_PAYLOAD_AFTER_EOCD" * 16
+        # The validator accepts it (zipfile reads from the central directory); the rebuild
+        # in cdr_office re-emits only the real entries, so the appended bytes must not
+        # appear in the sanitised output.
+        valid, anomalies = cdr._validate_zip_structure(polyglot)
+        assert valid, f"polyglot unexpectedly rejected: {anomalies}"
+        clean, report = cdr.cdr_office(polyglot, "docx")
+        assert b"APPENDED_TRAILING_PAYLOAD_AFTER_EOCD" not in clean, \
+            "appended bytes survived the archive rebuild"
+        # and the macro is still gone (sanity)
+        names = zipfile.ZipFile(io.BytesIO(clean)).namelist()
+        assert "word/vbaProject.bin" not in names

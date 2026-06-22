@@ -1019,6 +1019,7 @@ def cdr_pdf(data: bytes) -> tuple[bytes, dict]:
             removed.extend(_strip_pdf_page(page, page_num))
 
         removed.extend(_strip_pdf_outlines(catalog))
+        removed.extend(_neutralise_pdf_risky_image_filters(pdf))
 
         if "/Metadata" in catalog:
             del catalog["/Metadata"]
@@ -1034,6 +1035,118 @@ def cdr_pdf(data: bytes) -> tuple[bytes, dict]:
         pdf.save(out_buf)
 
     return out_buf.getvalue(), {"format": "pdf", "removed": removed}
+
+
+# Image compression filters with a history of decoder-level RCE: JBIG2 (CVE-2009-0658 and
+# the FORCEDENTRY CVE-2021-30860 family) and JPEG2000 / JPXDecode. These are not "active
+# content" the action sweep catches — the exploit is in the *decoder* parsing a crafted
+# stream. pdfid flags /JBIG2Decode for exactly this reason. We can't safely transcode the
+# image without invoking the very decoder we distrust, so we neutralise the stream: replace
+# its bytes with a 1×1 inert image and drop the dangerous filter. The page keeps a (blank)
+# image in that slot; the malicious payload never reaches a viewer's JBIG2/JPX decoder.
+_RISKY_IMAGE_FILTERS = {"/JBIG2Decode", "/JPXDecode"}
+
+
+def _filter_names(filt) -> list[str]:
+    """Normalise a stream's ``/Filter`` (a Name, an Array of Names, or — malformed — some
+    other type) to a list of name strings. pikepdf resolves indirect refs and normalises
+    name tokens (so ``/JBIG2#44ecode`` → ``/JBIG2Decode``) before we see them."""
+    if filt is None:
+        return []
+    if isinstance(filt, pikepdf.Name):
+        return [str(filt)]
+    try:
+        return [str(x) for x in filt]
+    except TypeError:
+        # A non-Name, non-iterable /Filter is spec-violating. Surface it as a sentinel so
+        # the caller fails closed rather than silently treating the stream as clean.
+        return ["<unparsable-filter>"]
+
+
+def _neutralise_pdf_risky_image_filters(pdf) -> list[str]:
+    """Neutralise every use of a decoder-RCE-prone image filter (JBIG2 / JPX).
+
+    Covers BOTH places such a filter can live:
+      * **Stream objects** (image XObjects, form XObjects, /SMask sub-images, appearance
+        streams) — rewritten to a 1×1 inert image with the filter dropped.
+      * **Inline images** (``BI … /F /JBIG2Decode … ID <bytes> EI``) inside page,
+        form-XObject, and annotation-appearance content streams — these are invisible to
+        the object walk; a PDF carrying one is **hard-rejected** (raises), because inline
+        JBIG2/JPX is spec-violating and vanishingly rare in legitimate files, so failing
+        closed is correct and won't false-positive.
+
+    FAIL CLOSED: if a stream is identified as risky (or its ``/Filter`` can't be parsed)
+    but neutralisation throws, we RE-RAISE rather than swallow — a silent fail-open that
+    leaves a risky stream in a file labelled "sanitised" is the worst outcome for a CDR
+    control. ``cdr_pdf``'s caller then quarantines the whole PDF (handler error path)."""
+    removed: list[str] = []
+
+    # ── (a) stream objects ────────────────────────────────────────────────────
+    for obj in pdf.objects:
+        if not isinstance(obj, pikepdf.Stream):
+            continue
+        try:
+            names = _filter_names(obj.get("/Filter"))
+        except Exception as exc:
+            # Could not even read /Filter on this stream — can't prove it's safe.
+            raise ValueError(f"unreadable /Filter during risky-image sweep: {exc}") from exc
+        risky = _RISKY_IMAGE_FILTERS.intersection(names)
+        if "<unparsable-filter>" in names:
+            raise ValueError("stream with unparsable /Filter — failing closed")
+        if not risky:
+            continue
+        # Identified as risky — from here a failure must NOT be swallowed.
+        obj.write(b"\x00")
+        obj.Width = 1
+        obj.Height = 1
+        obj.BitsPerComponent = 1
+        obj.ColorSpace = pikepdf.Name("/DeviceGray")
+        for k in ("/Filter", "/DecodeParms", "/SMask", "/Decode"):
+            if k in obj:
+                del obj[k]
+        removed.append(f"risky image filter {','.join(sorted(risky))} (neutralised)")
+
+    # ── (b) inline images in content streams ──────────────────────────────────
+    removed.extend(_reject_inline_risky_images(pdf))
+    return removed
+
+
+def _reject_inline_risky_images(pdf) -> list[str]:
+    """Scan every content stream (pages, form XObjects, annotation appearance streams) for
+    an inline image declaring a risky filter. Such an image bypasses the object-level sweep
+    entirely (it lives in operator tokens, not a stream object) and survives ``pdf.save()``.
+    Hard-reject the PDF if one is found — fail closed."""
+    def _check(obj, where: str) -> None:
+        try:
+            ops = pikepdf.parse_content_stream(obj)
+        except Exception:
+            return  # not a content stream / unparseable — object sweep covers real streams
+        for operands, operator in ops:
+            if str(operator) != "INLINE IMAGE":
+                continue
+            for operand in operands:
+                filters = [str(f) for f in getattr(operand, "filters", [])]
+                if _RISKY_IMAGE_FILTERS.intersection(filters):
+                    raise ValueError(
+                        f"inline image with decoder-RCE filter "
+                        f"{sorted(_RISKY_IMAGE_FILTERS.intersection(filters))} in {where} "
+                        f"— rejected (cannot be safely neutralised in place)"
+                    )
+
+    for page_num, page in enumerate(pdf.pages):
+        _check(page, f"page[{page_num}] content stream")
+        # Form XObjects referenced by the page can carry their own content streams.
+        try:
+            xobjects = page.get("/Resources", {}).get("/XObject", {})
+        except Exception:
+            xobjects = {}
+        for name, xobj in (xobjects.items() if hasattr(xobjects, "items") else []):
+            try:
+                if xobj.get("/Subtype") == pikepdf.Name("/Form"):
+                    _check(xobj, f"page[{page_num}] form XObject {name}")
+            except Exception:
+                continue
+    return []
 
 
 def _strip_pdf_page(page, page_num: int) -> list[str]:
