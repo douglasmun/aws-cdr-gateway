@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a non-security defect (crash, wrong routing, broken build/test).
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        **Not for vulnerabilities.** If active/executable content survives into
+        sanitised output, or unsanitised content is labelled `sanitised`, report it
+        privately — see [SECURITY.md](../blob/main/SECURITY.md). Do not attach live
+        malware samples to a public issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Commands, inputs, or a minimal file type/extension that triggers it.
+      placeholder: |
+        1. POST a .docx to /sanitise ...
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which front-end?
+      options:
+        - Lambda (AWS handler)
+        - Local FastAPI service (app.py)
+        - Container / sidecar image
+        - Tests / CI
+        - Other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, Python version, image tag, and relevant CDR_* env vars.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Relevant log lines or stack trace. Redact any sensitive content.
+      render: shell
+    validations:
+      required: false

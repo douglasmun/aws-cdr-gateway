@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose a new format, strip rule, or improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do that the gateway doesn't support today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: >-
+        For a new format or strip rule, note the threat it disarms. Remember the
+        project fails closed — new formats must be disarmed, never passed through.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
