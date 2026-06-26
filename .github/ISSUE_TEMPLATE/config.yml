@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (CDR bypass, etc.)
+    url: https://github.com/douglasmun/aws-cdr-gateway/security/advisories/new
+    about: >-
+      Do NOT open a public issue for a vulnerability. Active content surviving
+      into sanitised output is a security issue — report it privately. See SECURITY.md.
