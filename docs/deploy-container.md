@@ -35,7 +35,7 @@ curl -sS -o clean.docx -F file=@dirty.docm http://localhost:8000/sanitise
 ```
 
 > Images are published to GHCR by the `docker-publish` workflow on a version tag
-> (`git tag v1.0.0 && git push origin v1.0.0` → `:1.0.0`, `:1.0`, `:1`, `:latest`).
+> (`git tag v1.0.2 && git push origin v1.0.2` → `:1.0.2`, `:1.0`, `:1`, `:latest`).
 
 Or with Compose (includes the sidecar wiring and hardening):
 
