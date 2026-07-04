@@ -43,14 +43,8 @@ out `.cdr.xlsx`).
 
 ## One-line shell alias
 
-Add to `~/.zshrc` (adjust the repo path if yours differs):
-
-```bash
-alias cdr='(cd ~/Develop/aws-cdr-gateway && /tmp/cdrvenv/bin/python tools/disarm.py "$(pwd -P)/$1" 2>/dev/null || /tmp/cdrvenv/bin/python tools/disarm.py)'
-```
-
-That subshell-`cd` form is fiddly with arguments. A shell **function** is
-cleaner and lets you pass a path from anywhere — prefer this:
+A plain `alias` can't take a path argument in the middle, so use a one-line
+shell **function** (works in `~/.zshrc`). Adjust the repo path if yours differs:
 
 ```bash
 # Disarm from any directory: `cdr foo.pdf`  or  `cdr ~/Downloads/foo.pdf`
