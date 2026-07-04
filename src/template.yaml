@@ -162,11 +162,14 @@ Resources:
       KmsMasterKeyId: alias/aws/sns   # SSE at rest with the AWS-managed key (free)
 
   # Separate alarm topic so CloudWatch alarms don't pollute CDR result consumers
+  # Deliberately NOT encrypted with alias/aws/sns: the AWS-managed SNS key's resource
+  # policy does not grant cloudwatch.amazonaws.com permission to use it, so CloudWatch
+  # alarm actions silently fail to publish if this topic is SSE-KMS-encrypted. Alarm
+  # payloads here are just AlarmName/Reason/Threshold — non-sensitive.
   CdrAlarmTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: cdr-alarm-topic
-      KmsMasterKeyId: alias/aws/sns
 
   # ── Dead-letter queue ─────────────────────────────────────────────────────────
 
@@ -199,8 +202,18 @@ Resources:
                 - s3:GetObject
                 - s3:DeleteObject
               Resource: !Sub "arn:aws:s3:::${SourceBucketName}/*"
-        - S3WritePolicy:
-            BucketName: !Ref SanitisedBucketName
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub "arn:aws:s3:::${SourceBucketName}"
+        # Not S3WritePolicy: _upload() always sets object tags inline (Tagging=), which
+        # requires s3:PutObjectTagging in addition to s3:PutObject — S3WritePolicy's
+        # managed policy template does not include PutObjectTagging.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:PutObjectTagging
+              Resource: !Sub "arn:aws:s3:::${SanitisedBucketName}/*"
         - !If
           - QuarantineEnabled
           - S3WritePolicy:

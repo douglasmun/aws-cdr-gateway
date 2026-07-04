@@ -193,14 +193,18 @@ For each bucket confirm:
 ### 2.5 SNS topics and DLQ encrypted at rest
 
 ```bash
-# Both SNS topics should use SSE (the AWS-managed key alias/aws/sns).
-for ARN in $RESULT_TOPIC_ARN $ALARM_TOPIC_ARN; do
-  [ -z "$ARN" ] && continue
-  echo "=== $ARN ==="
-  aws sns get-topic-attributes --topic-arn $ARN \
-    --query 'Attributes.KmsMasterKeyId'
-done
+# CdrResultTopic uses SSE (the AWS-managed key alias/aws/sns).
+aws sns get-topic-attributes --topic-arn $RESULT_TOPIC_ARN \
+  --query 'Attributes.KmsMasterKeyId'
 # Expected: "alias/aws/sns" (not null)
+
+# CdrAlarmTopic is deliberately NOT SSE-encrypted: the AWS-managed SNS key's resource
+# policy does not grant cloudwatch.amazonaws.com permission to use it, so CloudWatch
+# alarm actions would silently fail to publish if this topic carried KmsMasterKeyId.
+# Alarm payloads (AlarmName/Reason/Threshold) are non-sensitive.
+aws sns get-topic-attributes --topic-arn $ALARM_TOPIC_ARN \
+  --query 'Attributes.KmsMasterKeyId'
+# Expected: null
 ```
 
 The DLQ encryption is verified in §6.

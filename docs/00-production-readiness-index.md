@@ -113,7 +113,7 @@ The responsible person and date should be recorded alongside each check.
 - [ ] All six CloudWatch alarms have `CdrAlarmTopic` SNS action (not `CdrResultTopic`)
 - [ ] `CdrAlarmTopic`: at least one confirmed subscriber
 - [ ] DLQ: `MessageRetentionPeriod` = 1209600 (14 days), SSE at rest enabled, depth = 0
-- [ ] Both SNS topics: SSE at rest enabled (`alias/aws/sns`)
+- [ ] `CdrResultTopic`: SSE at rest enabled (`alias/aws/sns`); `CdrAlarmTopic`: deliberately **not** SSE-encrypted (the AWS-managed SNS key doesn't grant CloudWatch's alarm-action principal permission to use it, which silently breaks alarm delivery)
 - [ ] Lambda: X-Ray active tracing enabled (or `enable_xray_tracing=false` documented), architecture matches the built wheels (`x86_64`)
 - [ ] Lambda `ReservedConcurrentExecutions` set (default 20 or tuned value documented)
 - [ ] CloudWatch Logs retention set on `/aws/lambda/cdr-lambda` (90 days or per data retention policy)

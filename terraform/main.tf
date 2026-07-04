@@ -178,9 +178,12 @@ resource "aws_sns_topic" "result" {
 }
 
 # Separate alarm topic so CloudWatch alarms don't pollute CDR result consumers.
+# Deliberately NOT encrypted with alias/aws/sns: the AWS-managed SNS key's resource
+# policy does not grant cloudwatch.amazonaws.com permission to use it, so CloudWatch
+# alarm actions silently fail to publish if this topic is SSE-KMS-encrypted. Alarm
+# payloads here are just AlarmName/Reason/Threshold — non-sensitive.
 resource "aws_sns_topic" "alarm" {
-  name              = "cdr-alarm-topic"
-  kms_master_key_id = "alias/aws/sns"
+  name = "cdr-alarm-topic"
 }
 
 # ── Dead-letter queue ──────────────────────────────────────────────────────────
@@ -220,6 +223,14 @@ data "aws_iam_policy_document" "lambda" {
     effect    = "Allow"
     actions   = ["s3:GetObject", "s3:DeleteObject"]
     resources = ["arn:aws:s3:::${var.source_bucket_name}/*"]
+  }
+
+  # List the source bucket itself (bucket-level ARN, not /*).
+  statement {
+    sid       = "SourceListBucket"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = ["arn:aws:s3:::${var.source_bucket_name}"]
   }
 
   # Write the sanitised output. PutObjectTagging is required because _upload() sets object

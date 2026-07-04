@@ -75,9 +75,12 @@ cd terraform && tofu apply
   version with checksums for `linux_amd64`, `darwin_arm64`, and `linux_arm64`, so CI and
   laptops resolve the same provider. To bump it: `tofu init -upgrade` then
   `tofu providers lock -platform=…` and commit the result.
-- **Encryption at rest:** S3 buckets use SSE-S3 (AES256); the DLQ uses SQS-managed SSE and
-  both SNS topics use the AWS-managed key (`alias/aws/sns`). All three S3 buckets —
-  including quarantine — have versioning enabled.
+- **Encryption at rest:** S3 buckets use SSE-S3 (AES256); the DLQ uses SQS-managed SSE;
+  `cdr-result-topic` uses the AWS-managed SNS key (`alias/aws/sns`). `cdr-alarm-topic` is
+  deliberately left unencrypted — the AWS-managed key's resource policy doesn't grant
+  CloudWatch's alarm-action principal permission to use it, which silently breaks alarm
+  delivery if applied. All three S3 buckets — including quarantine — have versioning
+  enabled.
 - **State:** local by default. To use an S3 + DynamoDB backend, create the bucket and
   lock table, then uncomment the `backend "s3"` block in `versions.tf` and run
   `tofu init -migrate-state`.
