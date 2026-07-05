@@ -181,7 +181,9 @@ _READ_CHUNK = 1024 * 1024
 # Header hygiene: an extension that goes into a response header must be a short, plain
 # token. Anything else is reported as "unknown" in the header (the routing decision still
 # used the real extension inside cdr_dispatch).
-_SAFE_EXT_RE = re.compile(r"^[a-z0-9]{1,16}$")
+# \Z (not $): $ matches just before a trailing '\n' too, so "docx\n" would otherwise pass
+# and inject a newline into the header value.
+_SAFE_EXT_RE = re.compile(r"^[a-z0-9]{1,16}\Z")
 
 
 def _ext_from_name(filename: str) -> str:

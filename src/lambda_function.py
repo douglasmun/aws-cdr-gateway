@@ -28,6 +28,7 @@ Environment variables:
   RESULT_TOPIC_ARN     SNS topic for CDR result metadata (optional)
   CDR_MAX_FILE_BYTES   pre-download size limit in bytes (default 104857600 = 100 MB)
   CDR_MAX_ENTRY_BYTES  per-ZIP-entry decompression limit (default 209715200 = 200 MB)
+  CDR_MAX_IMAGE_PIXELS decompression-bomb pixel cap for cdr_image (default 40000000 = 40 MP)
 """
 
 import html
@@ -38,6 +39,7 @@ import os
 import posixpath
 import re
 import urllib.parse
+import warnings
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timezone
@@ -62,6 +64,12 @@ RESULT_TOPIC_ARN  = os.environ.get("RESULT_TOPIC_ARN", "")
 
 _MAX_FILE_BYTES  = int(os.environ.get("CDR_MAX_FILE_BYTES",  str(100 * 1024 * 1024)))
 _MAX_ENTRY_BYTES = int(os.environ.get("CDR_MAX_ENTRY_BYTES", str(200 * 1024 * 1024)))
+# Explicit decompression-bomb cap, sized to this Lambda's 1024 MB default memory budget
+# rather than relying on Pillow's own undocumented default (89.5M soft-warn / 179M
+# hard-error) — the soft-warn band between those two lets a large-but-under-the-hard-cap
+# image decode+re-encode silently, which at several bytes/pixel/buffer can approach the
+# Lambda's memory ceiling well before Pillow's own error would ever fire.
+Image.MAX_IMAGE_PIXELS = int(os.environ.get("CDR_MAX_IMAGE_PIXELS", str(40_000_000)))
 
 # ── OOXML (Office) dangerous relationship types ────────────────────────────────
 STRIP_REL_TYPES: set[str] = {
@@ -325,7 +333,8 @@ def cdr_dispatch(data: bytes, ext: str, *, max_file_bytes: Optional[int] = None)
     # ── Legacy binary (OLE) formats — unsupported, fail closed ────────────────
     if ext in LEGACY_EXTS:
         return _result("unsupported-format",
-                       reason="OLE binary format not supported", delete_source=True)
+                       reason="OLE binary format not supported",
+                       metric="passthrough", delete_source=True)
 
     # ── Deliberately-rejected carriers (RTF) — FAIL CLOSED (highest priority) ──
     if ext in FAIL_CLOSED_EXTS:
@@ -801,6 +810,13 @@ _ENCODED_FIELD_KEYWORDS = (
     "EXEC", "INCLUDETEXT", "INCLUDEPICTURE", "INCLUDE", "WEBSERVICE", "HYPERLINK",
     "RTD", "CALL", "REGISTER", "LINK",
 )
+# Word-boundary matcher for the above: plain `kw in decoded_text` is a substring check and
+# false-positives on benign words that merely contain a keyword (e.g. "PADDED" contains
+# "DDE", "UNLINKING" contains "LINK", "RECALL" contains "CALL") — corrupting legitimate
+# text that was never a field code.
+_ENCODED_FIELD_KEYWORDS_RE = re.compile(
+    r'\b(?:' + '|'.join(_ENCODED_FIELD_KEYWORDS) + r')\b'
+)
 
 # A run of ASCII letters and/or numeric character references, e.g. &#68;&#68;&#69; or
 # &#77;ACROBUTTON (partial encoding). Such a run only ever spans plain text — never markup
@@ -831,7 +847,7 @@ def _neutralise_encoded_field_codes(text: str) -> tuple[str, int]:
         run = match.group(0)
         if "&#" not in run:  # a pure-letter run is never an encoded keyword
             return run
-        if any(kw in html.unescape(run).upper() for kw in _ENCODED_FIELD_KEYWORDS):
+        if _ENCODED_FIELD_KEYWORDS_RE.search(html.unescape(run).upper()):
             count += 1
             return "_CDR_REMOVED_"
         return run
@@ -857,10 +873,16 @@ _FIELD_KEYWORD_ARG_RE = re.compile(
 #   <w:instrText …>…</w:instrText>  — the run that holds the field instruction text
 #   <w:fldSimple … w:instr="…" …>   — the simple-field instruction attribute
 # Namespace prefix is matched loosely ([A-Za-z0-9]*:) so non-"w" prefixes are still covered.
-_INSTRTEXT_RE = re.compile(
-    r'(<[A-Za-z0-9]*:?instrText\b[^>]*>)(.*?)(</[A-Za-z0-9]*:?instrText\s*>)',
-    re.IGNORECASE | re.DOTALL,
-)
+#
+# _INSTRTEXT_OPEN_RE/_INSTRTEXT_CLOSE_RE are matched by a manual linear scanner
+# (_iter_instrtext_elements), NOT combined into one open-body-close regex with a `.*?`
+# body group: a `.*?` body scans to end-of-string on every opening tag that has no
+# matching close, which is O(n) work per occurrence — O(n^2) total on a document.xml
+# crafted with many unmatched "<w:instrText ...>" opens (Lambda-timeout DoS well within
+# the 200MB per-entry decompression cap). The manual scanner finds each close with a
+# single forward str.find/search per open, giving linear total work.
+_INSTRTEXT_OPEN_RE = re.compile(r'<[A-Za-z0-9]*:?instrText\b[^>]*>', re.IGNORECASE)
+_INSTRTEXT_CLOSE_RE = re.compile(r'</[A-Za-z0-9]*:?instrText\s*>', re.IGNORECASE)
 _FLDSIMPLE_INSTR_RE = re.compile(
     r'(\b[A-Za-z0-9]*:?instr=")([^"]*)(")',
     re.IGNORECASE,
@@ -876,17 +898,40 @@ def _scrub_field_string(s: str) -> tuple[str, int]:
     return s, n1 + n2
 
 
+def _scrub_instrtext_elements(text: str) -> tuple[str, int]:
+    """Linear-time equivalent of a single
+    ``(<w:instrText…>)(.*?)(</w:instrText>)`` substitution: for each opening tag found,
+    look for the next closing tag starting only from the end of that opening tag (never
+    re-scanning text already consumed by a prior element), so total work is O(n) instead
+    of the O(n^2) a lazy DOTALL body group produces on many unmatched opening tags."""
+    total = 0
+    out: list[str] = []
+    pos = 0
+    for open_m in _INSTRTEXT_OPEN_RE.finditer(text):
+        if open_m.start() < pos:
+            continue  # inside a previously-consumed element
+        out.append(text[pos:open_m.start()])
+        close_m = _INSTRTEXT_CLOSE_RE.search(text, open_m.end())
+        if close_m is None:
+            # Unterminated element: nothing more can be a instrText body; stop scrubbing.
+            out.append(text[open_m.start():])
+            pos = len(text)
+            break
+        body, n = _scrub_field_string(text[open_m.end():close_m.start()])
+        total += n
+        out.append(open_m.group(0))
+        out.append(body)
+        out.append(close_m.group(0))
+        pos = close_m.end()
+    out.append(text[pos:])
+    return "".join(out), total
+
+
 def _scrub_field_code_carriers(text: str) -> tuple[str, int]:
     """Run the auto-exec / keyword-argument field-code scrub ONLY inside field carriers
     (<w:instrText> content and <w:fldSimple w:instr="…">), leaving all other XML untouched.
     Returns (text, total_count)."""
     total = 0
-
-    def _instr_el(m: "re.Match[str]") -> str:
-        nonlocal total
-        body, n = _scrub_field_string(m.group(2))
-        total += n
-        return m.group(1) + body + m.group(3)
 
     def _fldsimple_attr(m: "re.Match[str]") -> str:
         nonlocal total
@@ -894,9 +939,9 @@ def _scrub_field_code_carriers(text: str) -> tuple[str, int]:
         total += n
         return m.group(1) + val + m.group(3)
 
-    text = _INSTRTEXT_RE.sub(_instr_el, text)
+    text, n1 = _scrub_instrtext_elements(text)
     text = _FLDSIMPLE_INSTR_RE.sub(_fldsimple_attr, text)
-    return text, total
+    return text, n1 + total
 
 
 def _strip_xml_macros(data: bytes, filename: str) -> tuple[bytes, list[str]]:
@@ -1242,81 +1287,94 @@ def _strip_pdf_page(page, page_num: int) -> list[str]:
     return removed
 
 
+_MAX_WALK_NODES = 100_000  # cap on any recursive-tree-turned-iterative PDF walk
+
+
 def _strip_pdf_outlines(catalog) -> list[str]:
     """Walk the document outline (bookmark) tree, deleting /A and /AA actions. An outline
     item's action (/JavaScript, /Launch, …) fires on bookmark click and is never reached
-    by the page/annotation/AcroForm sweeps."""
+    by the page/annotation/AcroForm sweeps.
+
+    Iterative (not recursive): a legitimately deep (non-cyclic) outline chain of a few
+    thousand items used to silently stop being swept once a fixed recursion-depth cutoff
+    was hit — well short of Python's default 1000-frame recursion limit — leaving deeper
+    nodes' /A /AA actions un-stripped while the function returned normally (pitfall #43).
+    An explicit stack has no such limit; the identity (`.objgen`) seen-set alone is
+    sufficient to block cyclic /Next or /First chains, and _MAX_WALK_NODES bounds total
+    work against a pathologically large (but acyclic) tree."""
     removed: list[str] = []
     if "/Outlines" not in catalog:
         return removed
 
     seen: set = set()
+    stack = [catalog["/Outlines"].get("/First")]
+    visited_count = 0
 
-    def _walk(node, depth: int) -> None:
-        # Depth + identity guard against malicious cyclic /Next or /First chains.
-        if node is None or depth > 1000:
-            return
+    while stack:
+        node = stack.pop()
+        if node is None or visited_count >= _MAX_WALK_NODES:
+            continue
         try:
             ident = node.objgen
         except Exception:
             ident = None
         if ident is not None:
             if ident in seen:
-                return
+                continue
             seen.add(ident)
+        visited_count += 1
         try:
             for action_key in ("/A", "/AA"):
                 if action_key in node:
                     del node[action_key]
                     removed.append(f"outline{action_key}")
-            child = node.get("/First")
-            if child is not None:
-                _walk(child, depth + 1)
             nxt = node.get("/Next")
             if nxt is not None:
-                _walk(nxt, depth + 1)
+                stack.append(nxt)
+            child = node.get("/First")
+            if child is not None:
+                stack.append(child)
         except Exception as exc:
             logger.debug("Skipped malformed outline node: %s", exc)
-
-    try:
-        _walk(catalog["/Outlines"].get("/First"), 0)
-    except Exception as exc:
-        logger.debug("Could not walk outlines: %s", exc)
     return removed
 
 
-def _strip_acroform_fields(fields, _seen: set | None = None, _depth: int = 0) -> list[str]:
-    """Recursively strip dangerous action keys from AcroForm field/widget dicts.
+def _strip_acroform_fields(fields) -> list[str]:
+    """Strip dangerous action keys from AcroForm field/widget dicts, walking /Kids.
 
-    Depth + identity guard against a malicious cyclic /Kids chain (a field listing
-    itself, or two fields listing each other), mirroring _strip_pdf_outlines' guard
-    against cyclic /Next chains."""
+    Iterative (not recursive) for the same reason as _strip_pdf_outlines: a fixed
+    recursion-depth cutoff silently stops sweeping partway through a legitimately deep
+    (non-cyclic) /Kids chain, leaving deeper fields' /JS /A /AA un-stripped while
+    returning normally (pitfall #43). The identity (`.objgen`) seen-set alone is
+    sufficient to block a cyclic /Kids chain (a field listing itself, or two fields
+    listing each other); _MAX_WALK_NODES bounds total work against a pathologically
+    large (but acyclic) field tree."""
     removed: list[str] = []
-    if _depth > 1000:
-        return removed
-    if _seen is None:
-        _seen = set()
-    try:
-        for field in fields:
+    seen: set = set()
+    stack = list(fields) if fields else []
+    visited_count = 0
+    while stack:
+        field = stack.pop()
+        if visited_count >= _MAX_WALK_NODES:
+            break
+        try:
             try:
-                try:
-                    ident = field.objgen
-                except Exception:
-                    ident = None
-                if ident is not None:
-                    if ident in _seen:
-                        continue
-                    _seen.add(ident)
-                for key in ("/A", "/AA", "/JS", "/JavaScript"):
-                    if key in field:
-                        del field[key]
-                        removed.append(f"AcroForm field {key}")
-                if "/Kids" in field:
-                    removed.extend(_strip_acroform_fields(field["/Kids"], _seen, _depth + 1))
-            except Exception as exc:
-                logger.debug("Skipped malformed AcroForm field: %s", exc)
-    except Exception as exc:
-        logger.debug("Could not iterate AcroForm fields: %s", exc)
+                ident = field.objgen
+            except Exception:
+                ident = None
+            if ident is not None:
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            visited_count += 1
+            for key in ("/A", "/AA", "/JS", "/JavaScript"):
+                if key in field:
+                    del field[key]
+                    removed.append(f"AcroForm field {key}")
+            if "/Kids" in field:
+                stack.extend(field["/Kids"])
+        except Exception as exc:
+            logger.debug("Skipped malformed AcroForm field: %s", exc)
     return removed
 
 
@@ -1337,47 +1395,60 @@ def cdr_image(data: bytes, ext: str) -> tuple[bytes, dict]:
                "bmp": "BMP", "tiff": "TIFF", "webp": "WEBP", "gif": "GIF"}
     save_fmt = fmt_map.get(ext, "PNG")
 
-    with Image.open(io.BytesIO(data)) as img:
-        if img.info.get("exif") or img.info.get("IFD"):
-            removed.append("EXIF")
-        if "icc_profile" in img.info:
-            removed.append("ICC profile")
-        if "xmp" in img.info:
-            removed.append("XMP")
-        if img.info.get("comment"):
-            removed.append("comment")
+    # Between MAX_IMAGE_PIXELS and 2x that, Pillow only emits DecompressionBombWarning
+    # (default warning filters do not raise) and proceeds to decode anyway. Escalate to
+    # an error, scoped to this call only, so every image over our explicit cap fails
+    # closed instead of silently decoding (and consuming memory) in the soft-warn band.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        with Image.open(io.BytesIO(data)) as img:
+            if img.info.get("exif") or img.info.get("IFD"):
+                removed.append("EXIF")
+            if "icc_profile" in img.info:
+                removed.append("ICC profile")
+            if "xmp" in img.info:
+                removed.append("XMP")
+            if img.info.get("comment"):
+                removed.append("comment")
 
-        n_frames = getattr(img, "n_frames", 1)
-        out_buf = io.BytesIO()
+            n_frames = getattr(img, "n_frames", 1)
+            out_buf = io.BytesIO()
 
-        if save_fmt == "TIFF" and n_frames > 1:
-            # Re-encode every frame through Pillow to produce a pixel-only multi-frame TIFF.
-            # Iterating via ImageSequence ensures each frame is decoded independently and
-            # no IFD tags or per-frame metadata survive the round-trip.
-            frames = [frame.convert("RGB").copy()
-                      for frame in ImageSequence.Iterator(img)]
-            frames[0].save(
-                out_buf, format="TIFF",
-                save_all=True, append_images=frames[1:],
-            )
-            removed.append(f"multi-frame TIFF metadata ({n_frames} frames re-encoded)")
-        else:
-            target_mode = "RGBA" if (ext == "png" and img.mode in ("RGBA", "LA", "PA")) else "RGB"
-            clean_img = img.convert(target_mode)
+            if save_fmt in ("TIFF", "GIF", "WEBP") and n_frames > 1:
+                # Re-encode every frame through Pillow to produce a pixel-only multi-frame
+                # image. Iterating via ImageSequence ensures each frame is decoded
+                # independently and no IFD tags or per-frame metadata survive the round-trip.
+                # Saving only `img` (the first frame) here would silently collapse an
+                # animated GIF/WEBP/TIFF to a single static frame.
+                frame_mode = "RGB" if save_fmt == "TIFF" else img.mode
+                frames = [frame.convert(frame_mode).copy()
+                          for frame in ImageSequence.Iterator(img)]
+                durations = [frame.info.get("duration", 0) for frame in ImageSequence.Iterator(img)]
+                save_all_kwargs: dict = {"save_all": True, "append_images": frames[1:]}
+                if save_fmt in ("GIF", "WEBP"):
+                    save_all_kwargs["duration"] = durations
+                    save_all_kwargs["loop"] = img.info.get("loop", 0)
+                if save_fmt == "GIF":
+                    save_all_kwargs["comment"] = b""
+                frames[0].save(out_buf, format=save_fmt, **save_all_kwargs)
+                removed.append(f"multi-frame {save_fmt} metadata ({n_frames} frames re-encoded)")
+            else:
+                target_mode = "RGBA" if (ext == "png" and img.mode in ("RGBA", "LA", "PA")) else "RGB"
+                clean_img = img.convert(target_mode)
 
-            save_kwargs: dict = {}
-            if save_fmt == "JPEG":
-                save_kwargs = {"quality": 95, "optimize": True}
-            elif save_fmt == "PNG":
-                save_kwargs = {"optimize": True}
-            elif save_fmt == "GIF":
-                # Explicitly suppress comment extension blocks — Pillow carries them
-                # through re-encode unless overridden.
-                save_kwargs = {"comment": b""}
+                save_kwargs: dict = {}
+                if save_fmt == "JPEG":
+                    save_kwargs = {"quality": 95, "optimize": True}
+                elif save_fmt == "PNG":
+                    save_kwargs = {"optimize": True}
+                elif save_fmt == "GIF":
+                    # Explicitly suppress comment extension blocks — Pillow carries them
+                    # through re-encode unless overridden.
+                    save_kwargs = {"comment": b""}
 
-            clean_img.save(out_buf, format=save_fmt, **save_kwargs)
+                clean_img.save(out_buf, format=save_fmt, **save_kwargs)
 
-        new_size = out_buf.tell()
+            new_size = out_buf.tell()
 
     return out_buf.getvalue(), {
         "format":          ext,
@@ -1432,6 +1503,20 @@ def _enc_tag(value: str, limit: int) -> str:
     return _TAG_SAFE.sub("_", value)[:limit]
 
 
+# SNS Subject must be ASCII and rejects non-printable control characters; publish()
+# raises InvalidParameterException otherwise. An attacker-controlled key with, say, a
+# newline or non-ASCII byte would break the publish call, and because publish is
+# fault-isolated (never blocks the success/delete path), the exception is silently
+# swallowed — the CDR result for exactly that (adversarial) file is never published.
+_SNS_SUBJECT_SAFE = re.compile(r"[^\x20-\x7e]")
+
+
+def _sns_subject_safe(value: str, limit: int = 100) -> str:
+    """Make a string safe to use as an SNS Subject: strip non-printable-ASCII/control
+    characters, then cap at ``limit`` chars."""
+    return _SNS_SUBJECT_SAFE.sub("_", value)[:limit]
+
+
 def _upload(bucket: str, key: str, data: bytes,
             content_type: str, tags: dict[str, str]) -> None:
     """Put an object to S3 with AES256 encryption and a sanitised tag set. Tag keys/values
@@ -1477,10 +1562,17 @@ def _content_type_for_ext(ext: str, fallback: str) -> str:
 
 def _sanitised_key(key: str, sanitised_ext: Optional[str] = None) -> str:
     """Build the destination key under the ``sanitised/`` prefix, optionally swapping the
-    extension (e.g. ``docm`` → ``docx`` after macro removal)."""
+    extension (e.g. ``docm`` → ``docx`` after macro removal).
+
+    When the extension changes, the original extension is kept in the basename (e.g.
+    ``foo.docm`` -> ``foo.docm.docx``) rather than dropped (``foo.docm`` -> ``foo.docx``).
+    Dropping it lets two distinct source uploads — a macro-bearing ``foo.docm`` and an
+    unrelated, already-clean ``foo.docx`` — collide on the same destination key, silently
+    overwriting one sanitised output with the other."""
     if sanitised_ext and "." in key:
-        base = key.rsplit(".", 1)[0]
-        key  = f"{base}.{sanitised_ext}"
+        orig_ext = key.rsplit(".", 1)[-1]
+        if orig_ext.lower() != sanitised_ext.lower():
+            key = f"{key}.{sanitised_ext}"
     return f"sanitised/{key}"
 
 
@@ -1543,7 +1635,7 @@ def _publish_result_safe(source_bucket: str, key: str, status: str, report: dict
         report = _truncate_removed(report)
         sns.publish(
             TopicArn=RESULT_TOPIC_ARN,
-            Subject=f"CDR/{status}: {key}"[:100],
+            Subject=_sns_subject_safe(f"CDR/{status}: {key}"),
             Message=json.dumps({
                 "source":    f"s3://{source_bucket}/{key}",
                 "status":    status,
@@ -1589,12 +1681,16 @@ def _emit_passthrough_metric(ext: str) -> None:
     alarm monitors a series that never receives data and stays permanently non-breaching.
     """
     try:
+        # CloudWatch rejects an empty Dimensions[].Value client-side (ParamValidationError)
+        # — a file with no extension at all would otherwise take down BOTH datapoints in
+        # this request, including the mandatory dimensionless rollup above.
+        dim_value = ext[:32] if ext else "(none)"
         cw.put_metric_data(
             Namespace="CDR/Validation",
             MetricData=[
                 {"MetricName": "PassthroughFiles", "Value": 1, "Unit": "Count"},
                 {"MetricName": "PassthroughFiles", "Value": 1, "Unit": "Count",
-                 "Dimensions": [{"Name": "Extension", "Value": ext[:32]}]},
+                 "Dimensions": [{"Name": "Extension", "Value": dim_value}]},
             ],
         )
     except Exception as exc:

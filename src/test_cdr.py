@@ -266,13 +266,109 @@ class TestConstants:
         assert "application/vnd.ms-excel.sheet.binary.macroEnabled.12" in cdr.MACRO_CONTENT_TYPE_REMAP
 
     def test_sanitised_key_remaps_extension(self):
-        assert cdr._sanitised_key("uploads/report.xlsm", "xlsx") == "sanitised/uploads/report.xlsx"
+        """Audit fix: the original extension is kept (not dropped) so a macro-bearing
+        upload can never collide with an unrelated already-clean upload of the same
+        basename under the remapped extension (e.g. report.xlsm and report.xlsx)."""
+        assert cdr._sanitised_key("uploads/report.xlsm", "xlsx") == "sanitised/uploads/report.xlsm.xlsx"
 
     def test_sanitised_key_unchanged_extension(self):
         assert cdr._sanitised_key("uploads/report.docx", "docx") == "sanitised/uploads/report.docx"
 
     def test_sanitised_key_no_ext(self):
         assert cdr._sanitised_key("uploads/datafile", "datafile") == "sanitised/uploads/datafile"
+
+    def test_sanitised_key_no_basename_collision_across_extensions(self):
+        """report.docm (macro-bearing) and report.docx (already clean) are distinct
+        source uploads; their sanitised outputs must not collide on the same key."""
+        docm_key = cdr._sanitised_key("uploads/report.docm", "docx")
+        docx_key = cdr._sanitised_key("uploads/report.docx", "docx")
+        assert docm_key != docx_key
+
+
+class TestSnsSubjectSafe:
+    """Audit fix: a crafted key with SNS-illegal characters must not break sns.publish()
+    and be silently swallowed by _publish_result_safe's fault-isolating try/except."""
+
+    def test_control_chars_stripped(self):
+        subject = cdr._sns_subject_safe("CDR/sanitised: evil\nkey\x00.docx")
+        assert "\n" not in subject
+        assert "\x00" not in subject
+
+    def test_non_ascii_stripped(self):
+        subject = cdr._sns_subject_safe("CDR/sanitised: résumé.docx")
+        assert all(0x20 <= ord(c) <= 0x7e for c in subject)
+
+    def test_truncated_to_limit(self):
+        subject = cdr._sns_subject_safe("x" * 500, limit=100)
+        assert len(subject) == 100
+
+    @patch.object(cdr, "sns")
+    def test_publish_result_safe_uses_sanitised_subject(self, mock_sns):
+        cdr.RESULT_TOPIC_ARN = "arn:aws:sns:us-east-1:123456789012:test"
+        try:
+            cdr._publish_result_safe("src", "evil\nkey.docx", "sanitised", {})
+        finally:
+            cdr.RESULT_TOPIC_ARN = ""
+        subject = mock_sns.publish.call_args.kwargs["Subject"]
+        assert "\n" not in subject
+
+
+class TestPassthroughMetricEmptyExtension:
+    """Audit fix: CloudWatch rejects an empty Dimensions[].Value client-side, which would
+    otherwise drop BOTH datapoints in the request (including the mandatory dimensionless
+    rollup the alarm depends on) for a file with no extension at all."""
+
+    @patch.object(cdr, "cw")
+    def test_empty_extension_does_not_crash_metric_emission(self, mock_cw):
+        cdr._emit_passthrough_metric("")
+        call_kwargs = mock_cw.put_metric_data.call_args.kwargs
+        dims = call_kwargs["MetricData"][1]["Dimensions"]
+        assert dims[0]["Value"] != ""
+
+    @patch.object(cdr, "cw")
+    def test_normal_extension_still_used_as_dimension(self, mock_cw):
+        cdr._emit_passthrough_metric("exe")
+        call_kwargs = mock_cw.put_metric_data.call_args.kwargs
+        dims = call_kwargs["MetricData"][1]["Dimensions"]
+        assert dims[0]["Value"] == "exe"
+
+
+class TestLegacyOleEmitsPassthroughMetric:
+    """Audit fix: legacy OLE (.doc/.xls/.ppt) uploads are quarantined but must also
+    increment the PassthroughFiles metric like other fail-closed carriers, or the
+    CdrPassthroughAlarm under-counts and legacy uploads are invisible in dashboards."""
+
+    def test_legacy_ext_sets_passthrough_metric(self):
+        result = cdr.cdr_dispatch(b"\xd0\xcf\x11\xe0" + b"\x00" * 100, "doc")
+        assert result["status"] == "unsupported-format"
+        assert result["metric"] == "passthrough"
+
+
+class TestEncodedFieldKeywordWordBoundary:
+    """Audit fix: a plain substring check (`kw in text`) false-positives on benign words
+    that merely contain a keyword, e.g. 'PADDED' contains 'DDE', 'UNLINKING' contains
+    'LINK', 'RECALL' contains 'CALL' — corrupting legitimate text that was never a field
+    code. Must use word-boundary matching instead."""
+
+    def test_benign_substring_not_neutralised(self):
+        text, count = cdr._neutralise_encoded_field_codes("&#80;ADDED text here")
+        assert count == 0
+        assert "_CDR_REMOVED_" not in text
+
+    def test_benign_unlinking_not_neutralised(self):
+        text, count = cdr._neutralise_encoded_field_codes("&#85;NLINKING text")
+        assert count == 0
+        assert "_CDR_REMOVED_" not in text
+
+    def test_malicious_dde_still_neutralised(self):
+        text, count = cdr._neutralise_encoded_field_codes("&#68;DE evil")
+        assert count == 1
+        assert "_CDR_REMOVED_" in text
+
+    def test_malicious_macrobutton_still_neutralised(self):
+        text, count = cdr._neutralise_encoded_field_codes("&#77;ACROBUTTON Hidden Click")
+        assert count == 1
+        assert "_CDR_REMOVED_" in text
 
 
 # ── Office CDR tests ───────────────────────────────────────────────────────────
@@ -555,6 +651,53 @@ class TestImageCDR:
         """webp output stays webp — confirm the content type map is consistent with fmt_map."""
         assert cdr._EXT_CONTENT_TYPE.get("webp") == "image/webp"
         assert cdr._content_type_for_ext("webp", "image/webp") == "image/webp"
+
+    # ── Audit fix: an explicit CDR_MAX_IMAGE_PIXELS cap (default 40 MP), sized to this
+    #    Lambda's memory budget, now fails closed instead of relying on Pillow's own
+    #    undocumented default (89.5M soft-warn / 179M hard-error) — the soft-warn band
+    #    used to decode silently since default warning filters don't raise ──
+    def test_decompression_bomb_over_pixel_cap_rejected(self):
+        import math
+        side = math.isqrt(cdr.Image.MAX_IMAGE_PIXELS) + 1000  # comfortably over the cap
+        buf = io.BytesIO()
+        Image.new("RGB", (side, side), "blue").save(buf, format="PNG")
+        with pytest.raises(Exception):
+            cdr.cdr_image(buf.getvalue(), "png")
+
+    def test_image_under_pixel_cap_still_processed(self):
+        img = Image.new("RGB", (64, 64), "green")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        clean, report = cdr.cdr_image(buf.getvalue(), "png")
+        assert Image.open(io.BytesIO(clean)).size == (64, 64)
+
+    # ── Audit fix: only TIFF got frame-by-frame re-encoding; animated GIF/WEBP fell
+    #    into the single-frame `else` branch and were silently collapsed to their first
+    #    frame — a real data-loss bug, not just a metadata-stripping gap ──
+    def test_animated_gif_all_frames_preserved(self):
+        frames = [Image.new("RGB", (10, 10), (i * 40, 0, 0)) for i in range(5)]
+        buf = io.BytesIO()
+        frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
+                        duration=100, loop=0)
+        clean, report = cdr.cdr_image(buf.getvalue(), "gif")
+        with Image.open(io.BytesIO(clean)) as out:
+            assert getattr(out, "n_frames", 1) == 5
+
+    def test_animated_webp_all_frames_preserved(self):
+        frames = [Image.new("RGB", (10, 10), (i * 40, 0, 0)) for i in range(4)]
+        buf = io.BytesIO()
+        frames[0].save(buf, format="WEBP", save_all=True, append_images=frames[1:],
+                        duration=100, loop=0)
+        clean, report = cdr.cdr_image(buf.getvalue(), "webp")
+        with Image.open(io.BytesIO(clean)) as out:
+            assert getattr(out, "n_frames", 1) == 4
+
+    def test_single_frame_gif_still_processed(self):
+        buf = io.BytesIO()
+        Image.new("RGB", (10, 10), (1, 2, 3)).save(buf, format="GIF")
+        clean, report = cdr.cdr_image(buf.getvalue(), "gif")
+        with Image.open(io.BytesIO(clean)) as out:
+            assert getattr(out, "n_frames", 1) == 1
 
 
 class TestContentTypesSanitisation:
@@ -1294,6 +1437,40 @@ class TestAcroFormJSSweep:
 
         clean, _ = cdr.cdr_pdf(buf.getvalue())  # must return promptly, not hang/crash
         assert clean
+
+    # ── Audit fix: a fixed recursion-depth cutoff silently stopped the sweep partway
+    #    through a legitimately deep (non-cyclic) /Kids chain, leaving deeper fields'
+    #    /JS un-stripped while returning normally. The walk is now iterative and must
+    #    fully sweep chains far deeper than the old depth cutoff (1000) ──
+    def test_acroform_deep_noncyclic_kids_fully_swept(self):
+        pdf = pikepdf.Pdf.new()
+        page = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Page"),
+            MediaBox=pikepdf.Array([0, 0, 612, 792]),
+        ))
+        pdf.pages.append(pikepdf.Page(page))
+
+        depth = 5000
+        prev = None
+        for i in range(depth):
+            field = pdf.make_indirect(pikepdf.Dictionary(
+                T=pikepdf.String(f"f{i}"),
+                FT=pikepdf.Name("/Tx"),
+                JS=pikepdf.String("app.alert('xss');"),
+            ))
+            if prev is not None:
+                field["/Kids"] = pikepdf.Array([prev])
+            prev = field
+
+        pdf.Root["/AcroForm"] = pikepdf.Dictionary(Fields=pikepdf.Array([prev]))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        buf.seek(0)
+
+        with pikepdf.open(buf) as pdf2:
+            removed = cdr._strip_acroform_fields(pdf2.Root["/AcroForm"].get("/Fields", []))
+        assert len(removed) == depth, \
+            f"only {len(removed)}/{depth} fields swept — deep chain silently truncated"
 
 
 class TestPdfNamesEmbeddedFiles:
@@ -2379,6 +2556,42 @@ class TestDenylistGaps:
                     assert "/A" not in node, "outline action survived"
         assert any("outline" in r for r in report["removed"])
 
+    # ── Audit fix: a fixed recursion-depth cutoff silently stopped the outline sweep
+    #    partway through a legitimately deep (non-cyclic) /Next chain, leaving deeper
+    #    nodes' /A un-stripped while returning normally. The walk is now iterative and
+    #    must fully sweep chains far deeper than the old depth cutoff (1000) ──
+    def test_pdf_deep_noncyclic_outline_chain_fully_swept(self):
+        pdf = pikepdf.Pdf.new()
+        page = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Page"), MediaBox=pikepdf.Array([0, 0, 612, 792]),
+        ))
+        pdf.pages.append(pikepdf.Page(page))
+
+        depth = 5000
+        first = None
+        prev = None
+        for i in range(depth):
+            item = pdf.make_indirect(pikepdf.Dictionary(
+                Title=pikepdf.String(f"item{i}"),
+                A=pikepdf.Dictionary(S=pikepdf.Name("/JavaScript"),
+                                     JS=pikepdf.String("app.alert('x')")),
+            ))
+            if prev is not None:
+                prev["/Next"] = item
+            else:
+                first = item
+            prev = item
+        pdf.Root["/Outlines"] = pikepdf.Dictionary(
+            Type=pikepdf.Name("/Outlines"), First=first, Last=prev, Count=depth)
+        buf = io.BytesIO()
+        pdf.save(buf)
+        buf.seek(0)
+
+        with pikepdf.open(buf) as out:
+            removed = cdr._strip_pdf_outlines(out.Root)
+        assert len(removed) == depth, \
+            f"only {len(removed)}/{depth} outline nodes swept — deep chain silently truncated"
+
     def test_pdf_goToE_annotation_action_stripped(self):
         """/GoToE (re-reaches embedded files) was not in the old denylist; the new
         unconditional /A deletion catches it (M4)."""
@@ -2595,6 +2808,18 @@ class TestStripXmlMacrosRegex:
             assert b'_CDR_REMOVED_' in clean, f"not neutralised: {payload!r}"
             assert b'!A1' not in clean, f"DDE target survived: {payload!r}"
             assert len(removed) > 0
+
+    def test_many_unterminated_instrtext_does_not_hang(self):
+        """Audit fix: a document.xml with many unmatched "<w:instrText ...>" opens used to
+        cost O(n^2) (a lazy DOTALL body group re-scans to EOF for every unmatched open) —
+        well within the 200MB per-entry limit, this was a Lambda-timeout DoS. Must now
+        complete in well under a second for tens of thousands of unmatched opens."""
+        xml = ("<w:instrText>" * 40_000).encode() + b"X" * 1000
+        start = time.time()
+        clean, removed = cdr._strip_xml_macros(xml, "doc.xml")
+        elapsed = time.time() - start
+        assert elapsed < 2.0, f"took {elapsed:.2f}s — quadratic blowup regressed"
+        assert removed == []  # no complete instrText element, nothing to scrub
 
 
 class TestEncTag:

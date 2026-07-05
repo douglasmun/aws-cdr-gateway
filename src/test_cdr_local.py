@@ -483,6 +483,11 @@ class TestHeaderValueHygiene:
         assert local_app._safe_ext_header('x"y') == "unknown"        # charset cap
         assert local_app._safe_ext_header("") == "unknown"
 
+    def test_safe_ext_header_rejects_trailing_newline(self):
+        """Audit fix: `$` matches just before a trailing '\\n', so "docx\\n" used to pass
+        the regex and inject a newline into the response header value. Must use \\Z."""
+        assert local_app._safe_ext_header("docx\n") == "unknown"
+
 
 class TestReportHeaderGating:
     def test_large_report_omits_header(self, monkeypatch):

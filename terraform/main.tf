@@ -339,11 +339,12 @@ resource "aws_lambda_function" "cdr" {
 
   environment {
     variables = {
-      SANITISED_BUCKET    = var.sanitised_bucket_name
-      QUARANTINE_BUCKET   = local.quarantine_enabled ? var.quarantine_bucket_name : ""
-      RESULT_TOPIC_ARN    = aws_sns_topic.result.arn
-      CDR_MAX_FILE_BYTES  = tostring(var.cdr_max_file_bytes)
-      CDR_MAX_ENTRY_BYTES = tostring(var.cdr_max_entry_bytes)
+      SANITISED_BUCKET     = var.sanitised_bucket_name
+      QUARANTINE_BUCKET    = local.quarantine_enabled ? var.quarantine_bucket_name : ""
+      RESULT_TOPIC_ARN     = aws_sns_topic.result.arn
+      CDR_MAX_FILE_BYTES   = tostring(var.cdr_max_file_bytes)
+      CDR_MAX_ENTRY_BYTES  = tostring(var.cdr_max_entry_bytes)
+      CDR_MAX_IMAGE_PIXELS = tostring(var.cdr_max_image_pixels)
     }
   }
 

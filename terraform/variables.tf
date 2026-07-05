@@ -32,6 +32,12 @@ variable "cdr_max_entry_bytes" {
   default     = 209715200 # 200 MB
 }
 
+variable "cdr_max_image_pixels" {
+  description = "Decompression-bomb pixel cap for cdr_image, sized to lambda_memory_mb."
+  type        = number
+  default     = 40000000 # 40 MP
+}
+
 variable "lambda_zip_path" {
   description = "Path to the pre-built Lambda deployment package. Produced by scripts/build.sh (which installs Linux wheels and zips src/*.py)."
   type        = string

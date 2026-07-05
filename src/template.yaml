@@ -18,6 +18,10 @@ Parameters:
     Type: Number
     Default: 209715200   # 200 MB
     Description: Per-ZIP-entry decompression bomb limit
+  CdrMaxImagePixels:
+    Type: Number
+    Default: 40000000    # 40 MP
+    Description: Decompression-bomb pixel cap for cdr_image, sized to MemorySize below
 
 Conditions:
   QuarantineEnabled: !Not [!Equals [!Ref QuarantineBucketName, ""]]
@@ -35,6 +39,7 @@ Globals:
         RESULT_TOPIC_ARN:    !Ref CdrResultTopic
         CDR_MAX_FILE_BYTES:  !Ref CdrMaxFileBytes
         CDR_MAX_ENTRY_BYTES: !Ref CdrMaxEntryBytes
+        CDR_MAX_IMAGE_PIXELS: !Ref CdrMaxImagePixels
 
 Resources:
 
