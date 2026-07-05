@@ -35,6 +35,7 @@ import io
 import json
 import logging
 import os
+import posixpath
 import re
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -436,6 +437,7 @@ def handler(event: dict, context) -> dict:
         prefix       = "rejected" if status == "rejected" else "unsupported"
         tag_status   = "rejected" if status == "rejected" else "unsupported-format"
         logger.warning("CDR %s: key=%s ext=%s reason=%s", status, key, ext, reason)
+        quarantine_failed = False
         if QUARANTINE_BUCKET:
             try:
                 _upload(QUARANTINE_BUCKET, f"{prefix}/{key}", file_bytes, content_type,
@@ -443,8 +445,12 @@ def handler(event: dict, context) -> dict:
                          "cdr-original-ext": ext, "cdr-timestamp": _now()})
             except Exception as q_exc:
                 logger.warning("Quarantine upload failed: key=%s error=%s", key, q_exc)
+                quarantine_failed = True
         _publish_result_safe(bucket, key, status, {"reason": reason, "original_ext": ext})
-        if decision["delete_source"]:
+        # If quarantine was supposed to hold the only remaining copy of this file and the
+        # upload failed, deleting the source would destroy it entirely — never delete in
+        # that case (pitfall: never destroy the only copy of unprocessable input).
+        if decision["delete_source"] and not quarantine_failed:
             _delete_source_safe(bucket, key)
         return {"status": status, "reason": reason}
 
@@ -550,16 +556,23 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
                 # Normalise backslashes: spec mandates forward slashes
                 name_lower = item.filename.replace("\\", "/").lower()
 
+                # Canonical form for the STRIP_ZIP_ENTRIES match only: collapses "./",
+                # "//", leading "/", and ".." segments the way OPC part-name / Word's path
+                # resolution does, so "./word/vbaProject.bin" or "word//vbaProject.bin"
+                # can't dodge the literal-prefix/suffix check while still resolving to the
+                # same part at open time.
+                name_canonical = posixpath.normpath(name_lower).lstrip("/")
+
                 # 1. Drop entries matching dangerous file/prefix patterns
                 skip = False
                 for pattern in STRIP_ZIP_ENTRIES:
                     if pattern.endswith("/"):
-                        if name_lower.startswith(pattern.lower()):
+                        if name_canonical.startswith(pattern.lower()):
                             removed.append(item.filename)
                             skip = True
                             break
                     else:
-                        if name_lower.endswith(pattern.lower()):
+                        if name_canonical.endswith(pattern.lower()):
                             removed.append(item.filename)
                             skip = True
                             break
@@ -1133,6 +1146,16 @@ def _reject_inline_risky_images(pdf) -> list[str]:
                         f"— rejected (cannot be safely neutralised in place)"
                     )
 
+    def _check_appearance(ap_entry, where: str) -> None:
+        # /AP/N (etc.) is either a single stream, or a sub-dictionary of streams keyed by
+        # appearance state (e.g. checkbox /On, /Off). pikepdf.Stream also exposes .items()
+        # (over its metadata dict), so a stream must be checked directly, not iterated.
+        if isinstance(ap_entry, pikepdf.Stream):
+            _check(ap_entry, where)
+        elif hasattr(ap_entry, "items"):
+            for state, stream in ap_entry.items():
+                _check_appearance(stream, f"{where}/{state}")
+
     for page_num, page in enumerate(pdf.pages):
         _check(page, f"page[{page_num}] content stream")
         # Form XObjects referenced by the page can carry their own content streams.
@@ -1146,6 +1169,27 @@ def _reject_inline_risky_images(pdf) -> list[str]:
                     _check(xobj, f"page[{page_num}] form XObject {name}")
             except Exception:
                 continue
+        # Annotation appearance streams (/AP /N, /D, /R) are their own content streams and
+        # are invisible to both the page-content walk above and the object-level sweep in
+        # _neutralise_pdf_risky_image_filters when the inline image lives in operator
+        # tokens rather than a stream object — same bypass as page content, different home.
+        try:
+            annots = page.get("/Annots", [])
+        except Exception:
+            annots = []
+        for annot_num, annot in enumerate(annots):
+            try:
+                ap = annot.get("/AP")
+            except Exception:
+                continue
+            if not ap:
+                continue
+            for ap_key in ("/N", "/D", "/R"):
+                if ap_key in ap:
+                    _check_appearance(
+                        ap[ap_key],
+                        f"page[{page_num}] annot[{annot_num}] appearance {ap_key}",
+                    )
     return []
 
 
@@ -1241,18 +1285,34 @@ def _strip_pdf_outlines(catalog) -> list[str]:
     return removed
 
 
-def _strip_acroform_fields(fields) -> list[str]:
-    """Recursively strip dangerous action keys from AcroForm field/widget dicts."""
+def _strip_acroform_fields(fields, _seen: set | None = None, _depth: int = 0) -> list[str]:
+    """Recursively strip dangerous action keys from AcroForm field/widget dicts.
+
+    Depth + identity guard against a malicious cyclic /Kids chain (a field listing
+    itself, or two fields listing each other), mirroring _strip_pdf_outlines' guard
+    against cyclic /Next chains."""
     removed: list[str] = []
+    if _depth > 1000:
+        return removed
+    if _seen is None:
+        _seen = set()
     try:
         for field in fields:
             try:
+                try:
+                    ident = field.objgen
+                except Exception:
+                    ident = None
+                if ident is not None:
+                    if ident in _seen:
+                        continue
+                    _seen.add(ident)
                 for key in ("/A", "/AA", "/JS", "/JavaScript"):
                     if key in field:
                         del field[key]
                         removed.append(f"AcroForm field {key}")
                 if "/Kids" in field:
-                    removed.extend(_strip_acroform_fields(field["/Kids"]))
+                    removed.extend(_strip_acroform_fields(field["/Kids"], _seen, _depth + 1))
             except Exception as exc:
                 logger.debug("Skipped malformed AcroForm field: %s", exc)
     except Exception as exc:

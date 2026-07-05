@@ -292,6 +292,35 @@ class TestOfficeCDR:
         assert any("vbaProject.bin" in r for r in report["removed"]), \
             "CDR report did not record macro removal"
 
+    @pytest.mark.parametrize("evasive_name", [
+        "./word/vbaProject.bin",
+        "word//vbaProject.bin",
+        "/word/vbaProject.bin",
+        "a/../word/vbaProject.bin",
+    ])
+    def test_vba_macro_removed_path_evasion(self, evasive_name):
+        """A ZIP entry name with a non-canonical path (./, //, leading /, ..) must still
+        be recognised as word/vbaProject.bin — these all resolve to the same OPC part at
+        open time even though they don't literally start with the STRIP_ZIP_ENTRIES prefix."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", _minimal_content_types())
+            z.writestr("_rels/.rels", _minimal_rels())
+            z.writestr(evasive_name, b"\xd0\xcf\x11\xe0MACRO_BINARY_PAYLOAD")
+            z.writestr("word/document.xml",
+                       '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml'
+                       '/2006/main"><w:body/></w:document>')
+        data = buf.getvalue()
+
+        clean, report = cdr.cdr_office(data, "docx")
+
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            names = [n.lower() for n in z.namelist()]
+        assert not any("vbaproject.bin" in n for n in names), \
+            f"vbaProject.bin still present after CDR (evasive name: {evasive_name!r})"
+        assert any("vbaproject.bin" in r.lower() for r in report["removed"]), \
+            f"CDR report did not record macro removal (evasive name: {evasive_name!r})"
+
     def test_external_link_stripped_from_rels(self):
         data = _make_docx_with_external_link()
         clean, report = cdr.cdr_office(data, "xlsx")
@@ -1244,6 +1273,28 @@ class TestAcroFormJSSweep:
         assert any("AcroForm" in r for r in report["removed"]), \
             "AcroForm field sweep not recorded in report"
 
+    # ── Audit fix: a malicious cyclic /Kids chain must not cause unbounded recursion
+    #    (stack overflow / DoS) — mirrors the existing /Next cycle guard on outlines ──
+    def test_acroform_cyclic_kids_does_not_hang(self):
+        pdf = pikepdf.Pdf.new()
+        page = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Page"),
+            MediaBox=pikepdf.Array([0, 0, 612, 792]),
+        ))
+        pdf.pages.append(pikepdf.Page(page))
+
+        field_a = pdf.make_indirect(pikepdf.Dictionary(T=pikepdf.String("a"), FT=pikepdf.Name("/Tx")))
+        field_b = pdf.make_indirect(pikepdf.Dictionary(T=pikepdf.String("b"), FT=pikepdf.Name("/Tx")))
+        field_a["/Kids"] = pikepdf.Array([field_b])
+        field_b["/Kids"] = pikepdf.Array([field_a])  # cycle: a -> b -> a -> ...
+
+        pdf.Root["/AcroForm"] = pikepdf.Dictionary(Fields=pikepdf.Array([field_a]))
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        clean, _ = cdr.cdr_pdf(buf.getvalue())  # must return promptly, not hang/crash
+        assert clean
+
 
 class TestPdfNamesEmbeddedFiles:
     """PDF /Names./EmbeddedFiles is removed."""
@@ -1480,6 +1531,44 @@ class TestZipRejectionDeletesSource:
             z.writestr("word/document.xml", b"<evil/>")
         mock_s3.get_object.return_value = {
             "Body": io.BytesIO(buf.getvalue()),
+            "ContentType": "application/octet-stream",
+        }
+        mock_s3.delete_object.return_value = {}
+
+        result = cdr.handler(self._event("src", "evil.docx"), None)
+
+        assert result["status"] == "rejected"
+        mock_s3.delete_object.assert_called_once_with(Bucket="src", Key="evil.docx")
+
+
+class TestQuarantineFailureDoesNotDeleteSource:
+    """Audit fix: if the quarantine upload fails, the source must NOT be deleted — it is
+    the only remaining copy of an unprocessable file. Never destroy the only copy."""
+
+    def _event(self, bucket: str, key: str) -> dict:
+        return {"detail": {"bucket": {"name": bucket}, "object": {"key": key, "size": 512}}}
+
+    @patch.object(cdr, "s3")
+    @patch.object(cdr, "_publish_result_safe")
+    @patch.object(cdr, "_upload")
+    def test_quarantine_upload_failure_keeps_source(self, mock_ul, mock_pub, mock_s3):
+        mock_ul.side_effect = Exception("simulated S3 outage")
+        mock_s3.get_object.return_value = {
+            "Body": io.BytesIO(b"NOT_A_ZIP_FILE" + b"\x00" * 100),
+            "ContentType": "application/octet-stream",
+        }
+
+        result = cdr.handler(self._event("src", "evil.docx"), None)
+
+        assert result["status"] == "rejected"
+        mock_s3.delete_object.assert_not_called()
+
+    @patch.object(cdr, "s3")
+    @patch.object(cdr, "_publish_result_safe")
+    @patch.object(cdr, "_upload")
+    def test_quarantine_upload_success_still_deletes_source(self, mock_ul, mock_pub, mock_s3):
+        mock_s3.get_object.return_value = {
+            "Body": io.BytesIO(b"NOT_A_ZIP_FILE" + b"\x00" * 100),
             "ContentType": "application/octet-stream",
         }
         mock_s3.delete_object.return_value = {}
@@ -2889,6 +2978,27 @@ class TestStevensGapRegressions:
         )
         with pytest.raises(ValueError, match="inline image with decoder-RCE filter"):
             cdr.cdr_pdf(raw)
+
+    # ── Audit fix: the same inline-image bypass also applies to an annotation's
+    #    appearance stream (/AP /N) — invisible to both the page-content walk and the
+    #    object-level sweep when the image lives in operator tokens ──
+    def test_inline_image_jbig2_in_annotation_appearance_rejected(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        ap_stream = pdf.make_stream(
+            b"q\nBI /W 4 /H 4 /CS /G /BPC 1 /F /JBIG2Decode ID INLINEXX EI\nQ\n")
+        annot = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Annot"),
+            Subtype=pikepdf.Name("/Widget"),
+            Rect=pikepdf.Array([0, 0, 10, 10]),
+            AP=pikepdf.Dictionary(N=ap_stream),
+        ))
+        pdf.pages[0].Annots = pikepdf.Array([annot])
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        with pytest.raises(ValueError, match="inline image with decoder-RCE filter"):
+            cdr.cdr_pdf(buf.getvalue())
 
     def test_inline_image_benign_filter_not_rejected(self):
         # A benign inline image (no risky filter) must NOT be rejected — no false positive.
