@@ -180,7 +180,7 @@ aws lambda get-function-configuration \
   --query '{Runtime:Runtime,MemorySize:MemorySize,Timeout:Timeout,State:State}'
 ```
 
-**SAM** — the EventBridge rule is named `cdr-lambda-S3Upload`:
+**SAM** — the EventBridge rule's logical ID is `CdrFunctionS3Upload`, but its physical name is auto-generated with a random suffix (e.g. `cdr-lambda-staging-CdrFunctionS3Upload-BJXdknPZ9Hq7`), not a fixed string — look it up from the stack resources first:
 ```bash
 STACK=cdr-lambda-staging
 
@@ -189,8 +189,13 @@ aws cloudformation describe-stack-resources \
   --query 'StackResources[].{Type:ResourceType,Status:ResourceStatus,Name:LogicalResourceId}' \
   --output table
 
+RULE_NAME=$(aws cloudformation describe-stack-resource \
+  --stack-name $STACK \
+  --logical-resource-id CdrFunctionS3Upload \
+  --query 'StackResourceDetail.PhysicalResourceId' --output text)
+
 aws events list-targets-by-rule \
-  --rule cdr-lambda-S3Upload \
+  --rule "$RULE_NAME" \
   --query 'Targets[].Arn'
 ```
 
@@ -414,8 +419,13 @@ not affected.)
 **Lambda function not triggered after upload**
 Check that the EventBridge rule is `ENABLED`. The rule name differs by path:
 ```bash
-# SAM:
-aws events describe-rule --name cdr-lambda-S3Upload     --query 'State'
+# SAM: physical name has an auto-generated suffix — look it up first (see section 3)
+RULE_NAME=$(aws cloudformation describe-stack-resource \
+  --stack-name cdr-lambda-staging \
+  --logical-resource-id CdrFunctionS3Upload \
+  --query 'StackResourceDetail.PhysicalResourceId' --output text)
+aws events describe-rule --name "$RULE_NAME"             --query 'State'
+
 # OpenTofu / Terraform:
 aws events describe-rule --name cdr-s3-object-created    --query 'State'
 ```
