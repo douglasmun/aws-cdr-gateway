@@ -7,4 +7,4 @@
 fastapi==0.139.0         # local HTTP CDR service framework
 uvicorn==0.51.0          # ASGI server for app.py
 python-multipart==0.0.32 # multipart/form-data parsing for file uploads
-httpx2==2.5.0            # Starlette/FastAPI TestClient dependency (test_cdr_local.py); httpx is deprecated for the TestClient
+httpx2==2.9.1            # Starlette/FastAPI TestClient dependency (test_cdr_local.py); httpx is deprecated for the TestClient
