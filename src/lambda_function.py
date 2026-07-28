@@ -38,7 +38,6 @@ import logging
 import os
 import posixpath
 import re
-import urllib.parse
 import warnings
 import xml.etree.ElementTree as ET
 import zipfile
@@ -49,14 +48,30 @@ import boto3
 import openpyxl
 import pikepdf
 import pyxlsb
+from botocore.config import Config
 from PIL import Image, ImageSequence
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-s3  = boto3.client("s3")
-sns = boto3.client("sns")
-cw  = boto3.client("cloudwatch")
+# Explicit client config rather than botocore's defaults. On a 300 s Lambda under high
+# utilisation the defaults are actively harmful: a 60 s connect/read timeout with legacy
+# retries lets a single hung S3 socket consume most of the invocation budget, and every
+# second spent blocked holds one of the 20 reserved-concurrency slots. Bounded timeouts
+# turn a stalled call into a fast, retryable failure. "standard" retry mode adds jitter
+# and honours throttling responses, which matters when many concurrent invocations hit
+# the same prefix. tcp_keepalive keeps warm-container sockets from being silently dropped.
+_BOTO_CONFIG = Config(
+    retries={"max_attempts": 3, "mode": "standard"},
+    connect_timeout=5,
+    read_timeout=30,
+    tcp_keepalive=True,
+    max_pool_connections=10,
+)
+
+s3  = boto3.client("s3", config=_BOTO_CONFIG)
+sns = boto3.client("sns", config=_BOTO_CONFIG)
+cw  = boto3.client("cloudwatch", config=_BOTO_CONFIG)
 
 SANITISED_BUCKET  = os.environ["SANITISED_BUCKET"]
 QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
@@ -64,6 +79,16 @@ RESULT_TOPIC_ARN  = os.environ.get("RESULT_TOPIC_ARN", "")
 
 _MAX_FILE_BYTES  = int(os.environ.get("CDR_MAX_FILE_BYTES",  str(100 * 1024 * 1024)))
 _MAX_ENTRY_BYTES = int(os.environ.get("CDR_MAX_ENTRY_BYTES", str(200 * 1024 * 1024)))
+# Aggregate decompression budget for one package; _MAX_ENTRY_BYTES bounds only a single
+# entry, so many just-under-cap entries otherwise expand without limit (pitfall #46).
+# Sized under the 1024 MB MemorySize rather than above it. Corpus max: 757 KB.
+_MAX_TOTAL_ENTRY_BYTES = int(os.environ.get("CDR_MAX_TOTAL_BYTES", str(512 * 1024 * 1024)))
+# Corpus max: 12 entries. Real OOXML packages run to a few thousand at the extreme.
+_MAX_ZIP_ENTRIES = int(os.environ.get("CDR_MAX_ZIP_ENTRIES", "20000"))
+# Image.MAX_IMAGE_PIXELS bounds a single frame; cdr_image materialises every frame at
+# once, so total pixels and frame count need their own caps (pitfall #46).
+_MAX_TOTAL_IMAGE_PIXELS = int(os.environ.get("CDR_MAX_TOTAL_IMAGE_PIXELS", str(80_000_000)))
+_MAX_IMAGE_FRAMES = int(os.environ.get("CDR_MAX_IMAGE_FRAMES", "2000"))
 # Explicit decompression-bomb cap, sized to this Lambda's 1024 MB default memory budget
 # rather than relying on Pillow's own undocumented default (89.5M soft-warn / 179M
 # hard-error) — the soft-warn band between those two lets a large-but-under-the-hard-cap
@@ -189,6 +214,18 @@ STRIP_ZIP_ENTRIES: set[str] = {
     # matching [Content_Types].xml declaration is stripped in _sanitise_content_types.
     ".eps",
     ".ps",
+    # altChunk payload parts. The aFChunk RELATIONSHIP is dropped (STRIP_REL_TYPES) and
+    # the <w:altChunk> element is neutralised in _strip_xml_macros, but the imported
+    # chunk itself — an HTML/MHTML part such as word/afchunk.htm carrying <script>,
+    # remote references, or an MHTML-smuggled payload — stayed in the package and rode
+    # into SANITISED_BUCKET intact. It is never inspected by the XML scrub (which only
+    # ever sees the host part), so anything extracting the package still reaches it.
+    # Strip the PART as well as the reference, per the strip-part-and-rel rule.
+    ".htm",
+    ".html",
+    ".xhtml",
+    ".mht",
+    ".mhtml",
 }
 
 OFFICE_EXTS: set[str] = {
@@ -355,13 +392,24 @@ def cdr_dispatch(data: bytes, ext: str, *, max_file_bytes: Optional[int] = None)
                        reason=f"unsupported extension: {ext}",
                        metric="passthrough", delete_source=True)
 
-    # ── CDR dispatch ──────────────────────────────────────────────────────────
-    if ext in OFFICE_EXTS:
-        clean_bytes, report = cdr_office(data, ext)
-    elif ext == "pdf":
-        clean_bytes, report = cdr_pdf(data)
-    else:  # one of IMAGE_EXTS, per the fail-closed guard above
-        clean_bytes, report = cdr_image(data, ext)
+    # A CdrReject is a deterministic verdict — hard-reject rather than let it escape as
+    # an error and burn the EventBridge retry budget on input that fails identically.
+    try:
+        if ext in OFFICE_EXTS:
+            clean_bytes, report = cdr_office(data, ext)
+        elif ext == "pdf":
+            clean_bytes, report = cdr_pdf(data)
+        else:  # one of IMAGE_EXTS, per the fail-closed guard above
+            clean_bytes, report = cdr_image(data, ext)
+    except CdrReject as exc:
+        return _result("rejected", reason=str(exc),
+                       metric="zip-anomaly", delete_source=True)
+
+    # An empty payload must never be uploaded labelled "sanitised".
+    if not clean_bytes:
+        raise ValueError(
+            f"CDR produced no output for ext={ext} — refusing to label empty content sanitised"
+        )
 
     return _result("sanitised", data=clean_bytes, report=report,
                    cdr_mode=report.get("cdr_mode", "full"), delete_source=True)
@@ -412,7 +460,11 @@ def handler(event: dict, context) -> dict:
         _classify_download_error(bucket, key, exc)
         raise
 
-    ext           = key.rsplit(".", 1)[-1].lower() if "." in key else ""
+    # Take the extension from the BASENAME. Splitting the whole key on "." reads a dot in
+    # a directory name as an extension ("reports.v2/summary" -> ext "v2/summary"), which
+    # fails closed but logs and alarms under a nonsense extension.
+    basename      = posixpath.basename(key)
+    ext           = basename.rsplit(".", 1)[-1].lower() if "." in basename else ""
 
     # ── Pure CDR decision core ────────────────────────────────────────────────
     # cdr_dispatch makes every routing/disarm decision with NO I/O; the handler maps
@@ -466,7 +518,6 @@ def handler(event: dict, context) -> dict:
     # ── Sanitised output ──────────────────────────────────────────────────────
     clean_bytes           = decision["data"]
     report                = decision["report"]
-    zip_anomalies: list[str] = []
     dest_key              = _sanitised_key(key, sanitised_ext)
     cdr_mode              = decision["cdr_mode"]
     sanitised_content_type = _content_type_for_ext(sanitised_ext, content_type)
@@ -480,7 +531,9 @@ def handler(event: dict, context) -> dict:
             "cdr-timestamp":    _now(),
             "cdr-removals":     str(removal_count),
             "cdr-original-ext": ext,
-            "cdr-zip-anomaly":  "true" if zip_anomalies else "false",
+            # A structural anomaly is a hard reject, so anything reaching this upload had
+            # none by construction. (Previously computed from a local that was always [].)
+            "cdr-zip-anomaly":  "false",
             "cdr-mode":         cdr_mode,
         },
     )
@@ -492,7 +545,7 @@ def handler(event: dict, context) -> dict:
         "original_ext":  ext,
         "sanitised_ext": sanitised_ext,
         "cdr_mode":      cdr_mode,
-        "zip_anomalies": zip_anomalies,
+        "zip_anomalies": [],
         "report":        report,
     }
     _publish_result_safe(bucket, key, "sanitised", result_payload)
@@ -518,6 +571,7 @@ def _postscript_override_parts(ct_xml: bytes) -> set[str]:
     empty set on unparseable XML (the ZIP validator already requires a present, well-formed
     Content-Types part, and the suffix rule remains as a backstop)."""
     parts: set[str] = set()
+    _reject_xml_doctype(ct_xml, "[Content_Types].xml")
     try:
         root = ET.fromstring(ct_xml)
     except ET.ParseError:
@@ -546,6 +600,7 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
     """
     removed: list[str] = []
     out_buf = io.BytesIO()
+    budget = _DecompressionBudget()
 
     with zipfile.ZipFile(io.BytesIO(data), "r") as src:
         # Pre-pass: resolve which parts [Content_Types].xml declares as PostScript via an
@@ -555,7 +610,8 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
         for item in src.infolist():
             if item.filename.replace("\\", "/").lower() == "[content_types].xml":
                 try:
-                    ps_parts = _postscript_override_parts(_read_zip_entry_safe(src, item))
+                    ps_parts = _postscript_override_parts(
+                        _read_zip_entry_safe(src, item, budget))
                 except ValueError:
                     ps_parts = set()  # bomb-guard trip; suffix rule remains the backstop
                 break
@@ -599,8 +655,10 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
                     removed.append(item.filename)
                     continue
 
-                # 3. Decompression bomb guard — read in chunks to catch falsified file_size
-                raw = _read_zip_entry_safe(src, item)
+                # 3. Decompression bomb guard — read in chunks to catch falsified
+                #    file_size, and charge the read against the package-wide budget so a
+                #    package of individually-legal entries cannot decompress to tens of GB.
+                raw = _read_zip_entry_safe(src, item, budget)
 
                 # 4. Sanitise [Content_Types].xml
                 if name_lower == "[content_types].xml":
@@ -612,8 +670,12 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
                     raw, rels_removed = _strip_rels(raw)
                     removed.extend(rels_removed)
 
-                # 6. Scrub macro attributes from XML content
-                elif name_lower.endswith(".xml"):
+                # 6. Scrub macro attributes from XML content. `.vml` is included: a VML
+                #    drawing part is XML that carries shape definitions with the same
+                #    action attributes (onClick/onAction) and field-code carriers the
+                #    scrub targets, and it is the classic home of the OLE-object shape.
+                #    Matching only ".xml" left every vmlDrawing*.vml part unscrubbed.
+                elif name_lower.endswith(".xml") or name_lower.endswith(".vml"):
                     raw, xml_removed = _strip_xml_macros(raw, item.filename)
                     removed.extend(xml_removed)
 
@@ -650,9 +712,11 @@ def cdr_xlsb(data: bytes) -> tuple[bytes, dict]:
     # Enforce per-entry decompression limit on the xlsb ZIP before handing to pyxlsb.
     # pyxlsb reads entries internally, bypassing _read_zip_entry_safe — pre-reading
     # all entries here ensures a decompression bomb cannot OOM the Lambda.
+    _budget = _DecompressionBudget()
     with zipfile.ZipFile(io.BytesIO(data), "r") as _zf:
         for _item in _zf.infolist():
-            _read_zip_entry_safe(_zf, _item)  # raises ValueError if entry > _MAX_ENTRY_BYTES
+            # Raises CdrReject on the per-entry cap or the aggregate package budget.
+            _read_zip_entry_safe(_zf, _item, _budget)
 
     wb_out = openpyxl.Workbook(write_only=False)
     wb_out.remove(wb_out.active)  # remove default empty sheet
@@ -689,11 +753,41 @@ def cdr_xlsb(data: bytes) -> tuple[bytes, dict]:
     }
 
 
-def _read_zip_entry_safe(src: zipfile.ZipFile, item: zipfile.ZipInfo) -> bytes:
+class _DecompressionBudget:
+    """Running total of decompressed bytes across every entry of ONE package.
+
+    The per-entry cap alone bounds no aggregate: a package whose entries are each under
+    _MAX_ENTRY_BYTES can still decompress to tens of GB in total (see
+    _MAX_TOTAL_ENTRY_BYTES). One budget instance is threaded through every read of a
+    single archive so the total is enforced, not just the maximum.
+    """
+
+    __slots__ = ("used", "limit")
+
+    def __init__(self, limit: int = None):
+        self.used = 0
+        self.limit = _MAX_TOTAL_ENTRY_BYTES if limit is None else limit
+
+    def consume(self, n: int, entry_name: str) -> None:
+        self.used += n
+        if self.used > self.limit:
+            raise CdrReject(
+                f"package exceeds total decompression budget {self.limit} bytes "
+                f"(while reading '{entry_name}')"
+            )
+
+
+def _read_zip_entry_safe(src: zipfile.ZipFile, item: zipfile.ZipInfo,
+                         budget: Optional["_DecompressionBudget"] = None) -> bytes:
     """Read a ZIP entry in chunks, raising if the actual decompressed size exceeds the limit.
-    Does not trust item.file_size which can be falsified in the central directory."""
-    chunks: list[bytes] = []
-    total = 0
+    Does not trust item.file_size which can be falsified in the central directory.
+
+    ``budget``, when supplied, additionally enforces the aggregate across all entries of
+    the package — checked per chunk, so an oversized entry is abandoned mid-read rather
+    than after it has already been buffered.
+    """
+    buf = bytearray()  # extend-in-place: a chunk list + b"".join() doubles peak memory,
+    total = 0          # 400 MB for one max-size entry inside a 1024 MB container.
     with src.open(item) as f:
         while True:
             chunk = f.read(65536)
@@ -701,11 +795,13 @@ def _read_zip_entry_safe(src: zipfile.ZipFile, item: zipfile.ZipInfo) -> bytes:
                 break
             total += len(chunk)
             if total > _MAX_ENTRY_BYTES:
-                raise ValueError(
+                raise CdrReject(
                     f"ZIP entry '{item.filename}' exceeds decompression limit {_MAX_ENTRY_BYTES}"
                 )
-            chunks.append(chunk)
-    return b"".join(chunks)
+            if budget is not None:
+                budget.consume(len(chunk), item.filename)
+            buf.extend(chunk)
+    return bytes(buf)
 
 
 def _strip_rels(data: bytes) -> tuple[bytes, list[str]]:
@@ -716,6 +812,7 @@ def _strip_rels(data: bytes) -> tuple[bytes, list[str]]:
     Returns ``(rels_bytes, removed)``; unparseable XML is returned unchanged.
     """
     removed: list[str] = []
+    _reject_xml_doctype(data, "(.rels part)")
     try:
         root = ET.fromstring(data)
     except ET.ParseError:
@@ -757,6 +854,7 @@ def _sanitise_content_types(data: bytes) -> tuple[bytes, list[str]]:
     Returns ``(content_types_bytes, removed)``; unparseable XML is returned unchanged.
     """
     removed: list[str] = []
+    _reject_xml_doctype(data, "[Content_Types].xml")
     try:
         root = ET.fromstring(data)
     except ET.ParseError:
@@ -944,6 +1042,79 @@ def _scrub_field_code_carriers(text: str) -> tuple[str, int]:
     return text, n1 + total
 
 
+class CdrReject(Exception):
+    """A deterministic, unprocessable-input verdict raised from inside a CDR function.
+
+    ``cdr_dispatch`` turns this into a ``rejected`` disposition (quarantine + delete
+    source), NOT into the error path. The distinction matters under load: an error
+    re-raises so EventBridge retries — correct for a possibly-transient fault, but pure
+    waste for input that will fail identically on every attempt, and it multiplies an
+    attacker's cost-per-upload by the retry count. Structural verdicts that can never
+    succeed on retry belong here.
+    """
+
+
+# XML byte-order marks. A part in any of these encodings is valid XML that Word/Excel
+# parse happily, but every neutralisation pass in this module is written against the
+# decoded text — decoding UTF-16 as UTF-8 turns "DDEAUTO" into "D\x00D\x00E\x00…", which
+# no keyword regex matches, so a UTF-16 document.xml sails through every pass untouched.
+# Decode with the real encoding, scrub, and re-encode with the SAME encoding (BOM
+# included) so the declaration stays truthful and the file stays byte-faithful.
+_XML_BOMS: tuple[tuple[bytes, str], ...] = (
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xff\xfe\x00\x00", "utf-32-le"),
+    (b"\xef\xbb\xbf",     "utf-8-sig"),
+    (b"\xfe\xff",         "utf-16-be"),
+    (b"\xff\xfe",         "utf-16-le"),
+)
+
+
+def _decode_xml_part(data: bytes):
+    """Decode an XML part to text, returning ``(text, encode_fn)`` where ``encode_fn``
+    re-encodes scrubbed text back to the part's original encoding.
+
+    Never lossy. The previous ``decode("utf-8", errors="replace")`` silently rewrote every
+    byte it could not decode to U+FFFD and then wrote that back out — so a legitimate
+    latin-1-encoded part came out of CDR with its accented characters destroyed (real
+    corruption of a clean document), while a UTF-16 part evaded the scrub entirely.
+    """
+    for bom, enc in _XML_BOMS:
+        if data.startswith(bom):
+            body = data[len(bom):] if enc != "utf-8-sig" else data
+            try:
+                text = body.decode(enc)
+            except UnicodeDecodeError:
+                break
+            if enc == "utf-8-sig":
+                return text, lambda s: s.encode("utf-8-sig")
+            return text, lambda s, e=enc, b=bom: b + s.encode(e)
+
+    try:
+        return data.decode("utf-8"), lambda s: s.encode("utf-8")
+    except UnicodeDecodeError:
+        # Not UTF-8 and no BOM — most likely a legacy single-byte encoding. latin-1 maps
+        # every byte 1:1 to U+0000–U+00FF, so decode→scrub→encode round-trips byte-exactly
+        # for anything the ASCII-only patterns don't match, and the ASCII keywords the
+        # patterns DO look for are still visible. Lossless where "replace" was destructive.
+        return data.decode("latin-1"), lambda s: s.encode("latin-1", errors="replace")
+
+
+# ECMA-376 Part 2 forbids a DTD in any OPC package part, and Word/Excel reject one. An
+# XML part carrying <!DOCTYPE ...> is therefore never legitimate, and it is the entry
+# point for entity-expansion amplification (billion laughs / quadratic blowup) against
+# the ElementTree parses in _strip_rels and _sanitise_content_types — verified locally:
+# a nested-entity [Content_Types].xml expands ~1000x through ET.fromstring today.
+# Reject the package rather than parse it.
+_XML_DOCTYPE_RE = re.compile(rb"<!DOCTYPE", re.IGNORECASE)
+
+
+def _reject_xml_doctype(data: bytes, filename: str) -> None:
+    """Hard-reject an OPC XML part containing a DTD (spec-forbidden; entity-expansion
+    amplification vector). Only the prolog can hold one, so only the head is scanned."""
+    if _XML_DOCTYPE_RE.search(data[:4096]):
+        raise CdrReject(f"XML part '{filename}' contains a DTD (forbidden in OPC packages)")
+
+
 def _strip_xml_macros(data: bytes, filename: str) -> tuple[bytes, list[str]]:
     """Neutralise dangerous content inside an Office XML part via text-level regex passes.
 
@@ -956,10 +1127,8 @@ def _strip_xml_macros(data: bytes, filename: str) -> tuple[bytes, list[str]]:
     Returns ``(xml_bytes, removed)``.
     """
     removed: list[str] = []
-    try:
-        text = data.decode("utf-8", errors="replace")
-    except Exception:
-        return data, removed
+    _reject_xml_doctype(data, filename)
+    text, _encode = _decode_xml_part(data)
 
     # Neutralise entity-encoded field codes (e.g. &#68;&#68;&#69; = "DDE") WITHOUT
     # decoding the whole document. Word entity-decodes content before evaluating field
@@ -1031,7 +1200,7 @@ def _strip_xml_macros(data: bytes, filename: str) -> tuple[bytes, list[str]]:
     if n3:
         removed.append(f"{filename}: {n3} dangerous formula/DDE reference(s)")
 
-    return cleaned.encode("utf-8"), removed
+    return _encode(cleaned), removed
 
 
 # ── PDF CDR ────────────────────────────────────────────────────────────────────
@@ -1420,10 +1589,30 @@ def cdr_image(data: bytes, ext: str) -> tuple[bytes, dict]:
                 # independently and no IFD tags or per-frame metadata survive the round-trip.
                 # Saving only `img` (the first frame) here would silently collapse an
                 # animated GIF/WEBP/TIFF to a single static frame.
+                # Image.MAX_IMAGE_PIXELS bounds ONE frame; nothing bounded the total.
+                # Every frame is materialised at once here, so a 2-frame 40 MP animation
+                # (a few hundred KB compressed) decodes to ~240 MB of buffers and a
+                # handful of frames reaches the 1024 MB container ceiling. Bound the
+                # cumulative pixel count and the frame count, and collect in ONE pass —
+                # the previous code ran ImageSequence.Iterator twice, decoding every
+                # frame a second time purely to read its duration.
                 frame_mode = "RGB" if save_fmt == "TIFF" else img.mode
-                frames = [frame.convert(frame_mode).copy()
-                          for frame in ImageSequence.Iterator(img)]
-                durations = [frame.info.get("duration", 0) for frame in ImageSequence.Iterator(img)]
+                frames = []
+                durations = []
+                total_pixels = 0
+                for frame in ImageSequence.Iterator(img):
+                    if len(frames) >= _MAX_IMAGE_FRAMES:
+                        raise CdrReject(
+                            f"animated image exceeds frame cap {_MAX_IMAGE_FRAMES}"
+                        )
+                    total_pixels += frame.width * frame.height
+                    if total_pixels > _MAX_TOTAL_IMAGE_PIXELS:
+                        raise CdrReject(
+                            f"animated image exceeds total pixel budget "
+                            f"{_MAX_TOTAL_IMAGE_PIXELS} across {len(frames) + 1} frames"
+                        )
+                    durations.append(frame.info.get("duration", 0))
+                    frames.append(frame.convert(frame_mode).copy())
                 save_all_kwargs: dict = {"save_all": True, "append_images": frames[1:]}
                 if save_fmt in ("GIF", "WEBP"):
                     save_all_kwargs["duration"] = durations
@@ -1475,7 +1664,11 @@ def _download(bucket: str, key: str) -> tuple[bytes, str]:
         raise ValueError(
             f"S3 object content length {content_length} exceeds max {_MAX_FILE_BYTES}"
         )
-    return resp["Body"].read(), resp["ContentType"]
+    # ContentType is absent on objects stored without one (and on some S3-compatible
+    # endpoints). Indexing would raise KeyError here, which the caller re-raises into the
+    # retry/DLQ path — a download that actually succeeded, failed as if the object were
+    # unreadable. The value is only ever a fallback for the output Content-Type anyway.
+    return resp["Body"].read(), resp.get("ContentType") or "application/octet-stream"
 
 
 def _classify_download_error(bucket: str, key: str, exc: Exception) -> None:
@@ -1716,8 +1909,15 @@ def _validate_zip_structure(data: bytes) -> tuple[bool, list[str]]:
 
     anomalies: list[str] = []
     with zf_ctx as zf:
+        infos = zf.infolist()
+        # Per-entry and total byte caps say nothing about entry COUNT: a package of
+        # hundreds of thousands of empty entries costs per-entry parse, re-deflate, and
+        # report-append work with no byte cap ever tripping.
+        if len(infos) > _MAX_ZIP_ENTRIES:
+            return False, [f"too many ZIP entries: {len(infos)} (max {_MAX_ZIP_ENTRIES})"]
+
         names: list[str] = []
-        for info in zf.infolist():
+        for info in infos:
             if info.compress_type not in _SAFE_COMPRESS_METHODS:
                 return False, [
                     f"non-standard compression method {info.compress_type} "
@@ -1735,13 +1935,38 @@ def _validate_zip_structure(data: bytes) -> tuple[bool, list[str]]:
             except Exception:
                 pass
 
+            # Entry names that escape the package root. OPC part names are absolute,
+            # slash-rooted, and traversal-free; an entry like "../../../etc/cron.d/x" or
+            # "/abs/path" is never a legitimate part. Left unchecked, such a name passes
+            # validation, survives CDR (nothing else inspects entry names outside the
+            # denylist match), and is written verbatim into the SANITISED_BUCKET output —
+            # so the gateway hands a zip-slip archive to every downstream consumer that
+            # extracts it, stamped "sanitised". Reject the package outright.
+            cname = info.filename.replace("\\", "/")
+            if (
+                cname.startswith("/")
+                or ".." in cname.split("/")
+                or (len(cname) > 1 and cname[1] == ":")  # "C:/…" drive-absolute
+            ):
+                return False, [f"unsafe ZIP entry name: '{info.filename}'"]
+
             names.append(info.filename)
 
+        # Duplicate detection must run on the CANONICAL part name, not the raw entry
+        # name. Word resolves "./word/document.xml", "word//document.xml", and
+        # "word/document.xml" to the same OPC part, and part-name comparison is
+        # case-insensitive — so a raw-string comparison lets an attacker ship two
+        # entries that collide at open time (the consumer picks one, CDR reports on the
+        # other) while the duplicate-entry hard reject sees two distinct names. Verified:
+        # a package with both "word/document.xml" and "./word/document.xml" passed
+        # validation before this check. (Same canonicalisation as the STRIP_ZIP_ENTRIES
+        # match in cdr_office — pitfall #43.)
         seen: set[str] = set()
         for name in names:
-            if name in seen:
+            canonical = posixpath.normpath(name.replace("\\", "/").lower()).lstrip("/")
+            if canonical in seen:
                 return False, [f"duplicate ZIP entry: '{name}'"]
-            seen.add(name)
+            seen.add(canonical)
 
         # Every OOXML package MUST contain [Content_Types].xml at the root. A ZIP that
         # lacks it is not a real Office document — reject rather than CDR-and-label it
