@@ -55,6 +55,13 @@ Run this checklist before considering any change complete. Each item maps to a c
 - [ ] **No new `src.read(name)` calls** — always use `_read_zip_entry_safe(src, item)`.
 - [ ] **New regex patterns are tested with both quote styles** — single-quoted and double-quoted XML attribute values.
 
+### Infrastructure invariants — verify both IaC paths stay in step
+
+- [ ] **Infra changes land in `src/template.yaml` AND `terraform/`** — the two paths provision the same stack, so a change to one is not a change to the deployment. New parameters, resources, IAM statements, alarms and env vars all need doing twice. (#62: four `CDR_MAX_*` caps and the resource-prefix work reached SAM only, and shipped that way for several PRs.)
+- [ ] **A new `CDR_MAX_*` cap is settable from both paths** — a SAM `Parameter` plus a `terraform/` variable wired into the Lambda `environment` block, with matching defaults. CI's `terraform-validate` job enforces this parity against the names `lambda_function.py` reads; it covers **caps only**, so names/IAM/alarms still need checking by hand.
+- [ ] **Defaults quoted in docs match the code** — `docs/claude/architecture.md`'s env-var table is the place readers trust for cap defaults; retuning a cap in `lambda_function.py` without updating it there leaves a doc that is confidently wrong (`CDR_MAX_TOTAL_BYTES` sat documented as 1 GiB after being retuned to 512 MB).
+- [ ] **Resource names stay parameterised** — never reintroduce a hardcoded `cdr-*` name. They are account-and-region-scoped, and a `cdr-*` deployment may already exist in the target account under another tool's management; absence from your state file does not mean unmanaged.
+
 ### Documentation invariants — verify docs stay accurate
 
 - [ ] **CLAUDE.md test count matches actual** — update the `(N tests)` count after adding or removing tests. `scripts/check_test_count.py` (run by CI) enforces this for the *tracked* docs (`docs/claude/testing.md`, this file); CLAUDE.md / AGENTS.md / GEMINI.md are gitignored, so CI cannot see them — update those by hand.
