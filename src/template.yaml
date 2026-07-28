@@ -22,6 +22,22 @@ Parameters:
     Type: Number
     Default: 40000000    # 40 MP
     Description: Decompression-bomb pixel cap for cdr_image, sized to MemorySize below
+  CdrMaxTotalBytes:
+    Type: Number
+    Default: 536870912   # 512 MB
+    Description: Aggregate decompression budget across all entries of one package (kept under MemorySize)
+  CdrMaxZipEntries:
+    Type: Number
+    Default: 20000
+    Description: Maximum ZIP entry count accepted by _validate_zip_structure
+  CdrMaxTotalImagePixels:
+    Type: Number
+    Default: 80000000    # 80 MP
+    Description: Aggregate pixel budget across all frames of one animated image
+  CdrMaxImageFrames:
+    Type: Number
+    Default: 2000
+    Description: Maximum frame count accepted for an animated image
 
 Conditions:
   QuarantineEnabled: !Not [!Equals [!Ref QuarantineBucketName, ""]]
@@ -40,6 +56,10 @@ Globals:
         CDR_MAX_FILE_BYTES:  !Ref CdrMaxFileBytes
         CDR_MAX_ENTRY_BYTES: !Ref CdrMaxEntryBytes
         CDR_MAX_IMAGE_PIXELS: !Ref CdrMaxImagePixels
+        CDR_MAX_TOTAL_BYTES: !Ref CdrMaxTotalBytes
+        CDR_MAX_ZIP_ENTRIES: !Ref CdrMaxZipEntries
+        CDR_MAX_TOTAL_IMAGE_PIXELS: !Ref CdrMaxTotalImagePixels
+        CDR_MAX_IMAGE_FRAMES: !Ref CdrMaxImageFrames
 
 Resources:
 

@@ -9,6 +9,7 @@ import io
 import json
 import os
 import time
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2084,7 +2085,7 @@ class TestReadZipEntrySafe:
                 # central directory test. The point is that the limit is enforced by
                 # the chunked counter, not by a pre-read file_size comparison.
                 assert item.file_size == 2048
-                with pytest.raises(ValueError, match="exceeds decompression limit"):
+                with pytest.raises(cdr.CdrReject, match="exceeds decompression limit"):
                     cdr._read_zip_entry_safe(zf, item)
         finally:
             cdr._MAX_ENTRY_BYTES = original_limit
@@ -2111,7 +2112,7 @@ class TestReadZipEntrySafe:
                 item = zf.infolist()[0]
                 # A naive guard: if item.file_size > limit would raise here too.
                 # The point: our chunked reader also raises, independently.
-                with pytest.raises(ValueError, match="exceeds decompression limit"):
+                with pytest.raises(cdr.CdrReject, match="exceeds decompression limit"):
                     cdr._read_zip_entry_safe(zf, item)
         finally:
             cdr._MAX_ENTRY_BYTES = original_limit
@@ -3309,3 +3310,386 @@ class TestStevensGapRegressions:
         # and the macro is still gone (sanity)
         names = zipfile.ZipFile(io.BytesIO(clean)).namelist()
         assert "word/vbaProject.bin" not in names
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Production-robustness audit (2026-07): availability, encoding, and package-
+# structure findings. Each test below pins a defect that was reproduced against
+# the pre-fix code — see the "Production robustness audit" pitfalls entry.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAggregateDecompressionBudget:
+    """Per-entry caps do not bound a package's TOTAL decompressed size. A package of
+    individually-legal entries measured ~107 GB from a 105 MB upload — minutes of
+    inflate+re-deflate against a 300 s timeout, then EventBridge retries it."""
+
+    @staticmethod
+    def _many_entry_zip(n: int, size: int) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml", _minimal_content_types())
+            for i in range(n):
+                z.writestr(f"word/f{i}.dat", b"\0" * size)
+        return buf.getvalue()
+
+    def test_aggregate_budget_trips_when_total_exceeds_limit(self):
+        data = self._many_entry_zip(10, 1024 * 1024)  # 10 MB total, each entry legal
+        with patch.object(cdr, "_MAX_TOTAL_ENTRY_BYTES", 4 * 1024 * 1024):
+            with pytest.raises(cdr.CdrReject, match="total decompression budget"):
+                cdr.cdr_office(data, "docx")
+
+    def test_entry_under_per_entry_cap_still_counted_toward_total(self):
+        """Every entry here is far below _MAX_ENTRY_BYTES — the trip must come from the
+        aggregate, proving the total is enforced independently of the per-entry cap."""
+        data = self._many_entry_zip(10, 1024 * 1024)
+        assert cdr._MAX_ENTRY_BYTES > 10 * 1024 * 1024
+        with patch.object(cdr, "_MAX_TOTAL_ENTRY_BYTES", 4 * 1024 * 1024):
+            with pytest.raises(cdr.CdrReject, match="total decompression budget"):
+                cdr.cdr_office(data, "docx")
+
+    def test_normal_package_unaffected_by_budget(self):
+        clean, report = cdr.cdr_office(_make_docx_with_macro(), "docx")
+        assert clean
+        assert "word/vbaProject.bin" not in zipfile.ZipFile(io.BytesIO(clean)).namelist()
+
+    def test_xlsb_prereads_share_the_aggregate_budget(self):
+        with patch.object(cdr, "_MAX_TOTAL_ENTRY_BYTES", 8):
+            with pytest.raises(cdr.CdrReject, match="total decompression budget"):
+                cdr.cdr_xlsb(_make_xlsb())
+
+
+class TestZipEntryCountCap:
+    def test_too_many_entries_hard_rejected(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", _minimal_content_types())
+            for i in range(50):
+                z.writestr(f"word/p{i}.xml", "<a/>")
+        with patch.object(cdr, "_MAX_ZIP_ENTRIES", 10):
+            valid, anomalies = cdr._validate_zip_structure(buf.getvalue())
+        assert valid is False
+        assert "too many ZIP entries" in anomalies[0]
+
+    def test_normal_entry_count_accepted(self):
+        valid, _ = cdr._validate_zip_structure(_make_docx_with_macro())
+        assert valid is True
+
+
+class TestUnsafeZipEntryNames:
+    """A traversal/absolute entry name is never a legitimate OPC part. Before the fix it
+    passed validation and was written verbatim into SANITISED_BUCKET — the gateway
+    handing a zip-slip archive to every downstream consumer, stamped 'sanitised'."""
+
+    @staticmethod
+    def _zip_named(name: str) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", _minimal_content_types())
+            z.writestr(name, "<a/>")
+        return buf.getvalue()
+
+    @pytest.mark.parametrize("name", [
+        "../../../../tmp/evil.xml",
+        "word/../../evil.xml",
+        "/abs/evil.xml",
+        "C:/windows/evil.xml",
+        "..\\..\\evil.xml",
+    ])
+    def test_unsafe_name_hard_rejected(self, name):
+        valid, anomalies = cdr._validate_zip_structure(self._zip_named(name))
+        assert valid is False, f"{name!r} was accepted"
+        assert "unsafe ZIP entry name" in anomalies[0]
+
+    def test_ordinary_names_accepted(self):
+        valid, anomalies = cdr._validate_zip_structure(self._zip_named("word/document.xml"))
+        assert valid is True, anomalies
+
+
+class TestDuplicateEntryCanonicalisation:
+    """Word resolves './word/document.xml' and 'word/document.xml' to the SAME part, so a
+    raw-string duplicate check let an attacker ship two colliding entries: the consumer
+    opens one, CDR reports on the other."""
+
+    @staticmethod
+    def _dup(a: str, b: str) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", _minimal_content_types())
+            z.writestr(a, "<a>benign</a>")
+            z.writestr(b, "<a>malicious</a>")
+        return buf.getvalue()
+
+    @pytest.mark.parametrize("a,b", [
+        ("word/document.xml", "./word/document.xml"),
+        ("word/document.xml", "word//document.xml"),
+        ("word/document.xml", "WORD/Document.xml"),
+    ])
+    def test_path_equivalent_duplicates_rejected(self, a, b):
+        valid, anomalies = cdr._validate_zip_structure(self._dup(a, b))
+        assert valid is False, f"{a!r} vs {b!r} accepted as distinct"
+        assert "duplicate ZIP entry" in anomalies[0]
+
+    def test_traversal_form_of_a_duplicate_also_rejected(self):
+        """'word/sub/../document.xml' collides with 'word/document.xml' after
+        canonicalisation, but the unsafe-name check fires first — either verdict is a
+        hard reject, which is what matters."""
+        valid, anomalies = cdr._validate_zip_structure(
+            self._dup("word/document.xml", "word/sub/../document.xml"))
+        assert valid is False
+        assert ("duplicate ZIP entry" in anomalies[0]
+                or "unsafe ZIP entry name" in anomalies[0])
+
+    def test_genuinely_distinct_parts_accepted(self):
+        valid, anomalies = cdr._validate_zip_structure(
+            self._dup("word/document.xml", "word/settings.xml"))
+        assert valid is True, anomalies
+
+
+class TestXmlPartEncoding:
+    """Every neutralisation pass runs on decoded text. Decoding a UTF-16 part as UTF-8
+    turned 'DDEAUTO' into 'D\\x00D\\x00E\\x00…', which no keyword regex matches — the part
+    sailed through untouched. And errors='replace' destroyed legitimate non-UTF-8 bytes."""
+
+    DOC = ('<?xml version="1.0" encoding="{decl}"?><w:document xmlns:w="x">'
+           '<w:instrText>DDEAUTO c:\\\\cmd.exe "/c calc"</w:instrText></w:document>')
+
+    @pytest.mark.parametrize("enc,decl,bom", [
+        ("utf-16-le", "UTF-16", b"\xff\xfe"),
+        ("utf-16-be", "UTF-16", b"\xfe\xff"),
+    ])
+    def test_utf16_part_is_scrubbed_and_stays_valid(self, enc, decl, bom):
+        raw = bom + self.DOC.format(decl=decl).encode(enc)
+        out, removed = cdr._strip_xml_macros(raw, "word/document.xml")
+        assert removed, "UTF-16 part evaded the scrub entirely"
+        assert out.startswith(bom), "BOM lost — part no longer decodable as declared"
+        text = out.decode(enc)
+        assert "cmd.exe" not in text
+        assert "_CDR_REMOVED_" in text
+        ET.fromstring(out)  # must still parse
+
+    def test_utf8_bom_part_scrubbed_and_bom_preserved(self):
+        raw = self.DOC.format(decl="UTF-8").encode("utf-8-sig")
+        out, removed = cdr._strip_xml_macros(raw, "d.xml")
+        assert removed
+        assert out.startswith(b"\xef\xbb\xbf")
+        assert "cmd.exe" not in out.decode("utf-8-sig")
+        ET.fromstring(out)
+
+    def test_latin1_part_round_trips_losslessly(self):
+        """errors='replace' rewrote every undecodable byte to U+FFFD and wrote that back
+        out — silent corruption of a clean document."""
+        raw = '<w:t>caf\xe9 na\xefve r\xe9sum\xe9</w:t>'.encode("latin-1")
+        out, removed = cdr._strip_xml_macros(raw, "d.xml")
+        assert out == raw, "non-UTF-8 bytes were corrupted by the scrub"
+        assert removed == []
+
+    def test_plain_utf8_unchanged(self):
+        raw = '<w:t>caf\xe9 \u4e2d\u6587</w:t>'.encode("utf-8")
+        out, _ = cdr._strip_xml_macros(raw, "d.xml")
+        assert out == raw
+
+
+class TestXmlDoctypeRejected:
+    """OPC forbids a DTD in any package part; it is also the entity-expansion
+    amplification vector against the ElementTree parses (verified ~1000x expansion)."""
+
+    BOMB = (b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "AAAAAAAAAA">'
+            b'<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]>'
+            b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            b'<Default Extension="xml" ContentType="&b;"/></Types>')
+
+    def test_doctype_in_content_types_rejected(self):
+        with pytest.raises(cdr.CdrReject, match="DTD"):
+            cdr._sanitise_content_types(self.BOMB)
+
+    def test_doctype_in_rels_rejected(self):
+        with pytest.raises(cdr.CdrReject, match="DTD"):
+            cdr._strip_rels(self.BOMB)
+
+    def test_doctype_in_xml_part_rejected(self):
+        with pytest.raises(cdr.CdrReject, match="DTD"):
+            cdr._strip_xml_macros(self.BOMB, "word/document.xml")
+
+    def test_dispatch_maps_reject_to_rejected_not_error(self):
+        """A deterministic verdict must hard-reject (quarantine + delete source), not
+        raise into the retry path — retrying input that always fails is pure waste and
+        multiplies the attacker's cost-per-upload by the retry count."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", _minimal_content_types())
+            z.writestr("word/document.xml", self.BOMB)
+        result = cdr.cdr_dispatch(buf.getvalue(), "docx")
+        assert result["status"] == "rejected"
+        assert "DTD" in result["reason"]
+        assert result["delete_source"] is True
+
+    def test_clean_package_not_affected(self):
+        clean, _ = cdr.cdr_office(_make_docx_with_macro(), "docx")
+        assert clean
+
+
+class TestAltChunkPayloadPartDropped:
+    """The aFChunk rel was dropped and the element neutralised, but the imported HTML
+    part itself stayed in the package and rode into SANITISED_BUCKET intact."""
+
+    @staticmethod
+    def _docx_with_chunk(name: str) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", _minimal_content_types())
+            z.writestr("_rels/.rels", _minimal_rels())
+            z.writestr(name, b"<html><script>alert(1)</script></html>")
+            z.writestr("word/document.xml", '<w:document xmlns:w="x"><w:body/></w:document>')
+        return buf.getvalue()
+
+    @pytest.mark.parametrize("name", [
+        "word/afchunk.htm", "word/afchunk.html", "word/chunk.mht",
+        "word/chunk.mhtml", "word/chunk.xhtml",
+    ])
+    def test_html_payload_part_removed(self, name):
+        clean, report = cdr.cdr_office(self._docx_with_chunk(name), "docx")
+        names = zipfile.ZipFile(io.BytesIO(clean)).namelist()
+        assert name not in names, f"{name} survived into the sanitised output"
+        assert b"alert(1)" not in clean
+        assert any(name in r for r in report["removed"])
+
+
+class TestVmlPartScrubbed:
+    """VML drawing parts are XML carrying the same action attributes and field-code
+    carriers the scrub targets, but only '.xml' was matched — every vmlDrawing*.vml
+    part went through unscrubbed."""
+
+    def test_vml_action_attribute_and_field_code_removed(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", _minimal_content_types())
+            z.writestr("word/drawings/vmlDrawing1.vml",
+                       b'<v:shape onClick="evil()">'
+                       b'<w:instrText>DDEAUTO c:\\\\cmd.exe "/c calc"</w:instrText></v:shape>')
+        clean, report = cdr.cdr_office(buf.getvalue(), "docx")
+        vml = zipfile.ZipFile(io.BytesIO(clean)).read("word/drawings/vmlDrawing1.vml")
+        assert b"onClick" not in vml
+        assert b"cmd.exe" not in vml
+        assert b"_CDR_REMOVED_" in vml
+        assert any("vmlDrawing1.vml" in r for r in report["removed"])
+
+
+class TestAnimatedImageResourceCaps:
+    """MAX_IMAGE_PIXELS bounds ONE frame; nothing bounded the total, and cdr_image
+    materialises every frame at once — a handful of large frames reaches the container
+    memory ceiling from a small upload."""
+
+    @staticmethod
+    def _animated_gif(frames: int, size: tuple = (32, 32)) -> bytes:
+        # Frames must be visually distinct, or Pillow collapses them on save.
+        imgs = [Image.new("RGB", size, (i * 20 % 256, i * 7 % 256, 0)) for i in range(frames)]
+        buf = io.BytesIO()
+        imgs[0].save(buf, format="GIF", save_all=True, append_images=imgs[1:],
+                     duration=100, loop=0)
+        return buf.getvalue()
+
+    def test_frame_count_cap_enforced(self):
+        data = self._animated_gif(12)
+        with patch.object(cdr, "_MAX_IMAGE_FRAMES", 5):
+            with pytest.raises(cdr.CdrReject, match="frame cap"):
+                cdr.cdr_image(data, "gif")
+
+    def test_total_pixel_budget_enforced(self):
+        data = self._animated_gif(10, (64, 64))
+        with patch.object(cdr, "_MAX_TOTAL_IMAGE_PIXELS", 64 * 64 * 3):
+            with pytest.raises(cdr.CdrReject, match="total pixel budget"):
+                cdr.cdr_image(data, "gif")
+
+    def test_normal_animation_still_processed_with_all_frames(self):
+        data = self._animated_gif(5)
+        clean, report = cdr.cdr_image(data, "gif")
+        out = Image.open(io.BytesIO(clean))
+        assert getattr(out, "n_frames", 1) == 5, "frames lost"
+
+
+class TestDownloadContentTypeFallback:
+    def test_missing_content_type_does_not_raise(self):
+        """Objects stored without a Content-Type made _download raise KeyError, turning a
+        successful download into a retry/DLQ trip."""
+        body = MagicMock()
+        body.read.return_value = b"data"
+        with patch.object(cdr, "s3") as m:
+            m.get_object.return_value = {"Body": body, "ContentLength": 4}
+            data, ct = cdr._download("b", "k")
+        assert data == b"data"
+        assert ct == "application/octet-stream"
+
+    def test_content_type_used_when_present(self):
+        body = MagicMock()
+        body.read.return_value = b"data"
+        with patch.object(cdr, "s3") as m:
+            m.get_object.return_value = {"Body": body, "ContentLength": 4,
+                                         "ContentType": "application/pdf"}
+            _, ct = cdr._download("b", "k")
+        assert ct == "application/pdf"
+
+
+class TestExtensionFromBasename:
+    def test_dot_in_directory_name_is_not_an_extension(self):
+        """'reports.v2/summary' previously yielded ext 'v2/summary'."""
+        event = {"detail": {"bucket": {"name": "src"}, "object": {"key": "reports.v2/summary",
+                                                                 "size": 10}}}
+        with patch.object(cdr, "_download", return_value=(b"x", "text/plain")), \
+             patch.object(cdr, "_upload"), \
+             patch.object(cdr, "_publish_result_safe"), \
+             patch.object(cdr, "_delete_source_safe"), \
+             patch.object(cdr, "_emit_passthrough_metric") as metric:
+            result = cdr.handler(event, None)
+        assert result["status"] == "unsupported-format"
+        metric.assert_called_once_with("")
+
+
+class TestSanitisedOutputNeverEmpty:
+    def test_empty_cdr_output_is_not_labelled_sanitised(self):
+        """A 'sanitised' verdict with no payload must never reach SANITISED_BUCKET."""
+        with patch.object(cdr, "cdr_pdf", return_value=(b"", {"removed": []})):
+            with pytest.raises(ValueError, match="refusing to label empty content"):
+                cdr.cdr_dispatch(b"%PDF-1.4", "pdf")
+
+
+class TestResourceCapsRejectNotRetry:
+    """Resource-cap trips are deterministic verdicts, not transient errors.
+
+    A bomb fails identically on every retry, so escaping as an error would burn the
+    full EventBridge retry budget and hold a reserved-concurrency slot each time
+    (pitfall #46).
+    """
+
+    def _bomb(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml",
+                       '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/'
+                   'package/2006/content-types"><Default Extension="xml" '
+                   'ContentType="application/xml"/></Types>')
+            z.writestr("word/document.xml", b"\x00" * (cdr._MAX_ENTRY_BYTES + 1024))
+        return buf.getvalue()
+
+    def test_oversized_entry_dispatches_to_rejected(self):
+        result = cdr.cdr_dispatch(self._bomb(), "docx")
+        assert result["status"] == "rejected"
+        assert result["delete_source"] is True
+        assert "exceeds decompression limit" in result["reason"]
+
+    def test_aggregate_budget_trip_dispatches_to_rejected(self, monkeypatch):
+        monkeypatch.setattr(cdr, "_MAX_TOTAL_ENTRY_BYTES", 4096)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml",
+                       '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/'
+                   'package/2006/content-types"><Default Extension="xml" '
+                   'ContentType="application/xml"/></Types>')
+            for i in range(8):
+                z.writestr(f"word/part{i}.xml", b"<a>" + b"\x20" * 2048 + b"</a>")
+        result = cdr.cdr_dispatch(buf.getvalue(), "docx")
+        assert result["status"] == "rejected"
+        assert "total decompression budget" in result["reason"]
+
+    def test_aggregate_budget_default_fits_under_lambda_memory(self):
+        assert cdr._MAX_TOTAL_ENTRY_BYTES <= 512 * 1024 * 1024
