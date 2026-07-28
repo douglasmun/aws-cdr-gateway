@@ -46,6 +46,12 @@ def main() -> int:
         "docs/claude/checklist-and-invariants.md": [
             (rf"\*\*{total} tests pass\*\*", f"**{total} tests pass**"),
         ],
+        # The contributor quickstart. Was unguarded and drifted to "227 tests: 178 + 49"
+        # — off by 84 — while CI stayed green; it is the first doc a contributor reads.
+        "README.md": [
+            (rf"# Run the full test suite \({total} tests: {lambda_n} CDR Lambda \+ {local_n} local variant\)",
+             f"# Run the full test suite ({total} tests: {lambda_n} CDR Lambda + {local_n} local variant)"),
+        ],
     }.items():
         text = (ROOT / rel).read_text()
         for pattern, expected in patterns:

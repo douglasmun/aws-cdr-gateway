@@ -63,6 +63,7 @@ audited and hardened. See [`docs/progress.md`](docs/progress.md).
 | `src/lambda_function.py` | General CDR Lambda — all Office/PDF/image formats; exposes the pure `cdr_dispatch` decision core |
 | `src/app.py` | **Local CDR service** — FastAPI wrapper around `cdr_dispatch`; disarm files over HTTP with no AWS account |
 | `src/requirements-local.txt` | Extra deps for the local service (`fastapi`, `uvicorn`) — not part of the Lambda layer |
+| `src/requirements-dev.txt` | Test-only deps (`pytest`, `python-docx`) — in neither the Lambda layer nor the container image |
 | `src/test_cdr_local.py` | Tests for the local service + `cdr_dispatch` core (own file, per the per-module rule) |
 | `docs/local-cdr.md` | **Local CDR service guide** — run, configure, embed, proxy, API contract, security model |
 | `docs/local_cdr_architecture.svg` | "One core, two front-ends" diagram (cloud `handler` + local `app.py` over `cdr_dispatch`) |
@@ -92,10 +93,10 @@ newer. Dependencies are pinned in `src/requirements.txt`.
 # Activate the virtual environment (venv at repo root)
 source bin/activate
 
-# Install dependencies (Lambda + local-service deps)
-pip install -r src/requirements.txt -r src/requirements-local.txt
+# Install dependencies (Lambda + local-service + test-only deps)
+pip install -r src/requirements.txt -r src/requirements-local.txt -r src/requirements-dev.txt
 
-# Run the full test suite (227 tests: 178 CDR Lambda + 49 local variant)
+# Run the full test suite (311 tests: 261 CDR Lambda + 50 local variant)
 cd src && pytest test_cdr.py test_cdr_local.py -v
 
 # Run one class or test
