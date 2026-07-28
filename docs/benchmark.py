@@ -17,7 +17,9 @@ Options:
     --region       AWS region (default: from profile/env)
     --wait         Seconds to wait for Lambda invocations after upload (default: 60)
 
-Dependencies: boto3 (pip install boto3)
+Dependencies: boto3 (pip install boto3). If you authenticate with `aws login`
+(SSO-style) rather than static keys, boto3 also needs the CRT extra to read those
+credentials: pip install "botocore[crt]".
 """
 
 import argparse
@@ -35,6 +37,11 @@ try:
     import boto3
 except ImportError:
     sys.exit("boto3 is required: pip install boto3")
+
+try:
+    from botocore.exceptions import MissingDependencyException
+except ImportError:  # older botocore
+    MissingDependencyException = ()
 
 
 # ── Synthetic fixture generators ───────────────────────────────────────────────
@@ -258,7 +265,10 @@ def main():
     parser.add_argument("--count",       type=int, default=10,
                         help="Uploads per fixture file")
     parser.add_argument("--function",    default="cdr-lambda",
-                        help="Lambda function name for CloudWatch queries (default: cdr-lambda)")
+                        help="Lambda function name for CloudWatch queries (default: cdr-lambda). "
+                             "MUST match the deployed function: a stack deployed with a non-default "
+                             "ResourcePrefix is named <prefix>-lambda. A wrong name is not an error "
+                             "-- CloudWatch returns no data and every metric reads N/A.")
     parser.add_argument("--log-group",   default=None,
                         help="CloudWatch Logs group for the Lambda (e.g. /aws/lambda/cdr-lambda). "
                              "Required for MaxMemoryUsed reporting.")
@@ -384,6 +394,21 @@ def main():
         issues.append(f"  WARN  {metrics['throttles']} throttle(s) — increase ReservedConcurrentExecutions")
     if metrics.get("errors", 0) > 0:
         issues.append(f"  ERROR {metrics['errors']} Lambda error(s) — check CloudWatch Logs")
+
+    # No datapoints means the metric query found nothing -- almost always --function
+    # naming a function that did not process these uploads. Every threshold check above
+    # is guarded on a truthy metric, so without this the run prints the all-clear on an
+    # empty result set and reads as a pass.
+    invocations = metrics.get("invocations")
+    if not invocations:
+        print("Tuning recommendations:")
+        print(f"  ERROR No CloudWatch datapoints for function '{args.function}'.")
+        print("        The uploads may still have been processed by a DIFFERENT function.")
+        print("        Check --function matches the deployed name (a stack deployed with a")
+        print("        non-default ResourcePrefix is named <prefix>-lambda), and --region.")
+        print("        Results below are NOT a pass.")
+        print("=" * 60)
+        sys.exit(1)
 
     if issues:
         print("Tuning recommendations:")

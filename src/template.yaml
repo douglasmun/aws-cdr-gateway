@@ -10,6 +10,14 @@ Parameters:
   QuarantineBucketName:
     Type: String
     Default: ""
+  ResourcePrefix:
+    Type: String
+    Default: cdr
+    Description: >-
+      Prefix for the Lambda, SNS topics, DLQ and alarm names. These are
+      account-and-region-scoped, so two stacks in one region collide unless this
+      differs. Defaults to the historical names, so existing stacks are unchanged.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{0,24}$"
   CdrMaxFileBytes:
     Type: Number
     Default: 104857600   # 100 MB
@@ -183,7 +191,7 @@ Resources:
   CdrResultTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: cdr-result-topic
+      TopicName: !Sub "${ResourcePrefix}-result-topic"
       KmsMasterKeyId: alias/aws/sns   # SSE at rest with the AWS-managed key (free)
 
   # Separate alarm topic so CloudWatch alarms don't pollute CDR result consumers
@@ -194,14 +202,14 @@ Resources:
   CdrAlarmTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: cdr-alarm-topic
+      TopicName: !Sub "${ResourcePrefix}-alarm-topic"
 
   # ── Dead-letter queue ─────────────────────────────────────────────────────────
 
   CdrDlq:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: cdr-lambda-dlq
+      QueueName: !Sub "${ResourcePrefix}-lambda-dlq"
       MessageRetentionPeriod: 1209600   # 14 days
       SqsManagedSseEnabled: true        # SSE at rest with the SQS-managed key (free)
 
@@ -210,7 +218,7 @@ Resources:
   CdrFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: cdr-lambda
+      FunctionName: !Sub "${ResourcePrefix}-lambda"
       CodeUri: ./
       Handler: lambda_function.handler
       Description: Strip active content from Office, PDF, and image files
@@ -294,7 +302,7 @@ Resources:
   CdrErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: cdr-lambda-errors
+      AlarmName: !Sub "${ResourcePrefix}-lambda-errors"
       MetricName: Errors
       Namespace: AWS/Lambda
       Dimensions:
@@ -311,7 +319,7 @@ Resources:
   CdrDurationAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: cdr-lambda-duration-p99
+      AlarmName: !Sub "${ResourcePrefix}-lambda-duration-p99"
       MetricName: Duration
       Namespace: AWS/Lambda
       Dimensions:
@@ -328,7 +336,7 @@ Resources:
   CdrThrottleAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: cdr-lambda-throttles
+      AlarmName: !Sub "${ResourcePrefix}-lambda-throttles"
       MetricName: Throttles
       Namespace: AWS/Lambda
       Dimensions:
@@ -345,7 +353,7 @@ Resources:
   CdrDlqAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: cdr-lambda-dlq-depth
+      AlarmName: !Sub "${ResourcePrefix}-lambda-dlq-depth"
       MetricName: ApproximateNumberOfMessagesVisible
       Namespace: AWS/SQS
       Dimensions:
@@ -362,7 +370,7 @@ Resources:
   CdrPassthroughAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: cdr-lambda-passthrough
+      AlarmName: !Sub "${ResourcePrefix}-lambda-passthrough"
       MetricName: PassthroughFiles
       Namespace: CDR/Validation
       Statistic: Sum
@@ -380,7 +388,7 @@ Resources:
   CdrZipAnomalyAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: cdr-lambda-zip-anomalies
+      AlarmName: !Sub "${ResourcePrefix}-lambda-zip-anomalies"
       MetricName: ZipAnomalies
       Namespace: CDR/Validation
       Statistic: Sum
