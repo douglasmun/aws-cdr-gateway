@@ -40,9 +40,24 @@ S3 Source Bucket → EventBridge → CDR Lambda + Malware Scan Lambda → Result
 
 Sanitised files land at `sanitised/<original-key>` in `SANITISED_BUCKET`. Failed files go to `QUARANTINE_BUCKET` if configured.
 
-## Infrastructure (`src/template.yaml`)
+## Infrastructure (`src/template.yaml` and `terraform/`)
 
-AWS SAM template defines:
+**Two IaC paths provision the same stack** — `src/template.yaml` (AWS SAM) and `terraform/`
+(OpenTofu/Terraform). They are alternatives, not layers: deploy one. A change to the
+infrastructure is not complete until it lands in **both**, and anything present in only one
+is a drift bug. This has bitten already — four `CDR_MAX_*` env vars and the resource-prefix
+parameterisation reached `template.yaml` and were missing from `terraform/` for several PRs
+(#62). `tofu validate` cannot catch that class of bug: an absent env var is valid config,
+the cap just silently falls back to its in-code default. CI's `terraform-validate` job now
+enforces `CDR_MAX_*` parity against `lambda_function.py`, but **caps only** — names, IAM,
+alarms and any new shared tunable are unguarded.
+
+The SAM/Terraform names correspond exactly (`ResourcePrefix` ↔ `resource_prefix`, same
+default and validation pattern), except that `terraform/` names the IAM role, IAM policy and
+EventBridge rule explicitly where CloudFormation auto-generates them for SAM — expected
+asymmetry, not drift.
+
+Both define:
 - Source, sanitised, and quarantine S3 buckets (AES256 encryption, versioning, public access blocked)
 - Quarantine bucket and its IAM policies are gated behind `QuarantineEnabled` condition — the template deploys cleanly without a quarantine bucket name
 - CDR Lambda (Python 3.12, 1024 MB, 300 s timeout, `/tmp` ephemeral storage 1024 MB)
@@ -103,10 +118,16 @@ These patterns are non-negotiable. **Never remove or bypass them.**
 | `RESULT_TOPIC_ARN` | No | SNS topic for CDR result metadata |
 | `CDR_MAX_FILE_BYTES` | No | Pre-download size limit in bytes (default 104857600 = 100 MB) |
 | `CDR_MAX_ENTRY_BYTES` | No | Per-ZIP-entry decompression limit in bytes (default 209715200 = 200 MB) |
-| `CDR_MAX_TOTAL_BYTES` | No | Aggregate decompression budget across all entries of one package (default 1073741824 = 1 GiB) |
+| `CDR_MAX_TOTAL_BYTES` | No | Aggregate decompression budget across all entries of one package (default 536870912 = 512 MB — deliberately **under** the 1024 MB `MemorySize`) |
 | `CDR_MAX_ZIP_ENTRIES` | No | Maximum ZIP entry count (default 20000) |
+| `CDR_MAX_IMAGE_PIXELS` | No | Single-frame decompression-bomb pixel cap (default 40000000 = 40 MP) |
 | `CDR_MAX_TOTAL_IMAGE_PIXELS` | No | Aggregate pixel budget across all frames of one animation (default 80000000 = 80 MP) |
 | `CDR_MAX_IMAGE_FRAMES` | No | Maximum animation frame count (default 2000) |
+
+Every `CDR_MAX_*` above must be settable from **both** IaC paths — a SAM `Parameter` in
+`src/template.yaml` and a variable wired into the Lambda `environment` block in
+`terraform/main.tf`. CI enforces this parity against the names `lambda_function.py` actually
+reads; a cap set by neither path is untunable without a code change.
 
 ## Structured Logging
 
