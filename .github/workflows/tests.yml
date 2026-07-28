@@ -66,6 +66,14 @@ jobs:
         # added. Fail the build on a stale number rather than mislead the next reader.
         run: python scripts/check_test_count.py
 
+      - name: Check documented cap defaults match the code
+        working-directory: ${{ github.workspace }}
+        # Retuning a CDR_MAX_* cap silently invalidates every doc quoting its old default.
+        # CDR_MAX_TOTAL_BYTES stayed documented as 1 GiB for months after being retuned to
+        # 512 MB, implying the decompression budget sat above MemorySize when the point of
+        # the retune was putting it under.
+        run: python scripts/check_cap_defaults.py
+
   build-package:
     # Verify the Lambda deployment package builds with Linux wheels. Runs on Linux so the
     # manylinux wheels are the native platform; catches dependency/packaging breakage.
