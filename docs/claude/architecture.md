@@ -52,6 +52,7 @@ AWS SAM template defines:
 - `CdrAlarmTopic` SNS **separate** from `CdrResultTopic` — all CloudWatch alarms route here so alarm noise doesn't pollute result consumers
 - CloudWatch alarms: Lambda errors, p99 duration (threshold 250 s, fires before 300 s timeout), throttles, DLQ depth, passthrough files
 - `CDR_MAX_FILE_BYTES`, `CDR_MAX_ENTRY_BYTES`, `CDR_MAX_TOTAL_BYTES`, `CDR_MAX_ZIP_ENTRIES`, `CDR_MAX_IMAGE_PIXELS`, `CDR_MAX_TOTAL_IMAGE_PIXELS` and `CDR_MAX_IMAGE_FRAMES` as SAM Parameters — every resource cap is tunable without code changes
+- `ResourcePrefix` (default `cdr`) prefixes the Lambda, SNS topics, DLQ and alarm names. These are account-and-region-scoped, so two stacks in one region collide on them unless it differs; the default reproduces the historical names exactly, so existing stacks are unaffected. `docs/benchmark.py --function` must match (`<prefix>-lambda`) or CloudWatch returns no data.
 - EventBridge pattern restricted to `reason: [PutObject, CompleteMultipartUpload]` — excludes CopyObject events that could form a processing loop
 
 ## Defence-in-Depth Layers
