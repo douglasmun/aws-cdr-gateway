@@ -1,0 +1,10 @@
+# Test-only dependencies — NOT in the Lambda package and NOT in the container image.
+# The Lambda build (template.yaml) uses requirements.txt only; the Dockerfile installs
+# requirements.txt + requirements-local.txt. Nothing here ships to either, so a dep needed
+# purely to assert something in the test suite belongs in this file.
+#   pip install -r requirements.txt -r requirements-local.txt -r requirements-dev.txt
+
+pytest                   # test runner
+python-docx==1.2.0       # independent OOXML reader proving a sanitised .docm still opens
+                         # (test_sanitised_docm_opens_in_python_docx) — zipfile assertions
+                         # show parts are absent, not that the result is well-formed
