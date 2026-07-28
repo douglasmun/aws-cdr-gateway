@@ -60,6 +60,12 @@ jobs:
         # cdr_dispatch core (test_cdr_local.py).
         run: pytest test_cdr.py test_cdr_local.py -v
 
+      - name: Check documented test counts are current
+        working-directory: ${{ github.workspace }}
+        # The suite size is quoted in several docs and drifts silently as tests are
+        # added. Fail the build on a stale number rather than mislead the next reader.
+        run: python scripts/check_test_count.py
+
   build-package:
     # Verify the Lambda deployment package builds with Linux wheels. Runs on Linux so the
     # manylinux wheels are the native platform; catches dependency/packaging breakage.
