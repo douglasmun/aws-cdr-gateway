@@ -172,7 +172,7 @@ resource "aws_s3_bucket_policy" "quarantine_tls" {
 # ── SNS topics ─────────────────────────────────────────────────────────────────
 
 resource "aws_sns_topic" "result" {
-  name = "cdr-result-topic"
+  name = "${var.resource_prefix}-result-topic"
   # SSE at rest with the AWS-managed key (free; no CMK to provision).
   kms_master_key_id = "alias/aws/sns"
 }
@@ -183,13 +183,13 @@ resource "aws_sns_topic" "result" {
 # alarm actions silently fail to publish if this topic is SSE-KMS-encrypted. Alarm
 # payloads here are just AlarmName/Reason/Threshold — non-sensitive.
 resource "aws_sns_topic" "alarm" {
-  name = "cdr-alarm-topic"
+  name = "${var.resource_prefix}-alarm-topic"
 }
 
 # ── Dead-letter queue ──────────────────────────────────────────────────────────
 
 resource "aws_sqs_queue" "dlq" {
-  name                      = "cdr-lambda-dlq"
+  name                      = "${var.resource_prefix}-lambda-dlq"
   message_retention_seconds = var.dlq_retention_seconds
   # SSE at rest with the SQS-managed key (free).
   sqs_managed_sse_enabled = true
@@ -198,7 +198,7 @@ resource "aws_sqs_queue" "dlq" {
 # ── IAM role + least-privilege policy ──────────────────────────────────────────
 
 resource "aws_iam_role" "lambda" {
-  name = "cdr-lambda-role"
+  name = "${var.resource_prefix}-lambda-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -298,7 +298,7 @@ data "aws_iam_policy_document" "lambda" {
 }
 
 resource "aws_iam_role_policy" "lambda" {
-  name   = "cdr-lambda-policy"
+  name   = "${var.resource_prefix}-lambda-policy"
   role   = aws_iam_role.lambda.id
   policy = data.aws_iam_policy_document.lambda.json
 }
@@ -306,7 +306,7 @@ resource "aws_iam_role_policy" "lambda" {
 # ── Lambda function ────────────────────────────────────────────────────────────
 
 resource "aws_lambda_function" "cdr" {
-  function_name = "cdr-lambda"
+  function_name = "${var.resource_prefix}-lambda"
   description   = "Strip active content from Office, PDF, and image files"
   role          = aws_iam_role.lambda.arn
   handler       = "lambda_function.handler"
@@ -339,12 +339,16 @@ resource "aws_lambda_function" "cdr" {
 
   environment {
     variables = {
-      SANITISED_BUCKET     = var.sanitised_bucket_name
-      QUARANTINE_BUCKET    = local.quarantine_enabled ? var.quarantine_bucket_name : ""
-      RESULT_TOPIC_ARN     = aws_sns_topic.result.arn
-      CDR_MAX_FILE_BYTES   = tostring(var.cdr_max_file_bytes)
-      CDR_MAX_ENTRY_BYTES  = tostring(var.cdr_max_entry_bytes)
-      CDR_MAX_IMAGE_PIXELS = tostring(var.cdr_max_image_pixels)
+      SANITISED_BUCKET           = var.sanitised_bucket_name
+      QUARANTINE_BUCKET          = local.quarantine_enabled ? var.quarantine_bucket_name : ""
+      RESULT_TOPIC_ARN           = aws_sns_topic.result.arn
+      CDR_MAX_FILE_BYTES         = tostring(var.cdr_max_file_bytes)
+      CDR_MAX_ENTRY_BYTES        = tostring(var.cdr_max_entry_bytes)
+      CDR_MAX_IMAGE_PIXELS       = tostring(var.cdr_max_image_pixels)
+      CDR_MAX_TOTAL_BYTES        = tostring(var.cdr_max_total_bytes)
+      CDR_MAX_ZIP_ENTRIES        = tostring(var.cdr_max_zip_entries)
+      CDR_MAX_TOTAL_IMAGE_PIXELS = tostring(var.cdr_max_total_image_pixels)
+      CDR_MAX_IMAGE_FRAMES       = tostring(var.cdr_max_image_frames)
     }
   }
 
@@ -356,7 +360,7 @@ resource "aws_lambda_function" "cdr" {
 # CopyObject events that could otherwise form a processing loop.
 
 resource "aws_cloudwatch_event_rule" "s3_upload" {
-  name        = "cdr-s3-object-created"
+  name        = "${var.resource_prefix}-s3-object-created"
   description = "Trigger CDR Lambda on object creation in the source bucket"
 
   event_pattern = jsonencode({
@@ -371,7 +375,7 @@ resource "aws_cloudwatch_event_rule" "s3_upload" {
 
 resource "aws_cloudwatch_event_target" "cdr" {
   rule      = aws_cloudwatch_event_rule.s3_upload.name
-  target_id = "cdr-lambda"
+  target_id = "${var.resource_prefix}-lambda"
   arn       = aws_lambda_function.cdr.arn
 }
 
@@ -386,7 +390,7 @@ resource "aws_lambda_permission" "eventbridge" {
 # ── CloudWatch alarms (all route to the alarm topic) ──────────────────────────
 
 resource "aws_cloudwatch_metric_alarm" "errors" {
-  alarm_name          = "cdr-lambda-errors"
+  alarm_name          = "${var.resource_prefix}-lambda-errors"
   namespace           = "AWS/Lambda"
   metric_name         = "Errors"
   dimensions          = { FunctionName = aws_lambda_function.cdr.function_name }
@@ -399,7 +403,7 @@ resource "aws_cloudwatch_metric_alarm" "errors" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "duration_p99" {
-  alarm_name          = "cdr-lambda-duration-p99"
+  alarm_name          = "${var.resource_prefix}-lambda-duration-p99"
   namespace           = "AWS/Lambda"
   metric_name         = "Duration"
   dimensions          = { FunctionName = aws_lambda_function.cdr.function_name }
@@ -412,7 +416,7 @@ resource "aws_cloudwatch_metric_alarm" "duration_p99" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "throttles" {
-  alarm_name          = "cdr-lambda-throttles"
+  alarm_name          = "${var.resource_prefix}-lambda-throttles"
   namespace           = "AWS/Lambda"
   metric_name         = "Throttles"
   dimensions          = { FunctionName = aws_lambda_function.cdr.function_name }
@@ -425,7 +429,7 @@ resource "aws_cloudwatch_metric_alarm" "throttles" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "dlq_depth" {
-  alarm_name          = "cdr-lambda-dlq-depth"
+  alarm_name          = "${var.resource_prefix}-lambda-dlq-depth"
   namespace           = "AWS/SQS"
   metric_name         = "ApproximateNumberOfMessagesVisible"
   dimensions          = { QueueName = aws_sqs_queue.dlq.name }
@@ -438,7 +442,7 @@ resource "aws_cloudwatch_metric_alarm" "dlq_depth" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "passthrough" {
-  alarm_name          = "cdr-lambda-passthrough"
+  alarm_name          = "${var.resource_prefix}-lambda-passthrough"
   namespace           = "CDR/Validation"
   metric_name         = "PassthroughFiles"
   statistic           = "Sum"
@@ -453,7 +457,7 @@ resource "aws_cloudwatch_metric_alarm" "passthrough" {
 # Alerts on a spike of ZIP structural anomalies (malformed/zip-bomb/method-mismatch).
 # The metric is emitted dimensionless, so no dimensions block here.
 resource "aws_cloudwatch_metric_alarm" "zip_anomalies" {
-  alarm_name          = "cdr-lambda-zip-anomalies"
+  alarm_name          = "${var.resource_prefix}-lambda-zip-anomalies"
   namespace           = "CDR/Validation"
   metric_name         = "ZipAnomalies"
   statistic           = "Sum"
