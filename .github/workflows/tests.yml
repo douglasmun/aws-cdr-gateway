@@ -44,7 +44,9 @@ jobs:
           # Local CDR service deps (FastAPI/uvicorn/httpx) — needed to import src/app.py
           # and run src/test_cdr_local.py. Kept out of the Lambda layer (requirements.txt).
           pip install -r src/requirements-local.txt
-          pip install pytest
+          # Test-only deps (pytest, python-docx). Shipped nowhere — not the Lambda package,
+          # not the container image — so tests can depend on a library the service does not.
+          pip install -r src/requirements-dev.txt
 
       - name: Byte-compile (lint)
         run: |
