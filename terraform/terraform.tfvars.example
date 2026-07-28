@@ -4,12 +4,24 @@ aws_region            = "us-east-1"
 source_bucket_name    = "cdr-prod-source-<acct-or-org>"
 sanitised_bucket_name = "cdr-prod-sanitised-<acct-or-org>"
 
+# Prefix for the Lambda, IAM role/policy, SNS topics, DLQ, EventBridge rule and alarms.
+# Account-and-region-scoped: two deployments in one region collide unless this differs,
+# and a cdr-* deployment may already exist in the account under another tool's management.
+# Absence from this state file does not mean unmanaged — check before assuming it is free.
+# resource_prefix = "cdr"
+
 # Optional — leave as "" to disable quarantine (no quarantine bucket is created).
 quarantine_bucket_name = "cdr-prod-quarantine-<acct-or-org>"
 
-# Optional tuning (defaults shown).
+# Optional tuning (defaults shown). The CDR_MAX_* caps must stay consistent with
+# lambda_memory_mb — cdr_max_total_bytes in particular is deliberately under it.
 # cdr_max_file_bytes             = 104857600   # 100 MB
 # cdr_max_entry_bytes            = 209715200   # 200 MB
+# cdr_max_total_bytes            = 536870912   # 512 MB — aggregate across all ZIP entries
+# cdr_max_zip_entries            = 20000
+# cdr_max_image_pixels           = 40000000    # 40 MP — single frame
+# cdr_max_total_image_pixels     = 80000000    # 80 MP — all frames of one image
+# cdr_max_image_frames           = 2000
 # lambda_memory_mb               = 1024
 # lambda_timeout_seconds         = 300
 # reserved_concurrent_executions = 20
