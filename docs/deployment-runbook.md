@@ -12,10 +12,24 @@ pick one:
 - **Option B — OpenTofu / Terraform** (Sections 1B–2B). A standalone build step produces
   the Lambda zip, then `tofu`/`terraform` provisions everything else.
 
-Both produce a Lambda named `cdr-lambda` and the same buckets/alarms/topics, so the
-**smoke test, benchmark, and tuning (Sections 3–7) are identical regardless of path** —
-only the deploy and teardown commands differ. Section 8 (cleanup) and Section 9 (known
-issues) have a subsection per path where they diverge.
+Both produce a Lambda named `<ResourcePrefix>-lambda` and the same buckets/alarms/topics,
+so the **smoke test, benchmark, and tuning (Sections 3–7) are identical regardless of
+path** — only the deploy and teardown commands differ. Section 8 (cleanup) and Section 9
+(known issues) have a subsection per path where they diverge.
+
+> **Set `ResourcePrefix` before you deploy.** The Lambda, SNS topics, DLQ and alarm names
+> are account-and-region-scoped and derive from the `ResourcePrefix` parameter (default
+> `cdr`). Two stacks in one region collide unless it differs, and a `cdr-*` deployment may
+> already exist in your target account — possibly managed by another IaC tool and serving
+> live traffic. **Absence from CloudFormation does not mean unmanaged.** If a deploy fails
+> at `AWS::EarlyValidation::ResourceExistenceCheck`, choose a distinct prefix; never delete
+> the resource holding the name (see Section 9).
+>
+> Every command below uses `$PREFIX`. Export it once, matching your deployed value:
+>
+> ```bash
+> PREFIX=cdr-staging   # must match the ResourcePrefix you deployed with
+> ```
 
 ---
 
@@ -71,12 +85,13 @@ SAM will prompt for each parameter. Suggested staging values:
 
 | Parameter | Staging value |
 |---|---|
+| `ResourcePrefix` | `cdr-staging` — **do not leave at the `cdr` default** unless you have confirmed nothing in the account already owns those names |
 | `SourceBucketName` | `cdr-staging-source-<your-alias>` |
 | `SanitisedBucketName` | `cdr-staging-sanitised-<your-alias>` |
 | `QuarantineBucketName` | `cdr-staging-quarantine-<your-alias>` (or leave blank) |
 | `CdrMaxFileBytes` | `104857600` (100 MB default) |
 | `CdrMaxEntryBytes` | `209715200` (200 MB default) |
-| Stack name | `cdr-lambda-staging` |
+| Stack name | `cdr-staging-stack` (typed literally — SAM prompts are not shell-expanded) |
 | AWS Region | your preferred region |
 | Confirm changeset | `y` |
 | Save config | `y` → saved to `samconfig.toml` |
@@ -176,13 +191,13 @@ commands differ — use the block for your path.
 ```bash
 # Lambda deployed and healthy (both paths)
 aws lambda get-function-configuration \
-  --function-name cdr-lambda \
+  --function-name $PREFIX-lambda \
   --query '{Runtime:Runtime,MemorySize:MemorySize,Timeout:Timeout,State:State}'
 ```
 
-**SAM** — the EventBridge rule's logical ID is `CdrFunctionS3Upload`, but its physical name is auto-generated with a random suffix (e.g. `cdr-lambda-staging-CdrFunctionS3Upload-BJXdknPZ9Hq7`), not a fixed string — look it up from the stack resources first:
+**SAM** — the EventBridge rule's logical ID is `CdrFunctionS3Upload`, but its physical name is auto-generated with a random suffix (e.g. `$PREFIX-stack-CdrFunctionS3Upload-BJXdknPZ9Hq7`), not a fixed string — look it up from the stack resources first:
 ```bash
-STACK=cdr-lambda-staging
+STACK=$PREFIX-stack
 
 aws cloudformation describe-stack-resources \
   --stack-name $STACK \
@@ -246,7 +261,7 @@ Expected tags: `cdr-status=sanitised`, `cdr-mode=full`, `cdr-removals=N`,
 Check Lambda logs for the CDR completion line:
 
 ```bash
-aws logs tail /aws/lambda/cdr-lambda --follow --format short
+aws logs tail /aws/lambda/$PREFIX-lambda --follow --format short
 ```
 
 ---
@@ -258,14 +273,21 @@ Run the benchmark script after the smoke test passes:
 ```bash
 # From repo root
 source bin/activate
-pip install boto3
+pip install boto3            # add botocore[crt] if you authenticate with `aws login`
 
 python docs/benchmark.py \
   --bucket $SOURCE_BUCKET \
   --files docs/fixtures/ \
   --concurrency 5 \
-  --log-group /aws/lambda/cdr-lambda
+  --function $PREFIX-lambda \
+  --log-group /aws/lambda/$PREFIX-lambda
 ```
+
+> **Pass `--function`.** It defaults to `cdr-lambda`, so omitting it on a stack deployed
+> with any other prefix silently queries the wrong function — CloudWatch returns no
+> datapoints for a function that never ran your load. The script now exits non-zero rather
+> than printing a pass on empty metrics, but a run that errors out mid-benchmark still
+> costs you the whole cycle. It must match the deployed `ResourcePrefix`.
 
 `docs/fixtures/` contains 17 pre-built files with real active content covering every
 CDR path (VBA, DDE, PDF JavaScript, xlsb conversion, GIF comment block, etc.). Run
@@ -285,7 +307,7 @@ Query Lambda metrics after the benchmark run:
 
 ```bash
 FUNCTION_ARN=$(aws lambda get-function \
-  --function-name cdr-lambda \
+  --function-name $PREFIX-lambda \
   --query 'Configuration.FunctionArn' --output text)
 
 # Date helper — macOS uses -v, Linux uses -d
@@ -299,7 +321,7 @@ END=$(python3   -c "from datetime import datetime,timezone; print(datetime.now(t
 aws cloudwatch get-metric-statistics \
   --namespace AWS/Lambda \
   --metric-name Duration \
-  --dimensions Name=FunctionName,Value=cdr-lambda \
+  --dimensions Name=FunctionName,Value=$PREFIX-lambda \
   --start-time $START \
   --end-time   $END \
   --period 600 \
@@ -310,7 +332,7 @@ aws cloudwatch get-metric-statistics \
 aws cloudwatch get-metric-statistics \
   --namespace AWS/Lambda \
   --metric-name MaxMemoryUsed \
-  --dimensions Name=FunctionName,Value=cdr-lambda \
+  --dimensions Name=FunctionName,Value=$PREFIX-lambda \
   --start-time $START \
   --end-time   $END \
   --period 600 \
@@ -410,6 +432,28 @@ Bucket names are globally unique. Add a suffix to `SourceBucketName` /
 `SanitisedBucketName`. Alternatively, if the buckets were created by a previous
 failed deploy, delete them manually before redeploying.
 
+**(SAM) Deploy fails at `AWS::EarlyValidation::ResourceExistenceCheck`**
+Something in the account already owns a name this stack wants. The Lambda, SNS topics, DLQ
+and alarm names are account-and-region-scoped and derive from `ResourcePrefix`, so this
+fires when another stack — or another IaC tool entirely — holds them.
+
+**Do not delete the resource to free the name.** Absence from CloudFormation does not mean
+it is unmanaged or unused: it may be a live service managed by Terraform/CDK from a
+different repo. Identify the owner before doing anything:
+
+```bash
+# Is it serving traffic? Recent log activity is the fastest tell.
+aws logs tail /aws/lambda/cdr-lambda --since 30d --format short | tail -20
+
+# Who created it? Check for tags and any IaC state you can reach.
+aws lambda list-tags --resource "$(aws lambda get-function \
+  --function-name cdr-lambda --query 'Configuration.FunctionArn' --output text)"
+```
+
+The correct fix is a distinct `ResourcePrefix` for *your* stack. If the existing deployment
+genuinely should go, removal is the owning tool's job (`terraform destroy` from that repo)
+— deleting via CLI or console desyncs its state and breaks whatever depends on it.
+
 **(SAM) `ROLLBACK_COMPLETE` — SNSPublishMessagePolicy cannot find topic**
 The `CdrResultTopic` must exist before the policy is evaluated. This is a SAM
 ordering issue that resolves by running `sam deploy` a second time after the
@@ -421,7 +465,7 @@ Check that the EventBridge rule is `ENABLED`. The rule name differs by path:
 ```bash
 # SAM: physical name has an auto-generated suffix — look it up first (see section 3)
 RULE_NAME=$(aws cloudformation describe-stack-resource \
-  --stack-name cdr-lambda-staging \
+  --stack-name $PREFIX-stack \
   --logical-resource-id CdrFunctionS3Upload \
   --query 'StackResourceDetail.PhysicalResourceId' --output text)
 aws events describe-rule --name "$RULE_NAME"             --query 'State'
