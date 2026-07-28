@@ -97,6 +97,64 @@ jobs:
           path: build/lambda.zip
           if-no-files-found: error
 
+  terraform-validate:
+    # The terraform/ path provisions the same stack as src/template.yaml but was
+    # previously unchecked by CI, so drift between the two (missing variables, stale
+    # hardcoded names) merged unnoticed. fmt + validate need no AWS credentials and no
+    # provider network access beyond `init -backend=false`.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install OpenTofu
+        # Installed directly rather than via a third-party setup action: one less
+        # supply-chain surface, and the checksum pins the binary exactly.
+        env:
+          TOFU_VERSION: "1.10.6"
+          TOFU_SHA256: "15b7bed76420b50da3e121769c43341df8cd57d751ca14e6dbe9c850124c6dac"
+        run: |
+          set -euo pipefail
+          curl -fsSL -o tofu.zip \
+            "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_amd64.zip"
+          echo "${TOFU_SHA256}  tofu.zip" | sha256sum -c -
+          unzip -q tofu.zip tofu -d /usr/local/bin
+          rm tofu.zip
+          tofu version
+
+      - name: Check formatting
+        working-directory: terraform
+        run: tofu fmt -check -diff -recursive
+
+      - name: Validate configuration
+        working-directory: terraform
+        # -backend=false: no remote state, no credentials. Downloads the pinned AWS
+        # provider so validate can type-check resource arguments.
+        run: |
+          tofu init -backend=false -input=false
+          tofu validate
+
+      - name: Check every CDR_MAX_* env var the code reads is set by both IaC paths
+        # A cap the code reads but neither path sets falls back to the in-code default
+        # and cannot be tuned without a redeploy — silent, and how four caps went
+        # missing from terraform/ (#62). Compare against lambda_function.py, the
+        # authority on which names actually exist.
+        run: |
+          set -euo pipefail
+          grep -oE 'os\.environ\.get\("CDR_MAX_[A-Z_]+"' src/lambda_function.py \
+            | grep -oE 'CDR_MAX_[A-Z_]+' | sort -u > /tmp/code-vars.txt
+          grep -oE 'CDR_MAX_[A-Z_]+' terraform/main.tf | sort -u > /tmp/tf-vars.txt
+          grep -oE 'CDR_MAX_[A-Z_]+' src/template.yaml | sort -u > /tmp/sam-vars.txt
+          echo "Caps read by lambda_function.py:"; cat /tmp/code-vars.txt
+          if ! diff -u /tmp/code-vars.txt /tmp/tf-vars.txt; then
+            echo "::error::terraform/main.tf does not set every CDR_MAX_* the code reads (- missing, + unused)"
+            exit 1
+          fi
+          if ! diff -u /tmp/code-vars.txt /tmp/sam-vars.txt; then
+            echo "::error::src/template.yaml does not set every CDR_MAX_* the code reads (- missing, + unused)"
+            exit 1
+          fi
+
   docker-build:
     # Build the local CDR service container image and verify it serves /healthz. Guards the
     # Dockerfile / local-service deps from rotting; the build is the real regression check
