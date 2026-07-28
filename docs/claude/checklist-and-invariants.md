@@ -57,7 +57,7 @@ Run this checklist before considering any change complete. Each item maps to a c
 
 ### Documentation invariants — verify docs stay accurate
 
-- [ ] **CLAUDE.md test count matches actual** — update the `(N tests)` count after adding or removing tests.
+- [ ] **CLAUDE.md test count matches actual** — update the `(N tests)` count after adding or removing tests. `scripts/check_test_count.py` (run by CI) enforces this for the *tracked* docs (`docs/claude/testing.md`, this file); CLAUDE.md / AGENTS.md / GEMINI.md are gitignored, so CI cannot see them — update those by hand.
 - [ ] **ZIP anomaly handling described as hard-reject everywhere** — not "log and proceed". Check CLAUDE.md, AGENTS.md, GEMINI.md.
 - [ ] **New pitfalls encoded** — if a bug required a non-obvious fix, add it to the pitfalls section so future contributors recognise the pattern immediately.
 
