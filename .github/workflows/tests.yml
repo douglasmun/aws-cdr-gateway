@@ -84,6 +84,14 @@ jobs:
         # behind the tested versions exactly this way.
         run: python scripts/check_lambda_requirements.py
 
+      - name: Check the pitfalls index covers every entry
+        working-directory: ${{ github.workspace }}
+        # docs/claude/pitfalls.md is the reference every CDR change is read against. Its
+        # subsystem index is only useful if complete — an index that silently misses a
+        # newly-appended entry reads as covering everything. Also pins the numbering
+        # contract: ~90 `pitfall #N` references point at these headings.
+        run: python scripts/check_pitfalls_index.py
+
   build-package:
     # Verify the Lambda deployment package builds with Linux wheels. Runs on Linux so the
     # manylinux wheels are the native platform; catches dependency/packaging breakage.

@@ -4,6 +4,16 @@
 
 Tests (321 in `test_cdr.py` + 50 in `test_cdr_local.py` = **371 total**) construct malicious fixtures entirely in-memory — no fixture files on disk. S3/SNS calls are patched with `unittest.mock`. Required env vars are set automatically via `os.environ.setdefault`. `src/test_cdr.py` covers the CDR Lambda; `src/test_cdr_local.py` covers the pure `cdr_dispatch` core and the local FastAPI service (`app.py`), reusing the same in-memory fixtures. Run: `cd src && pytest test_cdr.py test_cdr_local.py -v`.
 
+> **Run it bare — do not export AWS env vars around it.** `src/conftest.py` sets the
+> credentials/region and `test_cdr.py` sets the bucket and topic names, both via
+> `setdefault`, which *yields to anything already in the environment*. Exporting
+> `SANITISED_BUCKET`/`QUARANTINE_BUCKET` therefore overrides the test defaults and fails
+> the two tests asserting on the literal names `test-sanitised`/`test-quarantine`
+> (`test_xlsb_output_is_valid_xlsx`, `test_oversized_uses_copy_object`) — an
+> environmental failure that reads exactly like a code regression. Dummy AWS credentials
+> are harmless but unnecessary; omitting them entirely also works, though botocore's
+> credential lookup then stretches the suite from ~2 s to ~60 s.
+
 **`test_cdr_local.py` of note:**
 - `TestCdrDispatchRouting` — every `cdr_dispatch` branch (office/pdf/image sanitised, legacy/RTF/unknown unsupported, non-OOXML-zip rejected, oversize rejected, ext remap) and a `test_dispatch_does_no_io` that fails if the pure core makes any boto3 call
 - `TestSanitiseEndpoint` — `/sanitise` returns 200 + clean bytes (vbaProject/OpenAction gone), 422 for RTF/unknown/non-OOXML-zip, 500 for a corrupt PDF; `/healthz` reports supported formats

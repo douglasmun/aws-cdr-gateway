@@ -4,6 +4,98 @@
 
 Bugs that have been found and fixed. Each entry states the correct pattern so future code can be written right the first time.
 
+## Index by subsystem
+
+Fifty entries is more than anyone reads top-to-bottom, so start here: find the group
+matching what you are about to touch and read those entries first.
+
+**Numbers are permanent identifiers.** 91 `pitfall #N` references across the code, the
+tests and the other docs point at these headings, so entries are never renumbered or
+reordered — new ones are appended. An entry may be relevant to more than one group;
+it is listed once, under the group whose code you would be editing.
+
+**Routing & fail-closed doctrine**
+
+- [#14 — ZIP anomaly handling is hard-reject, not log-and-proceed](#14-zip-anomaly-handling-is-hard-reject-not-log-and-proceed)
+- [#28 — The dispatch must FAIL CLOSED — never pass an unrecognised extension through to SANITISED_BUCKET](#28-the-dispatch-must-fail-closed-never-pass-an-unrecognised-extension-through-to-sanitised_bucket)
+- [#31 — Prefer allowlists; strip the PART, not just the relationship](#31-prefer-allowlists-strip-the-part-not-just-the-relationship)
+- [#34 — An Office ZIP missing `[Content_Types].xml` is hard-rejected](#34-an-office-zip-missing-content_typesxml-is-hard-rejected)
+- [#38 — RTF is rejected BY DESIGN — never give it a CDR handler](#38-rtf-is-rejected-by-design-never-give-it-a-cdr-handler)
+- [#41 — A second CDR front-end must reuse `cdr_dispatch`, never re-implement routing](#41-a-second-cdr-front-end-must-reuse-cdr_dispatch-never-re-implement-routing)
+- [#47 — An extension allowlist gates ROUTING, not DECODING — pin the decoder too](#47-an-extension-allowlist-gates-routing-not-decoding-pin-the-decoder-too)
+- [#49 — Dispatching on a hardcoded OPC part name — resolve the RELATIONSHIP, as the parser does](#49-dispatching-on-a-hardcoded-opc-part-name-resolve-the-relationship-as-the-parser-does)
+
+**OOXML / Office parts & relationships**
+
+- [#7 — `[Content_Types].xml` using container MIME types instead of OPC part types](#7-content_typesxml-using-container-mime-types-instead-of-opc-part-types)
+- [#11 — Content type test fixtures that don't reflect real Office output](#11-content-type-test-fixtures-that-dont-reflect-real-office-output)
+- [#13 — Asserting field code element removal when CDR neutralises in-place](#13-asserting-field-code-element-removal-when-cdr-neutralises-in-place)
+- [#16 — `onClick`/`onAction` regex must handle single-quoted attributes](#16-onclickonaction-regex-must-handle-single-quoted-attributes)
+- [#21 — Entity-encoded field codes must be neutralised WITHOUT decoding the whole XML part](#21-entity-encoded-field-codes-must-be-neutralised-without-decoding-the-whole-xml-part)
+- [#22 — `WEBSERVICE` Word field code (no parens) is not caught by the `n3` pattern](#22-webservice-word-field-code-no-parens-is-not-caught-by-the-n3-pattern)
+- [#23 — DDE pipe pattern must allow quoted/bracketed application names](#23-dde-pipe-pattern-must-allow-quotedbracketed-application-names)
+- [#32 — External hyperlink rels are neutralised in place, not deleted](#32-external-hyperlink-rels-are-neutralised-in-place-not-deleted)
+- [#33 — The DDE pipe `!suffix` is anchored to a cell-reference shape, not any word](#33-the-dde-pipe-suffix-is-anchored-to-a-cell-reference-shape-not-any-word)
+- [#37 — PostScript/EPS parts inside an OOXML package must be stripped (part bytes AND declaration)](#37-postscripteps-parts-inside-an-ooxml-package-must-be-stripped-part-bytes-and-declaration)
+- [#39 — Stripping a PART by name must also drop its RELATIONSHIP (else a dangling rel corrupts the doc)](#39-stripping-a-part-by-name-must-also-drop-its-relationship-else-a-dangling-rel-corrupts-the-doc)
+- [#40 — Field-code neutralisation must be scoped to field carriers, NOT run over the raw XML part](#40-field-code-neutralisation-must-be-scoped-to-field-carriers-not-run-over-the-raw-xml-part)
+
+**Spreadsheets (xlsb / formulas)**
+
+- [#10 — Trying to CDR xlsb binary sheets with regex or byte scanning](#10-trying-to-cdr-xlsb-binary-sheets-with-regex-or-byte-scanning)
+- [#19 — openpyxl serialises string cell values starting with `=` as live formulas](#19-openpyxl-serialises-string-cell-values-starting-with-as-live-formulas)
+- [#20 — `cdr_xlsb()` bypasses `_read_zip_entry_safe` — must pre-read before handing to pyxlsb](#20-cdr_xlsb-bypasses-_read_zip_entry_safe-must-pre-read-before-handing-to-pyxlsb)
+- [#50 — Formula-injection neutralisation must cover the CSV prefixes, not just `=`](#50-formula-injection-neutralisation-must-cover-the-csv-prefixes-not-just)
+
+**PDF**
+
+- [#25 — PDF AcroForm root `/AA` and page `/FileAttachment` are separate vectors](#25-pdf-acroform-root-aa-and-page-fileattachment-are-separate-vectors)
+- [#42 — PDF decoder-RCE image filters (JBIG2/JPX) are neutralised in-place, not rejected](#42-pdf-decoder-rce-image-filters-jbig2jpx-are-neutralised-in-place-not-rejected)
+
+**Images**
+
+- [#48 — Pillow re-embeds `icc_profile` from `info` on PNG/TIFF — a silent metadata leak with a false audit record](#48-pillow-re-embeds-icc_profile-from-info-on-pngtiff-a-silent-metadata-leak-with-a-false-audit-record)
+
+**Resource limits & DoS**
+
+- [#2 — Trusting `item.file_size` for decompression bomb defence](#2-trusting-itemfile_size-for-decompression-bomb-defence)
+- [#8 — Decompression bomb guard is mandatory on every ZIP read path](#8-decompression-bomb-guard-is-mandatory-on-every-zip-read-path)
+- [#26 — `_download` must bound by S3 `ContentLength`, not just the EventBridge size field](#26-_download-must-bound-by-s3-contentlength-not-just-the-eventbridge-size-field)
+- [#29 — Neutralisation regexes must not have catastrophic backtracking (ReDoS)](#29-neutralisation-regexes-must-not-have-catastrophic-backtracking-redos)
+
+**AWS plumbing, IAM & observability**
+
+- [#1 — Side-effect failures masquerading as CDR failures](#1-side-effect-failures-masquerading-as-cdr-failures)
+- [#3 — Silent `except: pass` hiding operational failures](#3-silent-except-pass-hiding-operational-failures)
+- [#4 — Conflating CDR result topic with alarm topic](#4-conflating-cdr-result-topic-with-alarm-topic)
+- [#5 — No DLQ = silent event loss after retry exhaustion](#5-no-dlq-silent-event-loss-after-retry-exhaustion)
+- [#6 — Oversized-file guard writing empty bytes to quarantine](#6-oversized-file-guard-writing-empty-bytes-to-quarantine)
+- [#17 — EventBridge rule must exclude CopyObject to prevent processing loops](#17-eventbridge-rule-must-exclude-copyobject-to-prevent-processing-loops)
+- [#24 — `CDR/Validation/ZipAnomalies` metric must be emitted on hard reject](#24-cdrvalidationzipanomalies-metric-must-be-emitted-on-hard-reject)
+- [#27 — `s3:CopyObject` is not a real IAM action](#27-s3copyobject-is-not-a-real-iam-action)
+- [#35 — S3 object-tag values must be sanitised to S3's charset — NOT percent-encoded](#35-s3-object-tag-values-must-be-sanitised-to-s3s-charset-not-percent-encoded)
+- [#36 — The CDR-error path quarantines but does NOT delete the source (intentional)](#36-the-cdr-error-path-quarantines-but-does-not-delete-the-source-intentional)
+
+**Testing discipline**
+
+- [#9 — Not testing failure paths](#9-not-testing-failure-paths)
+- [#12 — Writing security tests that manipulate file internals without understanding format validation](#12-writing-security-tests-that-manipulate-file-internals-without-understanding-format-validation)
+- [#18 — Infrastructure-dependent tasks cannot be completed without live credentials](#18-infrastructure-dependent-tasks-cannot-be-completed-without-live-credentials)
+- [#30 — Any independently-imported module needs its OWN test file](#30-any-independently-imported-module-needs-its-own-test-file)
+
+**Multi-bug audit batches**
+
+- [#43 — Four bugs found by an adversarial code-quality audit (path evasion, annotation-AP bypass, cyclic /Kids, quarantine-failure source loss)](#43-four-bugs-found-by-an-adversarial-code-quality-audit-path-evasion-annotation-ap-bypass-cyclic-kids-quarantine-failure-source-loss)
+- [#44 — Three availability/DoS bugs found by the same adversarial audit (ReDoS, silent depth-cutoff truncation, unenforced decompression-bomb cap)](#44-three-availabilitydos-bugs-found-by-the-same-adversarial-audit-redos-silent-depth-cutoff-truncation-unenforced-decompression-bomb-cap)
+- [#45 — Six correctness/data-loss/observability bugs found by the same adversarial audit (basename collision, SNS Subject charset, empty-dimension metric, missing legacy-OLE metric, substring over-match, header-injection anchor, animated-frame loss)](#45-six-correctnessdata-lossobservability-bugs-found-by-the-same-adversarial-audit-basename-collision-sns-subject-charset-empty-dimension-metric-missing-legacy-ole-metric-substring-over-match-header-injection-anchor-animated-frame-loss)
+- [#46 — Eight availability/evasion bugs found by the high-utilisation production audit (aggregate zip bomb, XML encoding evasion, zip-slip, canonical duplicates, DTD, altChunk payload, .vml, animation budgets)](#46-eight-availabilityevasion-bugs-found-by-the-high-utilisation-production-audit-aggregate-zip-bomb-xml-encoding-evasion-zip-slip-canonical-duplicates-dtd-altchunk-payload-vml-animation-budgets)
+
+**Report & message shaping**
+
+- [#15 — `_publish_result_safe` truncation must handle both flat and nested report shapes](#15-_publish_result_safe-truncation-must-handle-both-flat-and-nested-report-shapes)
+
+---
+
 ### 1. Side-effect failures masquerading as CDR failures
 Wrap every non-CDR side effect (`publish_result`, `delete_object`) in try/except with warn-and-continue. The upload to `SANITISED_BUCKET` is the only call that must succeed. Any unhandled exception causes EventBridge to retry — re-downloading and re-CDRing a file that was already sanitised.
 
