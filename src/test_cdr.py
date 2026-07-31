@@ -148,8 +148,17 @@ def _make_xlsb(rows: list[list] | None = None) -> bytes:
       - Record length: standard LEB128
     Produces workbook.bin (WORKBOOK / SHEETS / SHEET / SHEETS_END / WORKBOOK_END)
     and worksheets/sheet1.bin (WORKSHEET / DIMENSION / SHEETDATA /
-    [ROW + FLOAT cells] / SHEETDATA_END / WORKSHEET_END).
-    rows is a list of lists of float/None values. Defaults to [[1.0, 2.0], [3.0, 4.0]].
+    [ROW + cells] / SHEETDATA_END / WORKSHEET_END).
+
+    rows is a list of lists whose values may be:
+      - float/int -> FLOAT record
+      - str       -> FORMULA_STRING record (a formula's cached string result,
+                     carried inline; this is the shape that lets a payload such
+                     as '=DDE("cmd","/c calc")' ride in as a cell value). STRING
+                     is deliberately not used: it indexes the shared string
+                     table, which this fixture does not emit.
+      - None      -> BLANK record
+    Defaults to [[1.0, 2.0], [3.0, 4.0]].
     """
     import struct as _struct
     from pyxlsb import biff12
@@ -213,6 +222,9 @@ def _make_xlsb(rows: list[list] | None = None) -> bytes:
         for c_idx, val in enumerate(row):
             if val is None:
                 sheet_rows += _rec(biff12.BLANK, _u32(c_idx) + _u32(0))
+            elif isinstance(val, str):
+                sheet_rows += _rec(biff12.FORMULA_STRING,
+                                   _u32(c_idx) + _u32(0) + _biff12_string(val))
             else:
                 sheet_rows += _rec(biff12.FLOAT,
                                    _u32(c_idx) + _u32(0) + _struct.pack("<d", float(val)))
@@ -3942,34 +3954,32 @@ class TestFormulaInjectionPrefixes:
     sheet is exported to CSV and reopened, so the payload survives CDR as text and goes
     live one export later."""
 
+    @staticmethod
+    def _sanitised_a1(payload):
+        """Drive one string cell through the real cdr_xlsb path and return its A1 cell.
+
+        _make_xlsb emits str values as BIFF12 FORMULA_STRING records — a formula's
+        cached string result carried inline — which is exactly how such a payload
+        reaches cdr_xlsb in the wild.
+        """
+        clean, _ = cdr.cdr_xlsb(_make_xlsb([[payload]]))
+        return openpyxl.load_workbook(io.BytesIO(clean)).active["A1"]
+
     @pytest.mark.parametrize("payload", [
         '=DDE("cmd","/c calc")', "+1+1", "-1+1", "@SUM(A1)",
         "\t=1+1", "  @SUM(A1)",
     ])
     def test_prefix_neutralised(self, payload):
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        v = payload
-        if isinstance(v, str) and v.lstrip("\t\r\n ").startswith(
-            cdr._FORMULA_INJECTION_PREFIXES
-        ):
-            v = "'" + v
-        ws.append([v])
-        buf = io.BytesIO()
-        wb.save(buf)
-        cell = openpyxl.load_workbook(io.BytesIO(buf.getvalue())).active["A1"]
+        cell = self._sanitised_a1(payload)
         assert cell.data_type != "f", f"{payload!r} serialised as a live formula"
+        assert cell.value == "'" + payload
 
-    def test_equals_would_be_live_without_the_guard(self):
-        """Control: '=' genuinely produces a live formula when NOT neutralised, so the
-        parametrised test above is asserting something real. (_make_xlsb encodes FLOAT
-        cells only, so string payloads are exercised at the guard boundary rather than
-        end-to-end through cdr_xlsb.)"""
-        wb = openpyxl.Workbook()
-        wb.active.append(['=DDE("cmd","/c calc")'])
-        buf = io.BytesIO()
-        wb.save(buf)
-        assert openpyxl.load_workbook(io.BytesIO(buf.getvalue())).active["A1"].data_type == "f"
+    def test_equals_would_be_live_without_the_guard(self, monkeypatch):
+        """Control: with the guard disabled, the same end-to-end path yields a LIVE
+        formula — proving the parametrised test above asserts something real and that
+        cdr_xlsb, not openpyxl, is what neutralises the payload."""
+        monkeypatch.setattr(cdr, "_FORMULA_INJECTION_PREFIXES", ())
+        assert self._sanitised_a1('=DDE("cmd","/c calc")').data_type == "f"
 
     def test_numeric_cells_unaffected(self):
         """Negative numbers arrive as numeric cells, never strings, so widening the guard
@@ -3979,7 +3989,15 @@ class TestFormulaInjectionPrefixes:
         vals = [(c.value, c.data_type) for c in next(ws.iter_rows(min_row=1, max_row=1))]
         assert vals == [(42, "n"), (-5, "n"), (3.14, "n")]
 
-    @pytest.mark.parametrize("benign", ["hello", "2024-01-01", "N/A", "", "a=b"])
+    @pytest.mark.parametrize("benign", ["hello", "2024-01-01", "N/A", "a=b"])
     def test_benign_text_not_prefixed(self, benign):
-        """The guard must only fire on a leading formula prefix — not mid-string."""
-        assert not benign.lstrip("\t\r\n ").startswith(cdr._FORMULA_INJECTION_PREFIXES)
+        """The guard must only fire on a leading formula prefix — not mid-string —
+        and must not mangle ordinary text on its way through cdr_xlsb."""
+        cell = self._sanitised_a1(benign)
+        assert cell.value == benign
+        assert cell.data_type == "s"
+
+    def test_empty_string_not_prefixed(self):
+        """An empty cell has no leading prefix, so the guard must leave it alone.
+        openpyxl round-trips an empty string as an empty cell (value None)."""
+        assert self._sanitised_a1("").value is None
