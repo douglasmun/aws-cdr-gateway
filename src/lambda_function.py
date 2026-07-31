@@ -38,6 +38,7 @@ import logging
 import os
 import posixpath
 import re
+import struct
 import warnings
 import xml.etree.ElementTree as ET
 import zipfile
@@ -49,7 +50,7 @@ import openpyxl
 import pikepdf
 import pyxlsb
 from botocore.config import Config
-from PIL import Image, ImageSequence
+from PIL import Image, ImageSequence, UnidentifiedImageError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -95,6 +96,18 @@ _MAX_IMAGE_FRAMES = int(os.environ.get("CDR_MAX_IMAGE_FRAMES", "2000"))
 # image decode+re-encode silently, which at several bytes/pixel/buffer can approach the
 # Lambda's memory ceiling well before Pillow's own error would ever fire.
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("CDR_MAX_IMAGE_PIXELS", str(40_000_000)))
+
+# Pillow decoder allowlist (pitfall #47). IMAGE_EXTS gates which *extensions* route into
+# cdr_image, but Image.open() picks its decoder by sniffing CONTENT, so without this the
+# extension constrains only the save format and every plugin in Pillow's registry (43 in
+# the pinned build — FLI, PSD, DDS, SGI, XPM, JPEG2000, WMF, EPS…) is reachable by naming
+# a file .png. That is a native-code attack surface, not a disarm bypass: output is still
+# re-encoded, but the attacker chooses which C decoder parses their bytes, which is the
+# reachability precondition for a libtiff/FLI/DDS memory-corruption CVE. Deliberately the
+# 7-format set, NOT the single declared extension — extension/content mismatch among these
+# seven is common in legitimate files, and rejecting real business documents is a
+# production incident. Keep in sync with IMAGE_EXTS.
+_PILLOW_FORMATS: list[str] = ["JPEG", "PNG", "GIF", "BMP", "TIFF", "WEBP"]
 
 # ── OOXML (Office) dangerous relationship types ────────────────────────────────
 STRIP_REL_TYPES: set[str] = {
@@ -588,6 +601,67 @@ def _postscript_override_parts(ct_xml: bytes) -> set[str]:
     return parts
 
 
+# Relationship types (local name) whose Target is a sheet part. `xlBinaryIndex` is the
+# type xlsb actually uses for its BIFF12 sheet binaries; the rest are the OOXML sheet
+# types, included so a package that binds a .bin under a conventional sheet rel is caught
+# too. Matched on local name because the same type ships under both the
+# officeDocument/2006 and microsoft.com/office namespaces (mirrors `_strip_rels`).
+# Cell-value prefixes Excel treats as the start of a formula. '=' is the only one openpyxl
+# turns into a live <f> element in xlsx; the other three matter on CSV export (pitfall #50).
+_FORMULA_INJECTION_PREFIXES: tuple[str, ...] = ("=", "+", "-", "@")
+
+_WORKSHEET_REL_TYPES: frozenset[str] = frozenset({
+    "xlbinaryindex", "worksheet", "chartsheet", "dialogsheet", "macrosheet",
+})
+
+
+def _xlsb_worksheet_parts(src: zipfile.ZipFile, budget: "_DecompressionBudget") -> set[str]:
+    """Return the canonical part names an xlsb's workbook relationships bind to a sheet.
+
+    OPC part names are arbitrary — a real parser (pyxlsb included) follows the ``Target``
+    in ``xl/_rels/workbook.bin.rels``, not the conventional ``xl/worksheets/sheetN.bin``
+    path. Matching on the conventional name let a relocated sheet binary skip conversion
+    (pitfall #49), so resolve the rels instead.
+
+    Deliberately matched on the relationship type's LOCAL NAME (mirrors the rel-type
+    matching in ``_strip_rels``): the same worksheet type ships under both the
+    ``officeDocument/2006`` and ``microsoft.com/office`` namespaces, and a full-URI compare
+    misses one of them. Targets are resolved relative to the rels file's owning directory
+    and canonicalised the same way the ``STRIP_ZIP_ENTRIES`` match is, so ``../`` and
+    ``//`` cannot dodge the comparison.
+
+    A ``CdrReject`` from ``_read_zip_entry_safe`` (decompression budget trip) is allowed to
+    propagate: swallowing it would yield an empty set and fall through to the pass-through
+    ZIP path, which is exactly the bypass this function exists to close.
+    """
+    parts: set[str] = set()
+    for item in src.infolist():
+        name = item.filename.replace("\\", "/").lower()
+        # Any *.rels under a _rels/ directory — not just xl/_rels/workbook.bin.rels, since
+        # the workbook part itself is named by the package root rels.
+        if not (name.endswith(".rels") and "_rels/" in name):
+            continue
+        raw = _read_zip_entry_safe(src, item, budget)
+        try:
+            _reject_xml_doctype(raw, item.filename)
+            root = ET.fromstring(raw)
+        except (ET.ParseError, CdrReject):
+            continue
+        base = posixpath.dirname(posixpath.dirname(name))  # strip "_rels/<file>.rels"
+        for child in root:
+            rel_type = child.get("Type", "").rsplit("/", 1)[-1].lower()
+            if rel_type not in _WORKSHEET_REL_TYPES:
+                continue
+            target = child.get("Target", "").replace("\\", "/")
+            if not target or "://" in target:
+                continue  # external target — never a local part
+            resolved = target.lstrip("/") if target.startswith("/") else posixpath.join(base, target)
+            canonical = posixpath.normpath(resolved).lstrip("/").lower()
+            if canonical.endswith(".bin"):
+                parts.add(canonical)
+    return parts
+
+
 def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
     """Disarm an OOXML (ZIP) Office file by rebuilding the archive entry-by-entry.
 
@@ -615,6 +689,20 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
                 except ValueError:
                     ps_parts = set()  # bomb-guard trip; suffix rule remains the backstop
                 break
+
+        # Pitfall #49: resolve xlsb worksheet parts from the workbook relationships, not
+        # from a hardcoded "xl/worksheets/sheet*.bin" name. OPC part names are arbitrary —
+        # the rel Target is what a real parser follows — so an xlsb whose sheet binary is
+        # relocated to e.g. "xl/binparts/data1.bin" skipped conversion entirely and its
+        # BIFF12 records (FORMULA / DDE / OLEOBJECT / DEFINEDNAME) passed through
+        # byte-for-byte into the sanitised bucket. Resolved *before* the main loop because
+        # infolist() order is not guaranteed and the rels part may follow the sheet.
+        # A budget trip inside raises CdrReject, which propagates — deliberately NOT caught
+        # and converted into "no sheets found", since that would fall through to the ZIP
+        # path and pass BIFF12 bytes through unconverted. Fail closed.
+        xlsb_sheet_parts: set[str] = (
+            _xlsb_worksheet_parts(src, budget) if ext == "xlsb" else set()
+        )
 
         with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as dst:
             for item in src.infolist():
@@ -684,11 +772,7 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
                 #    worksheet binaries (xl/worksheets/sheet*.bin) trigger conversion;
                 #    other .bin parts (e.g. xl/workbook.bin metadata) must not divert a
                 #    VBA-only/metadata-only xlsb away from the normal ZIP CDR path.
-                elif (
-                    ext == "xlsb"
-                    and name_lower.startswith("xl/worksheets/sheet")
-                    and name_lower.endswith(".bin")
-                ):
+                elif ext == "xlsb" and name_canonical in xlsb_sheet_parts:
                     return cdr_xlsb(data)
 
                 dst.writestr(item, raw)
@@ -721,6 +805,34 @@ def cdr_xlsb(data: bytes) -> tuple[bytes, dict]:
     wb_out = openpyxl.Workbook(write_only=False)
     wb_out.remove(wb_out.active)  # remove default empty sheet
 
+    # Pitfall #49: malformed/hostile BIFF12 makes pyxlsb and openpyxl raise plain
+    # KeyError/ValueError/IndexError — an unresolvable sheet rel target, a sheet name with
+    # a character openpyxl forbids, an out-of-range column index. Those are deterministic
+    # verdicts about the bytes, so translate them into CdrReject; left as generic errors
+    # they re-raise and burn the full EventBridge retry budget on input that fails
+    # identically every attempt, ending in the DLQ instead of quarantine.
+    try:
+        _convert_xlsb_sheets(data, wb_out)
+    except CdrReject:
+        raise
+    except (KeyError, ValueError, IndexError, StopIteration, struct.error) as exc:
+        raise CdrReject(f"unparseable xlsb workbook: {type(exc).__name__}") from exc
+
+    out_buf = io.BytesIO()
+    wb_out.save(out_buf)
+    return out_buf.getvalue(), {
+        "format": "xlsb",
+        "converted_to": "xlsx",
+        "removed": removed,
+        "cdr_mode": "full",
+    }
+
+
+def _convert_xlsb_sheets(data: bytes, wb_out: "openpyxl.Workbook") -> None:
+    """Read every sheet's cell values via pyxlsb and append them to ``wb_out``.
+
+    Split out of ``cdr_xlsb`` so the whole pyxlsb/openpyxl traversal sits behind one
+    deterministic-reject boundary (pitfall #49)."""
     with pyxlsb.open_workbook(io.BytesIO(data)) as wb_in:
         for sheet_name in wb_in.sheets:
             ws_out = wb_out.create_sheet(title=sheet_name)
@@ -732,25 +844,22 @@ def cdr_xlsb(data: bytes) -> tuple[bytes, dict]:
                     out_row: list = [None] * (max_col + 1)
                     for cell in row:
                         v = cell.v
-                        # Force string cells starting with '=' to plain text.
-                        # openpyxl treats any cell value beginning with '=' as a formula
-                        # expression. A crafted xlsb can carry a FORMULA_STRING cached
-                        # result like '=DDE("cmd","/c calc")' which would be serialised
-                        # as a live <f> element. Prefixing with a leading apostrophe is
-                        # the standard Excel "force-text" convention and prevents this.
-                        if isinstance(v, str) and v.startswith("="):
+                        # Force formula-injection prefixes to plain text (pitfall #50).
+                        # Only '=' makes openpyxl serialise a live <f> element, so that is
+                        # the whole xlsx threat and the rest are inert *here*. They are not
+                        # inert downstream: '+', '-' and '@' are the standard CSV-injection
+                        # prefixes, and Excel evaluates all four when a sanitised sheet is
+                        # exported to CSV and reopened — so a '@SUM'/'+DDE' payload survives
+                        # CDR as text and goes live one export later. Leading whitespace is
+                        # stripped before the check because Excel tolerates it ahead of the
+                        # prefix. Prefixing with an apostrophe is the standard force-text
+                        # convention and is idempotent for our purposes.
+                        if isinstance(v, str) and v.lstrip("\t\r\n ").startswith(
+                            _FORMULA_INJECTION_PREFIXES
+                        ):
                             v = "'" + v
                         out_row[cell.c] = v
                     ws_out.append(out_row)
-
-    out_buf = io.BytesIO()
-    wb_out.save(out_buf)
-    return out_buf.getvalue(), {
-        "format": "xlsb",
-        "converted_to": "xlsx",
-        "removed": removed,
-        "cdr_mode": "full",
-    }
 
 
 class _DecompressionBudget:
@@ -1216,6 +1325,14 @@ def cdr_pdf(data: bytes) -> tuple[bytes, dict]:
     """
     removed: list[str] = []
 
+    # Magic check before QPDF sees the bytes (pitfall #47). The Office path validates
+    # magic + structure before zlib touches anything; PDF handed raw bytes straight to
+    # QPDF's C++ parser behind only the size cap. The spec allows the header within the
+    # first 1024 bytes, so match that rather than requiring offset 0 — the subsequent
+    # pdf.save() rebuild drops any leading polyglot prefix anyway.
+    if b"%PDF-" not in data[:1024]:
+        raise CdrReject("no %PDF- header in the first 1024 bytes")
+
     with pikepdf.open(io.BytesIO(data)) as pdf:
         catalog = pdf.Root
 
@@ -1570,7 +1687,18 @@ def cdr_image(data: bytes, ext: str) -> tuple[bytes, dict]:
     # closed instead of silently decoding (and consuming memory) in the soft-warn band.
     with warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
-        with Image.open(io.BytesIO(data)) as img:
+        # A format outside _PILLOW_FORMATS raises UnidentifiedImageError. That is a
+        # deterministic verdict about the bytes, not a transient fault, so translate it
+        # into CdrReject — otherwise it escapes as a generic error and EventBridge retries
+        # input that will fail identically every time.
+        try:
+            img_ctx = Image.open(io.BytesIO(data), formats=_PILLOW_FORMATS)
+        except UnidentifiedImageError as exc:
+            raise CdrReject(
+                f"image content does not match any allowed format {_PILLOW_FORMATS} "
+                f"(declared extension: {ext})"
+            ) from exc
+        with img_ctx as img:
             if img.info.get("exif") or img.info.get("IFD"):
                 removed.append("EXIF")
             if "icc_profile" in img.info:
@@ -1613,7 +1741,15 @@ def cdr_image(data: bytes, ext: str) -> tuple[bytes, dict]:
                         )
                     durations.append(frame.info.get("duration", 0))
                     frames.append(frame.convert(frame_mode).copy())
-                save_all_kwargs: dict = {"save_all": True, "append_images": frames[1:]}
+                # Pitfall #48: the PNG and TIFF encoders pull `icc_profile` out of the
+                # image's info dict (which survives .convert()/.copy()) and re-embed it
+                # unless explicitly overridden — so an attacker-supplied ICC blob rode
+                # through a "sanitised" image while `removed` claimed it was stripped.
+                # JPEG/WEBP/GIF happen to drop it, but pass None on every path rather than
+                # depending on per-encoder behaviour.
+                save_all_kwargs: dict = {
+                    "save_all": True, "append_images": frames[1:], "icc_profile": None,
+                }
                 if save_fmt in ("GIF", "WEBP"):
                     save_all_kwargs["duration"] = durations
                     save_all_kwargs["loop"] = img.info.get("loop", 0)
@@ -1625,11 +1761,12 @@ def cdr_image(data: bytes, ext: str) -> tuple[bytes, dict]:
                 target_mode = "RGBA" if (ext == "png" and img.mode in ("RGBA", "LA", "PA")) else "RGB"
                 clean_img = img.convert(target_mode)
 
-                save_kwargs: dict = {}
+                # icc_profile=None on every path — see pitfall #48 above.
+                save_kwargs: dict = {"icc_profile": None}
                 if save_fmt == "JPEG":
-                    save_kwargs = {"quality": 95, "optimize": True}
+                    save_kwargs |= {"quality": 95, "optimize": True}
                 elif save_fmt == "PNG":
-                    save_kwargs = {"optimize": True}
+                    save_kwargs |= {"optimize": True}
                 elif save_fmt == "GIF":
                     # Explicitly suppress comment extension blocks — Pillow carries them
                     # through re-encode unless overridden.

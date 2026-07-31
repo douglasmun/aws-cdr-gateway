@@ -1,7 +1,7 @@
 # CDR Lambda dependencies
 # Pin versions for reproducible Lambda layer builds.
 
-pikepdf==10.10.0          # PDF manipulation — strips JS, actions, embedded files
+pikepdf==10.11.0          # PDF manipulation — strips JS, actions, embedded files
 Pillow==12.3.0           # Image re-encoding — purges EXIF, ICC, XMP
 boto3==1.43.56           # AWS SDK (pre-installed in Lambda runtime, pin for local dev)
 pyxlsb==1.0.10           # xlsb reader — extracts cell values from BIFF12 binary sheets

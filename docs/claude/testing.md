@@ -2,7 +2,7 @@
 
 > Extracted from CLAUDE.md. Authoritative testing reference; CLAUDE.md points here.
 
-Tests (261 in `test_cdr.py` + 50 in `test_cdr_local.py` = **311 total**) construct malicious fixtures entirely in-memory — no fixture files on disk. S3/SNS calls are patched with `unittest.mock`. Required env vars are set automatically via `os.environ.setdefault`. `src/test_cdr.py` covers the CDR Lambda; `src/test_cdr_local.py` covers the pure `cdr_dispatch` core and the local FastAPI service (`app.py`), reusing the same in-memory fixtures. Run: `cd src && pytest test_cdr.py test_cdr_local.py -v`.
+Tests (321 in `test_cdr.py` + 50 in `test_cdr_local.py` = **371 total**) construct malicious fixtures entirely in-memory — no fixture files on disk. S3/SNS calls are patched with `unittest.mock`. Required env vars are set automatically via `os.environ.setdefault`. `src/test_cdr.py` covers the CDR Lambda; `src/test_cdr_local.py` covers the pure `cdr_dispatch` core and the local FastAPI service (`app.py`), reusing the same in-memory fixtures. Run: `cd src && pytest test_cdr.py test_cdr_local.py -v`.
 
 **`test_cdr_local.py` of note:**
 - `TestCdrDispatchRouting` — every `cdr_dispatch` branch (office/pdf/image sanitised, legacy/RTF/unknown unsupported, non-OOXML-zip rejected, oversize rejected, ext remap) and a `test_dispatch_does_no_io` that fails if the pure core makes any boto3 call
