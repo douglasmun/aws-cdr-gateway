@@ -73,7 +73,8 @@ audited and hardened. See [`docs/progress.md`](docs/progress.md).
 | `src/template.yaml` | AWS SAM infrastructure (buckets, IAM, DLQ, alarms, EventBridge) |
 | `terraform/` | Terraform port of the SAM template (parallel deploy path) |
 | `scripts/build.sh` | Builds the Lambda zip with Linux wheels (for the Terraform path) |
-| `src/requirements.txt` | Pinned Lambda dependencies |
+| `src/requirements.txt` | Pinned dependencies for the tests, the container image and local dev |
+| `scripts/lambda-requirements.txt` | **What the deployed Lambda is actually built from** — the same versions, hash-pinned and installed `--require-hashes`. Regenerate with `scripts/regen_lambda_requirements.py`; CI fails if it drifts from `src/requirements.txt` |
 | `docs/00–04` | Production-readiness manuals (setup, smoke tests, IAM review, runbook) |
 | `docs/deployment-runbook.md` | End-to-end staging deploy guide |
 | `docs/05-alarm-demo-walkthrough.md` | Subscribe to alarm notifications + fire the ZIP-anomaly alarm (live demo) |
@@ -87,11 +88,14 @@ audited and hardened. See [`docs/progress.md`](docs/progress.md).
 ## Development
 
 The Lambda runtime is **Python 3.12** (per `template.yaml`); the local dev venv may be
-newer. Dependencies are pinned in `src/requirements.txt`.
+newer. Dependencies are pinned in **two** files that must stay in step —
+`src/requirements.txt` (tests, container image, local dev) and
+`scripts/lambda-requirements.txt` (hash-pinned, what the deployed Lambda is built from).
+Bumping a dependency means changing both; see [Bumping a dependency](#bumping-a-dependency).
 
 ```bash
-# Activate the virtual environment (venv at repo root)
-source bin/activate
+# Create a venv (none is committed to the repo)
+python3.12 -m venv .venv && source .venv/bin/activate
 
 # Install dependencies (Lambda + local-service + test-only deps)
 pip install -r src/requirements.txt -r src/requirements-local.txt -r src/requirements-dev.txt
@@ -111,6 +115,32 @@ Tests construct malicious fixtures entirely in memory; S3/SNS are mocked. No liv
 credentials are needed to run them. `src/requirements-local.txt` (FastAPI/uvicorn) is only
 needed for the [local CDR service](#local-cdr-service-no-aws-account) and its tests — it is
 deliberately excluded from the deployed Lambda package.
+
+Run pytest **bare** — do not export `SANITISED_BUCKET`/`QUARANTINE_BUCKET` around it. The
+test defaults are set with `os.environ.setdefault`, which yields to anything already in the
+environment, so exported bucket names override them and fail two tests that assert on the
+literal names — an environmental failure that reads exactly like a code regression.
+
+### Bumping a dependency
+
+`src/requirements.txt` is what the tests and the container image install;
+`scripts/lambda-requirements.txt` is what the **deployed Lambda** is built from. A bump
+applied to one file alone ships a different wheel than the one the tests exercised —
+`pikepdf` and `Pillow` drifted two releases behind exactly this way, and the Pillow gap
+moved bundled native code (`liblcms2`, `libpng16`) that CI never ran. Dependabot watches
+both directories, but each PR bumps a single file, so the two still have to be reconciled.
+
+```bash
+# 1. edit the version in src/requirements.txt, then regenerate the hash-pinned file
+python scripts/regen_lambda_requirements.py
+
+# 2. verify they agree (this is what CI runs)
+python scripts/check_lambda_requirements.py
+```
+
+The regenerator resolves wheels for the Lambda target (`manylinux_2_28_x86_64`, CPython
+3.12) and rewrites the pins with their sha256 hashes. `boto3` is exempt — the Lambda
+runtime provides it, so it is deliberately absent from the shipped set.
 
 ---
 
