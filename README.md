@@ -96,7 +96,7 @@ source bin/activate
 # Install dependencies (Lambda + local-service + test-only deps)
 pip install -r src/requirements.txt -r src/requirements-local.txt -r src/requirements-dev.txt
 
-# Run the full test suite (358 tests: 308 CDR Lambda + 50 local variant)
+# Run the full test suite (371 tests: 321 CDR Lambda + 50 local variant)
 cd src && pytest test_cdr.py test_cdr_local.py -v
 
 # Run one class or test

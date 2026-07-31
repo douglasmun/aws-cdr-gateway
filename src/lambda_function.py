@@ -606,6 +606,10 @@ def _postscript_override_parts(ct_xml: bytes) -> set[str]:
 # types, included so a package that binds a .bin under a conventional sheet rel is caught
 # too. Matched on local name because the same type ships under both the
 # officeDocument/2006 and microsoft.com/office namespaces (mirrors `_strip_rels`).
+# Cell-value prefixes Excel treats as the start of a formula. '=' is the only one openpyxl
+# turns into a live <f> element in xlsx; the other three matter on CSV export (pitfall #50).
+_FORMULA_INJECTION_PREFIXES: tuple[str, ...] = ("=", "+", "-", "@")
+
 _WORKSHEET_REL_TYPES: frozenset[str] = frozenset({
     "xlbinaryindex", "worksheet", "chartsheet", "dialogsheet", "macrosheet",
 })
@@ -840,13 +844,19 @@ def _convert_xlsb_sheets(data: bytes, wb_out: "openpyxl.Workbook") -> None:
                     out_row: list = [None] * (max_col + 1)
                     for cell in row:
                         v = cell.v
-                        # Force string cells starting with '=' to plain text.
-                        # openpyxl treats any cell value beginning with '=' as a formula
-                        # expression. A crafted xlsb can carry a FORMULA_STRING cached
-                        # result like '=DDE("cmd","/c calc")' which would be serialised
-                        # as a live <f> element. Prefixing with a leading apostrophe is
-                        # the standard Excel "force-text" convention and prevents this.
-                        if isinstance(v, str) and v.startswith("="):
+                        # Force formula-injection prefixes to plain text (pitfall #50).
+                        # Only '=' makes openpyxl serialise a live <f> element, so that is
+                        # the whole xlsx threat and the rest are inert *here*. They are not
+                        # inert downstream: '+', '-' and '@' are the standard CSV-injection
+                        # prefixes, and Excel evaluates all four when a sanitised sheet is
+                        # exported to CSV and reopened — so a '@SUM'/'+DDE' payload survives
+                        # CDR as text and goes live one export later. Leading whitespace is
+                        # stripped before the check because Excel tolerates it ahead of the
+                        # prefix. Prefixing with an apostrophe is the standard force-text
+                        # convention and is idempotent for our purposes.
+                        if isinstance(v, str) and v.lstrip("\t\r\n ").startswith(
+                            _FORMULA_INJECTION_PREFIXES
+                        ):
                             v = "'" + v
                         out_row[cell.c] = v
                     ws_out.append(out_row)

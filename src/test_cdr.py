@@ -3933,3 +3933,53 @@ class TestXlsbSheetResolvedViaRels:
                 out.writestr(n, d)
         with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as z:
             assert cdr._xlsb_worksheet_parts(z, cdr._DecompressionBudget()) == set()
+
+
+class TestFormulaInjectionPrefixes:
+    """Pitfall #50 — only '=' makes openpyxl emit a live <f> element, so the other
+    prefixes are inert in the xlsx output. They are not inert downstream: '+', '-' and '@'
+    are the standard CSV-injection prefixes and Excel evaluates all four when a sanitised
+    sheet is exported to CSV and reopened, so the payload survives CDR as text and goes
+    live one export later."""
+
+    @pytest.mark.parametrize("payload", [
+        '=DDE("cmd","/c calc")', "+1+1", "-1+1", "@SUM(A1)",
+        "\t=1+1", "  @SUM(A1)",
+    ])
+    def test_prefix_neutralised(self, payload):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        v = payload
+        if isinstance(v, str) and v.lstrip("\t\r\n ").startswith(
+            cdr._FORMULA_INJECTION_PREFIXES
+        ):
+            v = "'" + v
+        ws.append([v])
+        buf = io.BytesIO()
+        wb.save(buf)
+        cell = openpyxl.load_workbook(io.BytesIO(buf.getvalue())).active["A1"]
+        assert cell.data_type != "f", f"{payload!r} serialised as a live formula"
+
+    def test_equals_would_be_live_without_the_guard(self):
+        """Control: '=' genuinely produces a live formula when NOT neutralised, so the
+        parametrised test above is asserting something real. (_make_xlsb encodes FLOAT
+        cells only, so string payloads are exercised at the guard boundary rather than
+        end-to-end through cdr_xlsb.)"""
+        wb = openpyxl.Workbook()
+        wb.active.append(['=DDE("cmd","/c calc")'])
+        buf = io.BytesIO()
+        wb.save(buf)
+        assert openpyxl.load_workbook(io.BytesIO(buf.getvalue())).active["A1"].data_type == "f"
+
+    def test_numeric_cells_unaffected(self):
+        """Negative numbers arrive as numeric cells, never strings, so widening the guard
+        to '-' must not turn them into apostrophe-prefixed text."""
+        clean, _ = cdr.cdr_xlsb(_make_xlsb([[42, -5, 3.14]]))
+        ws = openpyxl.load_workbook(io.BytesIO(clean)).active
+        vals = [(c.value, c.data_type) for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        assert vals == [(42, "n"), (-5, "n"), (3.14, "n")]
+
+    @pytest.mark.parametrize("benign", ["hello", "2024-01-01", "N/A", "", "a=b"])
+    def test_benign_text_not_prefixed(self, benign):
+        """The guard must only fire on a leading formula prefix — not mid-string."""
+        assert not benign.lstrip("\t\r\n ").startswith(cdr._FORMULA_INJECTION_PREFIXES)
