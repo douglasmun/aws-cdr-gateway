@@ -123,8 +123,15 @@ hash-pinned `scripts/lambda-requirements.txt`, and produces a reproducible
 Expected tail: `>> Done: …/build/lambda.zip (12M)`. The same inputs always produce an
 identical zip (and therefore an identical `source_code_hash`). If it fails:
 - `'zip'/'python3' not found` — install the missing tool (the script preflights both).
-- A hash mismatch — a dependency version changed; regenerate the hashes in
-  `scripts/lambda-requirements.txt` (the file documents the command).
+- A hash mismatch — a dependency version changed; regenerate the hashes with
+  `python3 scripts/regen_lambda_requirements.py` (it reads the versions from
+  `src/requirements.txt` and rewrites `scripts/lambda-requirements.txt`).
+
+> **Bumping a dependency is a two-file change.** `src/requirements.txt` feeds the tests,
+> the container and local dev; `scripts/lambda-requirements.txt` is what actually ships to
+> Lambda. Editing only the former leaves the deployed artifact on the old version — how
+> `pikepdf`/`Pillow` silently fell two releases behind. Run the regen script after any bump;
+> CI (`scripts/check_lambda_requirements.py`) fails the build if the two disagree.
 
 ---
 
