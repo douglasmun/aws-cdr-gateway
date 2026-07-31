@@ -181,6 +181,12 @@ jobs:
             exit 1
           fi
 
+      - name: Check resource names, IAM and alarms match across both IaC paths
+        # The cap check above covers CDR_MAX_* only. Resource names, IAM grants and
+        # CloudWatch alarms drifted unguarded — 14 names reached SAM alone (#62/#63), and
+        # a missing alarm is silent by construction: nothing fires to tell you.
+        run: python scripts/check_iac_parity.py
+
   docker-build:
     # Build the local CDR service container image and verify it serves /healthz. Guards the
     # Dockerfile / local-service deps from rotting; the build is the real regression check
