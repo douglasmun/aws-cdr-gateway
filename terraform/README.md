@@ -71,8 +71,18 @@ cd terraform && tofu apply
 - **Bumping a dependency touches two files:** `src/requirements.txt` (tests, container,
   local dev) and `scripts/lambda-requirements.txt` (what ships). Edit the former, then run
   the regen script. `scripts/check_lambda_requirements.py` fails CI if they drift.
+- **This is a port of `src/template.yaml`, and CI keeps it one.** `scripts/check_iac_parity.py`
+  compares the `${prefix}-*` resource names, the Lambda role's IAM actions, and every
+  alarm's metric/namespace/threshold/comparison operator across both paths; a separate
+  step compares the `CDR_MAX_*` env vars. A change to one path is not a change to the
+  deployment — do it in both. Two asymmetries are deliberate and encoded in the script:
+  SAM creates the execution role, its inline policy and the EventBridge rule implicitly
+  (so there is no name to compare), and SAM's `S3WritePolicy` template grants ACL actions
+  this Terraform policy deliberately omits. Bucket settings, TLS policies, the
+  EventBridge pattern and Lambda tuning are still compared by hand.
 - **X-Ray:** active tracing is on by default; set `enable_xray_tracing = false` to disable
-  it (and its IAM grant).
+  it (and its IAM grant). SAM's `Tracing: Active` attaches the X-Ray policy automatically,
+  so Terraform spells those two actions out explicitly — same effective permission.
 - **Quarantine is optional:** leave `quarantine_bucket_name = ""` to skip the quarantine
   bucket and its IAM grant entirely (mirrors the SAM `QuarantineEnabled` condition).
 - **Provider lock:** `.terraform.lock.hcl` is committed and pins the exact AWS provider
