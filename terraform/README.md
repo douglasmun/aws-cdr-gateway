@@ -65,8 +65,12 @@ cd terraform && tofu apply
   `manylinux_2_28_x86_64` wheels (glibc 2.28; the Lambda runtime is Amazon Linux 2023 /
   glibc 2.34, so they run) — hash-pinned in `scripts/lambda-requirements.txt`. For an
   arm64 (Graviton) Lambda: change `PLATFORM` in `build.sh` to `manylinux_2_28_aarch64`,
-  **regenerate the hashes** in `lambda-requirements.txt` (the wheel sha256s differ per
-  platform — the file has the command), and set `lambda_architecture = "arm64"`.
+  **regenerate the hashes** with `python3 scripts/regen_lambda_requirements.py` (the wheel
+  sha256s differ per platform; set `PLATFORM` in that script to match), and set
+  `lambda_architecture = "arm64"`.
+- **Bumping a dependency touches two files:** `src/requirements.txt` (tests, container,
+  local dev) and `scripts/lambda-requirements.txt` (what ships). Edit the former, then run
+  the regen script. `scripts/check_lambda_requirements.py` fails CI if they drift.
 - **X-Ray:** active tracing is on by default; set `enable_xray_tracing = false` to disable
   it (and its IAM grant).
 - **Quarantine is optional:** leave `quarantine_bucket_name = ""` to skip the quarantine

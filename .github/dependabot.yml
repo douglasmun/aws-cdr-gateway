@@ -9,10 +9,24 @@ updates:
     commit-message:
       prefix: ci
 
-  # Surface CVE bumps for the Python deps. Note: build.sh installs from the hash-pinned
-  # scripts/lambda-requirements.txt; regenerate that file's hashes when bumping versions.
+  # Surface CVE bumps for the Python deps used by the tests, the container and local dev.
+  # A bump here is NOT deployed on its own: build.sh installs from the hash-pinned
+  # scripts/lambda-requirements.txt, so run `python3 scripts/regen_lambda_requirements.py`
+  # and commit the result. CI (check_lambda_requirements.py) fails if you forget.
   - package-ecosystem: pip
     directory: "/src"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+
+  # The hash-pinned set that actually ships to Lambda. Watched separately because
+  # Dependabot scans a single directory per entry — without this, the deployed artifact
+  # had no CVE surveillance at all and silently fell behind src/requirements.txt.
+  # Dependabot cannot regenerate the sha256 hashes itself, so treat its PRs here as an
+  # alert: rerun regen_lambda_requirements.py rather than merging the raw bump.
+  - package-ecosystem: pip
+    directory: "/scripts"
     schedule:
       interval: weekly
     commit-message:
