@@ -3693,3 +3693,243 @@ class TestResourceCapsRejectNotRetry:
 
     def test_aggregate_budget_default_fits_under_lambda_memory(self):
         assert cdr._MAX_TOTAL_ENTRY_BYTES <= 512 * 1024 * 1024
+
+
+class TestPillowDecoderAllowlist:
+    """Pitfall #47 — IMAGE_EXTS gates which *extensions* route into cdr_image, but
+    Image.open() picks its decoder by sniffing CONTENT. Without an explicit formats=
+    allowlist the extension constrains only the save format, leaving every plugin in
+    Pillow's registry reachable by naming a hostile file .png. Not a disarm bypass (output
+    is still re-encoded) but a native-code attack-surface amplification: the attacker
+    chooses which C decoder parses their bytes."""
+
+    # Formats Pillow can both write and read, none of them in IMAGE_EXTS.
+    UNINTENDED = ["PCX", "TGA", "SGI", "DDS", "PPM", "IM", "SPIDER"]
+
+    @staticmethod
+    def _encode(fmt: str) -> bytes | None:
+        buf = io.BytesIO()
+        try:
+            Image.new("RGB", (8, 8), (255, 0, 0)).save(buf, format=fmt)
+        except Exception:
+            return None  # plugin not writable in this Pillow build
+        return buf.getvalue()
+
+    @pytest.mark.parametrize("fmt", UNINTENDED)
+    def test_unintended_decoder_rejected_under_allowed_extension(self, fmt):
+        data = self._encode(fmt)
+        if data is None:
+            pytest.skip(f"{fmt} not writable in this Pillow build")
+        with pytest.raises(cdr.CdrReject):
+            cdr.cdr_image(data, "png")
+
+    @pytest.mark.parametrize("fmt", UNINTENDED)
+    def test_unintended_decoder_dispatches_to_rejected(self, fmt):
+        """The reject must surface as a deterministic 'rejected' disposition, not an
+        error — an error re-raises and burns the EventBridge retry budget on input that
+        fails identically every time."""
+        data = self._encode(fmt)
+        if data is None:
+            pytest.skip(f"{fmt} not writable in this Pillow build")
+        result = cdr.cdr_dispatch(data, "png")
+        assert result["status"] == "rejected"
+        assert result["delete_source"] is True
+
+    @pytest.mark.parametrize("ext,fmt", [
+        ("png", "PNG"), ("jpg", "JPEG"), ("jpeg", "JPEG"), ("tiff", "TIFF"),
+        ("webp", "WEBP"), ("gif", "GIF"), ("bmp", "BMP"),
+    ])
+    def test_all_intended_formats_still_decode(self, ext, fmt):
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 16), (0, 128, 255)).save(buf, format=fmt)
+        clean, report = cdr.cdr_image(buf.getvalue(), ext)
+        assert clean, f"{fmt} produced no output"
+        assert report["format"] == ext
+
+    def test_extension_content_mismatch_among_allowed_formats_tolerated(self):
+        """Deliberately NOT pinned to the declared extension: mismatch among the seven
+        allowed formats is common in legitimate files, and rejecting real business
+        documents is a production incident, not a security win."""
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 16), (255, 0, 0)).save(buf, format="TIFF")
+        clean, _ = cdr.cdr_image(buf.getvalue(), "png")
+        assert Image.open(io.BytesIO(clean)).format == "PNG"
+
+    def test_allowlist_matches_image_exts(self):
+        """_PILLOW_FORMATS and IMAGE_EXTS must not drift apart."""
+        mapped = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "bmp": "BMP",
+                  "tiff": "TIFF", "webp": "WEBP", "gif": "GIF"}
+        assert {mapped[e] for e in cdr.IMAGE_EXTS} == set(cdr._PILLOW_FORMATS)
+
+
+class TestPdfMagicGuard:
+    """Pitfall #47 — the Office path validates magic + structure before zlib touches
+    anything; PDF handed raw bytes straight to QPDF's C++ parser behind only the size cap."""
+
+    def test_non_pdf_bytes_rejected(self):
+        with pytest.raises(cdr.CdrReject):
+            cdr.cdr_pdf(b"NOTAPDF" * 200)
+
+    def test_non_pdf_dispatches_to_rejected(self):
+        result = cdr.cdr_dispatch(b"NOTAPDF" * 200, "pdf")
+        assert result["status"] == "rejected"
+        assert result["delete_source"] is True
+
+    def test_empty_input_rejected(self):
+        with pytest.raises(cdr.CdrReject):
+            cdr.cdr_pdf(b"")
+
+    def test_real_pdf_still_accepted(self):
+        clean, report = cdr.cdr_pdf(_make_pdf_with_js())
+        assert clean.startswith(b"%PDF-")
+        assert report["format"] == "pdf"
+
+    def test_header_within_first_1024_bytes_accepted(self):
+        """The spec allows the header at a small offset; the pdf.save() rebuild drops the
+        leading prefix anyway, so match the spec rather than requiring offset 0."""
+        prefixed = b"\n" * 200 + _make_pdf_with_js()
+        clean, _ = cdr.cdr_pdf(prefixed)
+        assert clean.startswith(b"%PDF-")
+
+    def test_header_beyond_1024_bytes_rejected(self):
+        with pytest.raises(cdr.CdrReject):
+            cdr.cdr_pdf(b"\x00" * 2048 + _make_pdf_with_js())
+
+
+class TestIccProfilePurged:
+    """Pitfall #48 — the PNG and TIFF encoders pull `icc_profile` from the image's info
+    dict (which survives .convert()/.copy()) and re-embed it unless explicitly overridden.
+    An attacker-supplied ICC blob rode through a "sanitised" image while report["removed"]
+    claimed it had been stripped: a sanitisation failure AND a false audit record. ICC is
+    arbitrary-length attacker-controlled data and a historical CMS-parser RCE surface."""
+
+    @staticmethod
+    def _icc() -> bytes:
+        from PIL import ImageCms
+        return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+    @pytest.mark.parametrize("ext,fmt", [
+        ("png", "PNG"), ("tiff", "TIFF"), ("jpg", "JPEG"),
+        ("webp", "WEBP"), ("gif", "GIF"),
+    ])
+    def test_icc_stripped_single_frame(self, ext, fmt):
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 16), (255, 0, 0)).save(buf, format=fmt, icc_profile=self._icc())
+        clean, report = cdr.cdr_image(buf.getvalue(), ext)
+        assert not Image.open(io.BytesIO(clean)).info.get("icc_profile"), \
+            f"ICC profile survived re-encode for .{ext}"
+
+    @pytest.mark.parametrize("ext,fmt", [("tiff", "TIFF"), ("gif", "GIF"), ("webp", "WEBP")])
+    def test_icc_stripped_multi_frame(self, ext, fmt):
+        frames = [Image.new("RGB", (16, 16), (c, 0, 0)) for c in (255, 128, 0)]
+        buf = io.BytesIO()
+        frames[0].save(buf, format=fmt, save_all=True, append_images=frames[1:],
+                       icc_profile=self._icc())
+        clean, report = cdr.cdr_image(buf.getvalue(), ext)
+        assert not Image.open(io.BytesIO(clean)).info.get("icc_profile"), \
+            f"ICC profile survived multi-frame re-encode for .{ext}"
+
+    def test_removed_report_is_truthful_for_png(self):
+        """The report claimed ICC removal while the profile was still embedded — the
+        audit record must not assert something the output contradicts."""
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 16), (255, 0, 0)).save(buf, format="PNG", icc_profile=self._icc())
+        clean, report = cdr.cdr_image(buf.getvalue(), "png")
+        if "ICC profile" in report["removed"]:
+            assert not Image.open(io.BytesIO(clean)).info.get("icc_profile")
+
+
+def _relocate_xlsb_sheet(orig: bytes, new_part: str) -> tuple[bytes, bytes]:
+    """Move an xlsb's worksheet binary to `new_part` and repoint the workbook rel at it.
+
+    Returns (crafted_xlsb, original_sheet_bytes) so a test can assert the BIFF12 bytes did
+    not survive into the output."""
+    src = zipfile.ZipFile(io.BytesIO(orig))
+    names = src.namelist()
+    sheet = [n for n in names if n.startswith("xl/worksheets/") and n.endswith(".bin")][0]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as out:
+        for n in names:
+            d = src.read(n)
+            if n == sheet:
+                out.writestr(new_part, d)
+            elif n.endswith(".rels") and b"worksheets" in d:
+                out.writestr(n, d.replace(b"worksheets/sheet1.bin",
+                                          new_part[len("xl/"):].encode()))
+            else:
+                out.writestr(n, d)
+    return buf.getvalue(), src.read(sheet)
+
+
+class TestXlsbSheetResolvedViaRels:
+    """Pitfall #49 — dispatch to cdr_xlsb() was keyed on the hardcoded part name
+    `xl/worksheets/sheet*.bin`, but OPC part names are arbitrary: a real parser (pyxlsb
+    included) follows the rel Target. Relocating the sheet binary skipped conversion
+    entirely and passed raw BIFF12 records (FORMULA / DDE / OLEOBJECT / DEFINEDNAME)
+    byte-for-byte into the sanitised bucket — a full CDR bypass."""
+
+    def test_relocated_sheet_still_converted(self):
+        craft, sheet_bytes = _relocate_xlsb_sheet(_make_xlsb([[42]]), "xl/binparts/data1.bin")
+        clean, report = cdr.cdr_office(craft, "xlsb")
+        assert report["converted_to"] == "xlsx", "relocated sheet skipped cdr_xlsb conversion"
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            survived = [n for n in z.namelist()
+                        if n.endswith(".bin") and z.read(n) == sheet_bytes]
+        assert not survived, f"raw BIFF12 bytes passed through in {survived}"
+
+    def test_relocated_sheet_values_preserved(self):
+        """Conversion must still extract the cell values, not silently produce an empty
+        workbook that would look like a successful sanitise."""
+        craft, _ = _relocate_xlsb_sheet(_make_xlsb([[42]]), "xl/binparts/data1.bin")
+        clean, _ = cdr.cdr_office(craft, "xlsb")
+        wb = openpyxl.load_workbook(io.BytesIO(clean))
+        assert wb[wb.sheetnames[0]]["A1"].value == 42
+
+    @pytest.mark.parametrize("part", ["xl/evil.bin", "xl/a/b/c.bin"])
+    def test_unresolvable_relocation_is_deterministic_reject(self, part):
+        """pyxlsb reconstructs the sheet path as xl/{first}/{last}, so some relocations
+        are unreadable. That must surface as CdrReject (quarantine), not a generic error
+        that re-raises and burns the EventBridge retry budget on identical-failing input."""
+        craft, _ = _relocate_xlsb_sheet(_make_xlsb([[42]]), part)
+        with pytest.raises(cdr.CdrReject):
+            cdr.cdr_office(craft, "xlsb")
+
+    @pytest.mark.parametrize("part", ["xl/evil.bin", "xl/a/b/c.bin"])
+    def test_unresolvable_relocation_dispatches_to_rejected(self, part):
+        craft, _ = _relocate_xlsb_sheet(_make_xlsb([[42]]), part)
+        result = cdr.cdr_dispatch(craft, "xlsb")
+        assert result["status"] == "rejected"
+        assert result["delete_source"] is True
+
+    def test_normal_xlsb_unaffected(self):
+        clean, report = cdr.cdr_office(_make_xlsb([[42]]), "xlsb")
+        assert report["converted_to"] == "xlsx"
+
+    def test_vba_only_xlsb_still_uses_zip_path(self):
+        """Documented invariant: an xlsb with no sheet binary must NOT be diverted to
+        conversion (checklist-and-invariants.md). The rels-based resolver must not widen
+        the trigger to every .bin part."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", _minimal_content_types())
+            z.writestr("_rels/.rels", _minimal_rels())
+            z.writestr("xl/vbaProject.bin", b"\xd0\xcf\x11\xe0MACRO_BINARY")
+        clean, report = cdr.cdr_office(buf.getvalue(), "xlsb")
+        assert report.get("converted_to") is None
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            assert not any("vbaproject.bin" in n.lower() for n in z.namelist())
+
+    def test_external_rel_target_ignored(self):
+        """An http:// Target is never a local part; it must not be treated as a sheet."""
+        orig = _make_xlsb([[42]])
+        src = zipfile.ZipFile(io.BytesIO(orig))
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as out:
+            for n in src.namelist():
+                d = src.read(n)
+                if n.endswith(".rels") and b"worksheets" in d:
+                    d = d.replace(b'Target="worksheets/sheet1.bin"',
+                                  b'Target="http://attacker.example/sheet1.bin"')
+                out.writestr(n, d)
+        with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as z:
+            assert cdr._xlsb_worksheet_parts(z, cdr._DecompressionBudget()) == set()
