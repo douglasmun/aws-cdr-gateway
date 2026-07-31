@@ -78,8 +78,12 @@ cd terraform && tofu apply
   deployment — do it in both. Two asymmetries are deliberate and encoded in the script:
   SAM creates the execution role, its inline policy and the EventBridge rule implicitly
   (so there is no name to compare), and SAM's `S3WritePolicy` template grants ACL actions
-  this Terraform policy deliberately omits. Bucket settings, TLS policies, the
-  EventBridge pattern and Lambda tuning are still compared by hand.
+  this Terraform policy deliberately omits. It also compares each bucket's
+  encryption/versioning/public-access-block/EventBridge settings and the
+  `DenyInsecureTransport` policy on every bucket — the TLS check is an absolute, so
+  dropping it from both paths still fails. Only the EventBridge *pattern* contents and
+  Lambda tuning (memory/timeout/concurrency) are still compared by hand, since those are
+  legitimately tunable per environment.
 - **X-Ray:** active tracing is on by default; set `enable_xray_tracing = false` to disable
   it (and its IAM grant). SAM's `Tracing: Active` attaches the X-Ray policy automatically,
   so Terraform spells those two actions out explicitly — same effective permission.
