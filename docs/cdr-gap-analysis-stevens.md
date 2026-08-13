@@ -94,9 +94,18 @@ rel are on the strip lists (CLAUDE.md pitfalls #31, #39 cover the part-and-rel r
   action names, encrypted-empty-password disarm, and unknown-password fail-closed are pinned
   by `TestStevensGapRegressions` so a future pikepdf change can't silently regress them.
 
-**Verdict: no open PDF residuals.** Every technique pdfid enumerates is neutralised —
-including the parser-defeating ones (ObjStm, name obfuscation) and the decoder-RCE filters
-(JBIG2/JPX) — and all are now regression-tested.
+**Verdict: no open PDF residuals _within pdfid's enumeration_.** Every technique pdfid
+enumerates is neutralised — including the parser-defeating ones (ObjStm, name obfuscation)
+and the decoder-RCE filters (JBIG2/JPX) — and all are now regression-tested.
+
+> **Scope warning.** This verdict is bounded by what pdfid looks for. It is *not* a
+> statement that the PDF path has no gaps. A later pass against the
+> [jonaslejon/malicious-pdf](https://github.com/jonaslejon/malicious-pdf) taxonomy found
+> three live vectors that pdfid does not enumerate and this document therefore missed:
+> catalog `/Threads`, `/FontMatrix` JS injection (CVE-2024-4367), and UNC paths in stream
+> `/F` external file specs. All three are now fixed and pinned by
+> `TestMaliciousPdfTaxonomyGaps`. Treat a clean bill of health here as "clean against this
+> one toolkit", and re-audit against a new taxonomy rather than reading it as coverage.
 
 ---
 
@@ -162,7 +171,7 @@ MHTML-imported-via-altChunk — are respectively fail-closed and explicitly neut
 | Area | Coverage | Residual |
 |---|---|---|
 | OLE2 / VBA (`oledump`) | ✅ reject container / drop part | none |
-| PDF active content (`pdfid`/`pdf-parser`) | ✅ all enumerated vectors neutralised, incl. ObjStm + name-obfuscation + JBIG2/JPX decoder filters **[verified, regression-tested]** | none open |
+| PDF active content (`pdfid`/`pdf-parser`) | ✅ all enumerated vectors neutralised, incl. ObjStm + name-obfuscation + JBIG2/JPX decoder filters **[verified, regression-tested]** | none open *within pdfid's enumeration* — see the scope warning above; `/Threads`, `/FontMatrix`, and UNC stream `/F` were found later via a different taxonomy |
 | ZIP/OOXML structure (`zipdump`) | ✅ all structural anomalies hard-rejected; rebuild-not-rewrite | nested/opaque content inside unknown parts (low, deferred); ZIP-polyglot append — confirm rebuild drops it |
 | MHTML/ActiveMime (`emldump`) | ✅ altChunk neutralised + standalone fail-closed | none |
 

