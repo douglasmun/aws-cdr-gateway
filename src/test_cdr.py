@@ -3612,6 +3612,62 @@ class TestMaliciousPdfTaxonomyGaps:
         assert b"attacker.invalid" not in clean, "UNC image /F survived CDR"
         assert any("external file ref" in r for r in report["removed"])
 
+    def _image_xobject(self, pdf, **extra):
+        obj = pdf.make_stream(b"\x00")
+        obj[pikepdf.Name("/Type")] = pikepdf.Name("/XObject")
+        obj[pikepdf.Name("/Subtype")] = pikepdf.Name("/Image")
+        obj[pikepdf.Name("/Width")] = 1
+        obj[pikepdf.Name("/Height")] = 1
+        obj[pikepdf.Name("/BitsPerComponent")] = 8
+        obj[pikepdf.Name("/ColorSpace")] = pikepdf.Name("/DeviceGray")
+        for key, value in extra.items():
+            obj[pikepdf.Name(key)] = value
+        return obj
+
+    def test_image_alternates_external_ref_removed(self):
+        # /Alternates holds replacement images the viewer may fetch instead of the
+        # embedded one — the same fetch-on-open shape as /F, one level of indirection out.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        alternate = self._image_xobject(pdf, **{"/F": pikepdf.String(self.UNC)})
+        base = self._image_xobject(pdf, **{"/Alternates": pikepdf.Array([
+            pikepdf.Dictionary(Image=pdf.make_indirect(alternate),
+                               DefaultForPrinting=True)])})
+        pdf.pages[0].Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=base))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        raw = buf.getvalue()
+        assert b"attacker.invalid" in raw  # precondition
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"attacker.invalid" not in clean, "/Alternates external ref survived CDR"
+        assert any("/Alternates" in r for r in report["removed"])
+
+    @pytest.mark.parametrize("subtype,extra", [
+        ("/Image", {}),
+        ("/Form", {"/BBox": [0, 0, 9, 9]}),
+    ])
+    def test_opi_external_ref_removed(self, subtype, extra):
+        # /OPI (Open Prepress Interface) names a high-resolution replacement to fetch at
+        # print time — a UNC target here is the same NTLM leak as /F.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        obj = pdf.make_stream(b"q Q\n")
+        obj[pikepdf.Name("/Type")] = pikepdf.Name("/XObject")
+        obj[pikepdf.Name("/Subtype")] = pikepdf.Name(subtype)
+        for key, value in extra.items():
+            obj[pikepdf.Name(key)] = pikepdf.Array(value)
+        obj[pikepdf.Name("/OPI")] = pikepdf.Dictionary(**{
+            "/2.0": pikepdf.Dictionary(Type=pikepdf.Name("/OPI"),
+                                       F=pikepdf.String(self.UNC))})
+        pdf.pages[0].Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(X0=obj))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        raw = buf.getvalue()
+        assert b"attacker.invalid" in raw  # precondition
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"attacker.invalid" not in clean, f"/OPI ref survived CDR on {subtype}"
+        assert any("/OPI" in r for r in report["removed"])
+
     def test_clean_pdf_reports_no_external_ref_removal(self):
         pdf = pikepdf.Pdf.new()
         pdf.add_blank_page()
@@ -3665,6 +3721,105 @@ class TestMaliciousPdfTaxonomyGaps:
         assert any("annot/A" in r for r in report["removed"])
         with pikepdf.open(io.BytesIO(clean)) as p:
             assert len(p.pages) == 1
+
+
+class TestAnnotationActionCoverageClaims:
+    """Pin the action types claimed as covered by the *unconditional* annotation
+    `/A`//`/AA` delete in `_strip_pdf_page`, rather than by any per-type denylist.
+
+    These were asserted as "already handled" while auditing the malicious-pdf taxonomy —
+    read off the code, not executed. That is precisely the reasoning that produced two
+    wrong claims in the same review (the `/Thread` coverage boundary, and a `/FontMatrix`
+    sweep gated on an attacker-controlled `/Subtype`), so each is now executed. All pass
+    against the current code: these are lock-in tests, not bug reports. Their value is
+    that a future refactor narrowing the sweep back to a denylist fails here loudly —
+    which is the exact regression pitfall #26 warns about."""
+
+    def _pdf_with_annot_action(self, action: dict) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        annot = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Annot"), Subtype=pikepdf.Name("/Link"),
+            Rect=pikepdf.Array([0, 0, 9, 9]),
+            A=pikepdf.Dictionary(**action),
+        ))
+        pdf.pages[0].obj["/Annots"] = pikepdf.Array([annot])
+        buf = io.BytesIO()
+        pdf.save(buf, compress_streams=False)
+        return buf.getvalue()
+
+    @pytest.mark.parametrize("label,action,marker", [
+        ("/GoToE", {"S": pikepdf.Name("/GoToE"),
+                    "F": pikepdf.String("GOTOEMARK")}, b"GOTOEMARK"),
+        ("/Rendition", {"S": pikepdf.Name("/Rendition"), "OP": 0,
+                        "JS": pikepdf.String("RENDITIONMARK")}, b"RENDITIONMARK"),
+        ("/SetOCGState", {"S": pikepdf.Name("/SetOCGState"),
+                          "State": pikepdf.Array([pikepdf.Name("/OFF"),
+                                                  pikepdf.String("OCGMARK")])}, b"OCGMARK"),
+        ("/ImportData", {"S": pikepdf.Name("/ImportData"),
+                         "F": pikepdf.String("IMPORTMARK")}, b"IMPORTMARK"),
+        ("/Launch", {"S": pikepdf.Name("/Launch"),
+                     "F": pikepdf.String("LAUNCHMARK")}, b"LAUNCHMARK"),
+        ("/SubmitForm", {"S": pikepdf.Name("/SubmitForm"), "Flags": 4,
+                         "F": pikepdf.String("SUBMITMARK")}, b"SUBMITMARK"),
+        ("/URI", {"S": pikepdf.Name("/URI"),
+                  "URI": pikepdf.String("http://URIMARK.invalid")}, b"URIMARK"),
+        ("/GoToR", {"S": pikepdf.Name("/GoToR"),
+                    "F": pikepdf.String("GOTORMARK")}, b"GOTORMARK"),
+    ])
+    def test_annotation_action_type_removed(self, label, action, marker):
+        raw = self._pdf_with_annot_action(action)
+        assert marker in raw, f"fixture invalid: {label} marker not in input"
+        clean, report = cdr.cdr_pdf(raw)
+        assert marker not in clean, f"{label} annotation action survived CDR"
+        assert any("annot/A" in r for r in report["removed"])
+
+    def test_chained_next_action_removed(self):
+        # An action can carry a /Next follow-on chain; deleting the whole /A takes the
+        # chain with it, which a per-type denylist walking only /S would miss.
+        raw = self._pdf_with_annot_action({
+            "S": pikepdf.Name("/URI"),
+            "URI": pikepdf.String("http://first.invalid"),
+            "Next": pikepdf.Dictionary(S=pikepdf.Name("/JavaScript"),
+                                       JS=pikepdf.String("NEXTCHAINMARK")),
+        })
+        assert b"NEXTCHAINMARK" in raw  # precondition
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"NEXTCHAINMARK" not in clean, "/Next action chain survived CDR"
+        assert any("annot/A" in r for r in report["removed"])
+
+    def test_catalog_additional_action_removed(self):
+        # Document-level /AA (e.g. /WC will-close) is separate from page and annot /AA.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.Root["/AA"] = pikepdf.Dictionary(
+            WC=pikepdf.Dictionary(S=pikepdf.Name("/JavaScript"),
+                                  JS=pikepdf.String("CATALOGAAMARK")))
+        buf = io.BytesIO()
+        pdf.save(buf, compress_streams=False)
+        raw = buf.getvalue()
+        assert b"CATALOGAAMARK" in raw  # precondition
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"CATALOGAAMARK" not in clean, "catalog /AA survived CDR"
+        assert "/AA" in report["removed"]
+
+    def test_xfa_as_stream_array_removed(self):
+        # /XFA is commonly an array of [name, stream] pairs rather than a single stream.
+        # compress_streams=False so the payload is greppable in the input — otherwise the
+        # precondition silently passes on a deflated stream and the test proves nothing.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        xfa = pdf.make_stream(b"<xdp><script>XFASTREAMMARK</script></xdp>")
+        pdf.Root["/AcroForm"] = pikepdf.Dictionary(
+            Fields=pikepdf.Array([]),
+            XFA=pikepdf.Array([pikepdf.String("form"), pdf.make_indirect(xfa)]))
+        buf = io.BytesIO()
+        pdf.save(buf, compress_streams=False)
+        raw = buf.getvalue()
+        assert b"XFASTREAMMARK" in raw  # precondition
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"XFASTREAMMARK" not in clean, "XFA stream array survived CDR"
+        assert "AcroForm/XFA" in report["removed"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
