@@ -1,0 +1,36 @@
+%PDF-1.3
+%¿÷¢þ
+1 0 obj
+<< /OpenAction << /D (thread-dest) /F (http://cdr.invalid/thread-fetch) /S /Thread >> /Pages 2 0 R /Threads [ 3 0 R ] /Type /Catalog >>
+endobj
+2 0 obj
+<< /Count 1 /Kids [ 4 0 R ] /Type /Pages >>
+endobj
+3 0 obj
+<< /F 5 0 R /I << /Author (http://cdr.invalid/thread-callback) /Title (CDR Test: thread bead) >> /Type /Thread >>
+endobj
+4 0 obj
+<< /Contents 6 0 R /MediaBox [ 0 0 612 792 ] /Parent 2 0 R /Resources << >> /Type /Page >>
+endobj
+5 0 obj
+<< /R [ 0 0 100 100 ] /Type /Bead >>
+endobj
+6 0 obj
+<< /Length 0 /Filter /FlateDecode >>
+stream
+
+endstream
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000166 00000 n 
+0000000225 00000 n 
+0000000354 00000 n 
+0000000460 00000 n 
+0000000512 00000 n 
+trailer << /Root 1 0 R /Size 7 /ID [<a40e6c7837d55d641cfefa3d4765bd8f><a40e6c7837d55d641cfefa3d4765bd8f>] >>
+startxref
+582
+%%EOF

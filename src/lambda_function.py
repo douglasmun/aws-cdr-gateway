@@ -31,6 +31,7 @@ Environment variables:
   CDR_MAX_IMAGE_PIXELS decompression-bomb pixel cap for cdr_image (default 40000000 = 40 MP)
 """
 
+import decimal
 import html
 import io
 import json
@@ -1318,8 +1319,9 @@ def cdr_pdf(data: bytes) -> tuple[bytes, dict]:
     """Disarm a PDF with pikepdf: remove catalog-level active content (``/OpenAction``,
     ``/AA``, JavaScript, ``/Names./EmbeddedFiles``), sweep AcroForm fields and root, walk
     pages (all annotation ``/A``/``/AA``, ``/FileAttachment`` file specs, multimedia
-    subtypes) and the outline tree, then re-serialise via ``pdf.save()`` — which also
-    drops any appended/polyglot bytes.
+    subtypes) and the outline tree, drop article threads, external stream file refs and
+    malformed Type3 ``/FontMatrix`` values, then re-serialise via ``pdf.save()`` — which
+    also drops any appended/polyglot bytes.
 
     Returns ``(clean_bytes, {"format": "pdf", "removed": [...]})``.
     """
@@ -1363,7 +1365,10 @@ def cdr_pdf(data: bytes) -> tuple[bytes, dict]:
             removed.extend(_strip_pdf_page(page, page_num))
 
         removed.extend(_strip_pdf_outlines(catalog))
+        removed.extend(_strip_pdf_threads(catalog))
         removed.extend(_neutralise_pdf_risky_image_filters(pdf))
+        removed.extend(_strip_pdf_external_stream_refs(pdf))
+        removed.extend(_strip_pdf_fontmatrix(pdf))
 
         if "/Metadata" in catalog:
             del catalog["/Metadata"]
@@ -1522,6 +1527,117 @@ def _reject_inline_risky_images(pdf) -> list[str]:
                         f"page[{page_num}] annot[{annot_num}] appearance {ap_key}",
                     )
     return []
+
+
+# A stream's /F key is an *external file specification*: the viewer fetches the stream's
+# data from that path instead of using the embedded bytes. Pointed at a UNC share
+# (\\host\share) it leaks NTLM credentials on open, with no action object anywhere in the
+# file — so the unconditional annotation /A//AA sweep never sees it. Same trick as the
+# Office-path UNC handling (see the WEBSERVICE/HYPERLINK notes above), different container.
+# /Alternates and /OPI are the same fetch-on-open shape for image XObjects.
+_EXTERNAL_STREAM_REF_KEYS = ("/F", "/Alternates", "/OPI")
+
+
+def _strip_pdf_external_stream_refs(pdf) -> list[str]:
+    """Delete external-file references from every stream object.
+
+    A stream carrying ``/F`` (plus its ``/FDecodeParms``/``/FFilter`` companions) fetches
+    its data from that path on open. The dangerous case is a UNC or remote URL; we do not
+    try to distinguish "safe" local paths, because a CDR output should be self-contained by
+    construction — an embedded stream that needs an external fetch is already outside what
+    we are willing to pass through. The stream's own bytes are left intact, so a legitimate
+    file simply renders from the data it already carries."""
+    removed: list[str] = []
+    for obj in pdf.objects:
+        if not isinstance(obj, pikepdf.Stream):
+            continue
+        # Per-key try, not per-stream: a single malformed key must not abort the sweep of
+        # the remaining keys on the same stream and leave a live /F behind.
+        for key in _EXTERNAL_STREAM_REF_KEYS:
+            try:
+                if key not in obj:
+                    continue
+                del obj[key]
+                # /FDecodeParms and /FFilter only have meaning alongside /F; leaving
+                # them behind would be harmless but incoherent.
+                if key == "/F":
+                    for companion in ("/FDecodeParms", "/FFilter"):
+                        if companion in obj:
+                            del obj[companion]
+                removed.append(f"stream external file ref {key}")
+            except Exception as exc:
+                logger.debug("Skipped %s during external-ref sweep: %s", key, exc)
+    return removed
+
+
+_DEFAULT_FONT_MATRIX = [0.001, 0, 0, 0.001, 0, 0]
+
+
+def _is_pdf_number(element) -> bool:
+    """True only for a genuine PDF numeric object.
+
+    ``bool`` is deliberately excluded: it is a subclass of ``int`` in Python, so a naive
+    ``isinstance(x, int)`` accepts a PDF boolean — which serialises as the *token* ``true``
+    and is exactly the kind of non-numeric element that reaches a viewer's string
+    interpolation. pikepdf hands back ``Decimal`` for reals and ``int`` for integers."""
+    if isinstance(element, bool):
+        return False
+    return isinstance(element, (int, float, decimal.Decimal))
+
+
+def _strip_pdf_fontmatrix(pdf) -> list[str]:
+    """Normalise every malformed ``/FontMatrix`` to the spec default.
+
+    CVE-2024-4367: PDF.js interpolated ``/FontMatrix`` entries straight into generated
+    JavaScript, so a non-numeric element (a string) broke out and ran arbitrary JS in the
+    viewer. The array is *font geometry* — it has no business holding anything but six
+    numbers, and a malformed one cannot be "cleaned" element-wise without guessing intent,
+    so it gets the spec default ``[0.001 0 0 0.001 0 0]``. Glyphs may render at the wrong
+    scale, which is the correct trade for a file that was already lying about its geometry.
+
+    Deliberately NOT gated on ``/Subtype == /Type3``. The vulnerable sink parses the array
+    wherever it finds it, and ``/Subtype`` is attacker-controlled — gating on it lets a
+    payload through by simply relabelling the font (or omitting ``/Subtype`` entirely).
+    Any dictionary carrying a ``/FontMatrix`` is checked; a well-formed one is untouched,
+    so the broader scope costs nothing on legitimate files."""
+    removed: list[str] = []
+    for obj in pdf.objects:
+        if not isinstance(obj, pikepdf.Dictionary):
+            continue
+        try:
+            if "/FontMatrix" not in obj:
+                continue
+            matrix = obj["/FontMatrix"]
+            numeric = True
+            try:
+                if len(matrix) != 6:
+                    numeric = False
+                else:
+                    for element in matrix:
+                        if not _is_pdf_number(element):
+                            numeric = False
+                            break
+            except TypeError:
+                numeric = False  # not even an array — spec-violating
+            if numeric:
+                continue
+            obj["/FontMatrix"] = pikepdf.Array(_DEFAULT_FONT_MATRIX)
+            removed.append("/FontMatrix (non-numeric, reset to default)")
+        except Exception as exc:
+            logger.debug("Skipped object during /FontMatrix sweep: %s", exc)
+    return removed
+
+
+def _strip_pdf_threads(catalog) -> list[str]:
+    """Drop the document's article-thread structure (``/Threads``).
+
+    Thread beads carry ``/I`` info dictionaries and file specs that survive every other
+    sweep (they hang off the catalog, not a page, an annotation, or an action). Threads are
+    a navigation nicety with no rendering role, so removing the array wholesale is safe."""
+    if "/Threads" not in catalog:
+        return []
+    del catalog["/Threads"]
+    return ["/Threads"]
 
 
 def _strip_pdf_page(page, page_num: int) -> list[str]:
