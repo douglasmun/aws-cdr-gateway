@@ -2,6 +2,17 @@
 
 > Extracted from CLAUDE.md. Authoritative testing reference; CLAUDE.md points here.
 
+> **What a green suite does not prove.** Every assertion here is evaluated by **pikepdf,
+> python-docx, openpyxl and Pillow**. The bug class this project keeps hitting (#49, #54, #55)
+> *is* parser disagreement — a real consumer resolving a part differently than the test parser
+> does — so the oracle shares a blind spot with the code under test. As of 2026-08-14 the PDF
+> paths are independently confirmed against **mupdf, poppler and pdf.js**, the Office paths
+> against **LibreOffice headless**, and the deployed pipeline against a **live AWS staging
+> stack**. **Word, Excel and PowerPoint themselves are still unverified**, and both confirmed
+> live bypasses (#54, #55) lived there. A headless render never *executes* a DDE field, so a
+> clean conversion shows structural absence, not that an interactive viewer declines to
+> prompt. See `docs/viewer-validation/CHECKLIST.md`.
+
 Tests (386 in `test_cdr.py` + 50 in `test_cdr_local.py` = **436 total**) construct malicious fixtures entirely in-memory — no fixture files on disk. S3/SNS calls are patched with `unittest.mock`. Required env vars are set automatically via `os.environ.setdefault`. `src/test_cdr.py` covers the CDR Lambda; `src/test_cdr_local.py` covers the pure `cdr_dispatch` core and the local FastAPI service (`app.py`), reusing the same in-memory fixtures. Run: `cd src && pytest test_cdr.py test_cdr_local.py -v`.
 
 > **Run it bare — do not export AWS env vars around it.** `src/conftest.py` sets the

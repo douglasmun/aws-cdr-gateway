@@ -6,6 +6,15 @@
 
 Run this checklist before considering any change complete. Each item maps to a class of bug that has already been found in this codebase.
 
+> **Before calling a security change "verified":** the suite's oracle is pikepdf/python-docx/
+> openpyxl/Pillow, and parser disagreement is this project's recurring bug class — so a green
+> run is necessary, not sufficient. For a change to Office part resolution or PDF object
+> handling, confirm the sanitised output with an engine *outside* that family
+> (`soffice --headless --convert-to`, `mutool show <f> grep`, `pdfinfo`) and, when a sweep
+> comes back entirely clean, re-run the same probe against the malicious input as a positive
+> control — a silent probe bug is indistinguishable from a clean result. See
+> `docs/viewer-validation/CHECKLIST.md`.
+
 ### Security invariants — verify nothing was weakened
 
 - [ ] **`_read_zip_entry_safe` still present** — no bare `src.read(name)` calls in `cdr_office()`. The chunked counter is defence-in-depth against zip bombs even if `BadZipFile` would catch most cases.
