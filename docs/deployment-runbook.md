@@ -73,6 +73,27 @@ Expected output ends with `Build Succeeded`. If it fails:
 - `ModuleNotFoundError` — check `src/requirements.txt` pins; run `pip install -r requirements.txt` locally to verify
 - `Template format error` — validate with `sam validate`
 
+> **The package includes the test and local-service files — this is known and accepted.**
+> `template.yaml` uses `CodeUri: ./`, so `sam build` bundles all of `src/`: `app.py`,
+> `conftest.py`, `test_cdr.py`, `test_cdr_local.py`, `requirements-dev.txt` and
+> `requirements-local.txt` ship alongside `lambda_function.py`. Measured 2026-08-14 at
+> **296 KB of a 66.8 MB package (0.43%)**, far from Lambda's 250 MB limit. None of it is
+> reachable: `Handler` is pinned to `lambda_function.handler`, and fastapi/uvicorn/
+> starlette/pytest are absent from the package, so `app.py` and the test modules raise
+> `ModuleNotFoundError` if anything tries to import them.
+>
+> **Do not "fix" this with a `.samignore`** — SAM CLI 1.163.0's Python builder does not
+> honour one. Verified empirically: adding the file and rebuilding from clean changed
+> nothing. (`sam build -x/--exclude` excludes whole *resources*, not files.) The two
+> approaches that do work are `Metadata: BuildMethod: makefile` on the function, or
+> repointing `CodeUri` at a runtime-only subdirectory. Both were rejected as a worse
+> trade than 296 KB: the makefile route replaces SAM's tested dependency install with a
+> hand-written step that must reproduce the hash-pinned `scripts/lambda-requirements.txt`
+> exactly (a naive version built from `src/requirements.txt` instead and came out **16 MB
+> larger**, with 65 stray `__pycache__` directories), and `CodeUri` retargeting breaks the
+> `import lambda_function` co-location that `app.py` and both test modules depend on.
+> Revisit only if package size becomes a real constraint.
+
 ---
 
 ## 2A. First deploy — SAM (guided)
