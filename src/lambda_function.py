@@ -602,6 +602,41 @@ def _postscript_override_parts(ct_xml: bytes) -> set[str]:
     return parts
 
 
+def _xml_override_parts(ct_xml: bytes) -> set[str]:
+    """Return the normalised part names that ``[Content_Types].xml`` declares as XML via an
+    ``Override``, whatever their filename suffix.
+
+    Same authority argument as ``_postscript_override_parts``, applied to the XML macro
+    scrub: a real OOXML consumer locates the main document part by following the package
+    relationship and reads it as XML because the *content type* says so — the ``.xml``
+    suffix is a convention, not the binding. Dispatching the scrub on ``name.endswith
+    (".xml")`` therefore missed a document part stored as ``word/document.bin`` with an
+    Override declaring the wordprocessingml content type: python-docx opened the sanitised
+    output and still saw the live payload, while ``removed`` was empty (pitfall #54).
+
+    Returns an empty set on unparseable XML — the suffix rule remains the backstop."""
+    parts: set[str] = set()
+    _reject_xml_doctype(ct_xml, "[Content_Types].xml")
+    try:
+        root = ET.fromstring(ct_xml)
+    except ET.ParseError:
+        return parts
+    ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+    for child in root:
+        if child.tag != f"{{{ns}}}Override":
+            continue
+        ct = child.get("ContentType", "").lower()
+        # Any content type whose media subtype is XML — "+xml" covers the OOXML family
+        # (…wordprocessingml.document.main+xml, …drawing+xml, …), "text/xml" and
+        # "application/xml" cover the plain forms.
+        if not (ct.endswith("+xml") or ct in ("text/xml", "application/xml")):
+            continue
+        pn = child.get("PartName", "").replace("\\", "/").lstrip("/").lower()
+        if pn:
+            parts.add(pn)
+    return parts
+
+
 # Relationship types (local name) whose Target is a sheet part. `xlBinaryIndex` is the
 # type xlsb actually uses for its BIFF12 sheet binaries; the rest are the OOXML sheet
 # types, included so a package that binds a .bin under a conventional sheet rel is caught
@@ -681,14 +716,20 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
         # Pre-pass: resolve which parts [Content_Types].xml declares as PostScript via an
         # Override on an arbitrary PartName. infolist() order is not guaranteed, so this
         # must run before the main loop to drop such parts wherever they appear.
+        # The same pre-pass also resolves parts declared XML by an Override, so the macro
+        # scrub below dispatches on the declared content type as well as the suffix.
         ps_parts: set[str] = set()
+        xml_parts: set[str] = set()
         for item in src.infolist():
             if item.filename.replace("\\", "/").lower() == "[content_types].xml":
                 try:
-                    ps_parts = _postscript_override_parts(
-                        _read_zip_entry_safe(src, item, budget))
+                    ct_raw = _read_zip_entry_safe(src, item, budget)
+                    ps_parts = _postscript_override_parts(ct_raw)
+                    xml_parts = _xml_override_parts(ct_raw)
                 except ValueError:
-                    ps_parts = set()  # bomb-guard trip; suffix rule remains the backstop
+                    # Bomb-guard trip; suffix rules remain the backstop.
+                    ps_parts = set()
+                    xml_parts = set()
                 break
 
         # Pitfall #49: resolve xlsb worksheet parts from the workbook relationships, not
@@ -764,7 +805,15 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
                 #    action attributes (onClick/onAction) and field-code carriers the
                 #    scrub targets, and it is the classic home of the OLE-object shape.
                 #    Matching only ".xml" left every vmlDrawing*.vml part unscrubbed.
-                elif name_lower.endswith(".xml") or name_lower.endswith(".vml"):
+                #    The Override-declared set is consulted alongside the suffix because
+                #    OPC binds a content type to an exact PartName irrespective of the
+                #    filename: a document part stored as "word/document.bin" and declared
+                #    wordprocessingml via an Override is still read as XML by every real
+                #    consumer, so a suffix-only dispatch left it entirely unscrubbed
+                #    (pitfall #54). Checked before the xlsb branch cannot apply, since an
+                #    xlsb sheet binary is never declared with an XML content type.
+                elif (name_lower.endswith(".xml") or name_lower.endswith(".vml")
+                      or name_canonical in xml_parts):
                     raw, xml_removed = _strip_xml_macros(raw, item.filename)
                     removed.extend(xml_removed)
 
@@ -1418,11 +1467,11 @@ def _neutralise_pdf_risky_image_filters(pdf) -> list[str]:
     Covers BOTH places such a filter can live:
       * **Stream objects** (image XObjects, form XObjects, /SMask sub-images, appearance
         streams) — rewritten to a 1×1 inert image with the filter dropped.
-      * **Inline images** (``BI … /F /JBIG2Decode … ID <bytes> EI``) inside page,
-        form-XObject, and annotation-appearance content streams — these are invisible to
-        the object walk; a PDF carrying one is **hard-rejected** (raises), because inline
-        JBIG2/JPX is spec-violating and vanishingly rare in legitimate files, so failing
-        closed is correct and won't false-positive.
+      * **Inline images** (``BI … /F /JBIG2Decode … ID <bytes> EI``) inside *any* reachable
+        content stream — these live in operator tokens, not stream objects, so they are
+        invisible to the sweep above; a PDF carrying one is **hard-rejected** (raises),
+        because inline JBIG2/JPX is spec-violating and vanishingly rare in legitimate
+        files, so failing closed is correct and won't false-positive.
 
     FAIL CLOSED: if a stream is identified as risky (or its ``/Filter`` can't be parsed)
     but neutralisation throws, we RE-RAISE rather than swallow — a silent fail-open that
@@ -1431,7 +1480,14 @@ def _neutralise_pdf_risky_image_filters(pdf) -> list[str]:
     removed: list[str] = []
 
     # ── (a) stream objects ────────────────────────────────────────────────────
-    for obj in pdf.objects:
+    # Walk the graph rather than pdf.objects. A PDF stream is *always* an indirect object
+    # (the spec requires it — a stream's data is addressed via the xref), so enumerating
+    # the object table happens to reach every one of them today, and probing confirmed it.
+    # But that is a property of pikepdf's parser, not an invariant this sweep should rest
+    # on: a lenient parser accepting a malformed direct stream, or a future pikepdf that
+    # surfaces one, silently reopens the #52 hole. _walk_pdf_nodes seeds from pdf.objects
+    # as well, so this is a strict superset — orphans are still covered.
+    for obj in _walk_pdf_nodes(pdf):
         if not isinstance(obj, pikepdf.Stream):
             continue
         try:

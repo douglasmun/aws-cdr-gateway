@@ -920,6 +920,97 @@ class TestPostScriptStrip:
         assert not cdr._is_postscript_ct("application/vnd.ms-postscript-lookalike")
 
 
+class TestXmlPartResolvedViaContentType:
+    """The XML macro scrub dispatched on `name.endswith(".xml")`, but OPC binds a content
+    type to an exact PartName irrespective of filename — the same authority mistake as
+    pitfall #49, one layer over. A document part stored as `word/document.bin` and declared
+    wordprocessingml via an Override was read as XML by every real consumer while CDR
+    skipped it entirely, reporting `removed: []` on a file carrying a live DDEAUTO payload.
+    Confirmed with an independent parser: python-docx opened the *sanitised* output and
+    still saw the payload (pitfall #54)."""
+
+    NS_MAIN = ("application/vnd.openxmlformats-officedocument"
+               ".wordprocessingml.document.main+xml")
+    PAYLOAD = ('<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org'
+               '/wordprocessingml/2006/main"><w:body><w:p><w:r><w:instrText>'
+               'DDEAUTO c:\\\\windows\\\\system32\\\\cmd.exe "/c calc.exe"'
+               '</w:instrText></w:r></w:p></w:body></w:document>')
+
+    def _package(self, part_name, content_type):
+        content_types = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package'
+            '.relationships+xml"/>'
+            f'<Override PartName="/{part_name}" ContentType="{content_type}"/>'
+            '</Types>'
+        )
+        root_rels = (
+            '<?xml version="1.0"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+            'relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats'
+            f'.org/officeDocument/2006/relationships/officeDocument" Target="{part_name}"/>'
+            '</Relationships>'
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", content_types)
+            z.writestr("_rels/.rels", root_rels)
+            z.writestr(part_name, self.PAYLOAD)
+        return buf.getvalue()
+
+    @pytest.mark.parametrize("part_name", [
+        "word/document.xml",   # control: suffix alone would have caught this
+        "word/document.bin",   # the bypass: no .xml suffix, Override declares it XML
+        "word/document",       # no suffix at all
+    ])
+    def test_override_declared_xml_part_is_scrubbed(self, part_name):
+        raw = self._package(part_name, self.NS_MAIN)
+        assert b"cmd.exe" in raw  # precondition: payload really is in the input
+        clean, report = cdr.cdr_office(raw, "docx")
+        assert b"cmd.exe" not in clean, \
+            f"{part_name}: field-code payload survived the XML macro scrub"
+        assert any("field code" in r for r in report["removed"]), \
+            f"{part_name}: scrubbed but not reported"
+
+    def test_plain_application_xml_override_is_scrubbed(self):
+        # The +xml suffix convention is not the only spelling a package may use.
+        raw = self._package("word/part0", "application/xml")
+        clean, _ = cdr.cdr_office(raw, "docx")
+        assert b"cmd.exe" not in clean
+
+    def test_binary_part_misdeclared_as_xml_is_preserved(self):
+        # False-positive guard: a part declared XML whose bytes are binary must not break
+        # the rebuild. _strip_xml_macros leaves unparseable content alone, so the entry
+        # survives byte-for-byte rather than being mangled or rejected.
+        blob = bytes(range(256)) * 8
+        content_types = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package'
+            '.relationships+xml"/>'
+            '<Override PartName="/word/media/image1.png" ContentType="application/xml"/>'
+            '</Types>'
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", content_types)
+            z.writestr("word/media/image1.png", blob)
+        clean, _ = cdr.cdr_office(buf.getvalue(), "docx")
+        with zipfile.ZipFile(io.BytesIO(clean)) as out:
+            assert out.read("word/media/image1.png") == blob
+
+    def test_xml_override_parts_ignores_non_xml_types(self):
+        content_types = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Override PartName="/word/media/i.png" ContentType="image/png"/>'
+            '<Override PartName="/word/doc.bin" ContentType="text/xml"/>'
+            '</Types>'
+        ).encode()
+        assert cdr._xml_override_parts(content_types) == {"word/doc.bin"}
+
+
 class TestContentTypeRealOfficeTypes:
     """Validate MACRO_CONTENT_TYPE_REMAP against the actual content type strings
     that Microsoft Office writes into [Content_Types].xml for every macro-enabled format.
@@ -3921,6 +4012,30 @@ class TestInlineRiskyImageContainers:
             ])))
         clean, _ = cdr.cdr_pdf(self._serialise(pdf))
         assert clean, "a binary stream broke the inline risky-image sweep"
+
+    def test_risky_stream_under_nonstandard_catalog_key_neutralised(self):
+        # The stream sweep walks the graph rather than enumerating known containers, so a
+        # risky stream parked under a catalog key that appears in no spec table is still
+        # reached. (A genuinely unreferenced stream cannot be used as the fixture here:
+        # pikepdf garbage-collects it on save, so the payload never reaches the input —
+        # verified. Hanging it off a private key keeps it in the file while keeping it
+        # off every standard traversal path.)
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        stream = pdf.make_stream(b"\x00\x00\x00\x00")
+        for key, value in (("/Type", pikepdf.Name("/XObject")),
+                           ("/Subtype", pikepdf.Name("/Image")),
+                           ("/Width", 16), ("/Height", 16), ("/BitsPerComponent", 1),
+                           ("/ColorSpace", pikepdf.Name("/DeviceGray")),
+                           ("/Filter", pikepdf.Name("/JBIG2Decode"))):
+            stream[pikepdf.Name(key)] = value
+        pdf.Root[pikepdf.Name("/CDRProbe")] = pdf.make_indirect(stream)
+        raw = self._serialise(pdf)
+        assert b"JBIG2Decode" in raw  # precondition: the payload really is in the input
+        clean, report = cdr.cdr_pdf(raw)
+        assert any("risky image filter" in r for r in report["removed"]), \
+            "risky stream under a non-standard catalog key was not swept"
+        assert b"JBIG2Decode" not in clean
 
     def test_ordinary_inline_image_preserved(self):
         # False-positive guard: inline images are commonplace. Only the risky decoder
