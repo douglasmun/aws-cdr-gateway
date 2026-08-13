@@ -5,6 +5,11 @@ Didier Stevens' analysis tools (`oledump.py`, `pdfid.py`, `pdf-parser.py`, `zipd
 This report maps each hiding technique those tools surface against what this CDR gateway
 actually does, to find blind spots.
 
+> **Scope and status.** This is a **point-in-time report**, written against one toolkit's
+> enumeration. It is not a coverage guarantee and has not been re-run end-to-end since.
+> Sections whose claims later proved incomplete carry inline `Superseded` notes; the
+> closing section records what changed. See pitfall #51 for why that distinction matters.
+
 **Method.** For each technique: is it caught? where in the code? and — for the
 non-obvious cases — an *empirical* check (a crafted fixture run through the real
 `cdr_*` function), not just a code read. Claims marked **[verified]** were reproduced in a
@@ -76,12 +81,25 @@ rel are on the strip lists (CLAUDE.md pitfalls #31, #39 cover the part-and-rel r
   filter can also ride an *inline image* (`BI … /F /JBIG2Decode … ID … EI`) inside a
   page/XObject content stream. That lives in operator tokens, not a stream object, so the
   object sweep above never saw it — and it **survives `pdf.save()`** (re-encoded but intact,
-  verified by decoding the saved content stream). Fix: scan every content stream via
+  verified by decoding the saved content stream). Fix: scan content streams via
   `pikepdf.parse_content_stream` and **hard-reject** any PDF with an inline image using a
   risky filter (`_reject_inline_risky_images`). Inline JBIG2/JPX is spec-violating and
   vanishingly rare, so fail-closed rejection is correct and won't false-positive (a
   benign-inline-image test confirms no over-reject). **[verified]** —
   `test_inline_image_jbig2_rejected`, `test_inline_image_benign_filter_not_rejected`.
+
+  > **Superseded — this section overstated its own coverage until 2026-08-13 (PR #88).**
+  > "Scan every content stream" described the intent, not the code. The implementation
+  > enumerated *known containers*: page content streams, `/XObject` entries one level below
+  > the page **gated on `/Subtype == /Form`**, and `/AP` appearance streams. Six containers
+  > were never reached — a form XObject nested inside another, a form XObject with no
+  > `/Subtype` (an attacker-written discriminator), Type3 `/CharProcs` glyph procedures,
+  > tiling `/Pattern` streams, and ExtGState `/SMask /G` groups — each confirmed to carry an
+  > inline `/JBIG2Decode` payload into the sanitised bucket. Worse, a blanket
+  > `except Exception: continue` around the operand loop swallowed the sweep's **own**
+  > rejection, so even the containers it did reach failed open. Both are fixed: the sweep now
+  > walks `_walk_pdf_nodes` and checks every reachable stream, with the `try` scoped to
+  > operator extraction only. See pitfall #53; pinned by `TestInlineRiskyImageContainers`.
 - **Fail-open swallow — FIXED (audit).** The first cut caught all per-object exceptions and
   only `debug`-logged them, so a stream *identified as risky* that failed to mutate would
   silently survive in a "sanitised" file (worst outcome for a CDR control; inconsistent with
@@ -97,6 +115,19 @@ rel are on the strip lists (CLAUDE.md pitfalls #31, #39 cover the part-and-rel r
 **Verdict: no open PDF residuals _within pdfid's enumeration_.** Every technique pdfid
 enumerates is neutralised — including the parser-defeating ones (ObjStm, name obfuscation)
 and the decoder-RCE filters (JBIG2/JPX) — and all are now regression-tested.
+
+> **How this verdict has aged — read before trusting it.** It was accurate against pdfid's
+> enumeration and is *still* scoped to exactly that. It is not a statement about the PDF
+> attack surface, and treating it as one is what hid the next round of gaps. Auditing the
+> same code against a different taxonomy (jonaslejon/malicious-pdf) found three more live
+> vectors pdfid does not enumerate — catalog `/Threads`, `/FontMatrix` JS injection
+> (CVE-2024-4367), and a UNC stream `/F` external ref with no action object (PR #85,
+> pitfall #51) — and adversarial audits of *those* fixes found four more classes of bug in
+> the fixes themselves: an attacker-controlled `/Subtype` gate, `bool` passing an `int`
+> check, `pdf.objects` missing every direct (inline) object (#87, pitfall #52), and the
+> container-enumeration/swallowed-rejection pair above (#88, pitfall #53). None of these
+> contradict the verdict; all of them sat outside its scope. **Re-audit against a fresh
+> taxonomy rather than re-reading this line.**
 
 > **Scope warning.** This verdict is bounded by what pdfid looks for. It is *not* a
 > statement that the PDF path has no gaps. A later pass against the
@@ -194,6 +225,23 @@ MHTML-imported-via-altChunk — are respectively fail-closed and explicitly neut
 The design (parse-don't-scan, rebuild-don't-rewrite, fail-closed) held up well against the
 full Stevens technique set; the one real residual (JBIG2/JPX decoder filters) is now closed,
 and the parser-strength behaviours are regression-protected.
+
+**Update (2026-08-13).** The *design* verdict still holds — every gap found since sat in an
+implementation that had drifted from the design, never in the design itself. But the
+implementation was not as complete as this report implied. Four subsequent PRs (#85–#89)
+closed ten further vectors across three pitfalls (#51–#53), plus one in the Office path
+(#54): `cdr_office` dispatched its XML macro scrub on **filename suffix**, so a document
+part stored as `word/document.bin` and declared wordprocessingml via an OPC `Override`
+skipped the scrub entirely — python-docx opened the *sanitised* file and still saw a live
+`DDEAUTO … cmd.exe` field code. The recurring shape across all of them is a sweep trusting
+something the attacker writes (a `/Subtype`, a filename suffix) or enumerating containers
+instead of walking the graph.
+
+**Known limits of every claim in this document.** Verification here is against **pikepdf,
+python-docx, openpyxl and Pillow** — not Acrobat or Word. That is strong evidence a real
+consumer behaves the same way, and it is what confirmed the #54 bypass was live rather than
+inert, but it is not proof. Divergence between those parsers and the shipping viewers would
+not be caught by anything in this report or the test suite.
 
 ---
 
