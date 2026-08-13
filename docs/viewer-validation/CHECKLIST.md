@@ -45,8 +45,6 @@ These are the reason the corpus exists. Both were **live bypasses**: python-docx
 |---|---|---|
 | `macro-sample.docx` | Input was `.docm`; output is `.docx` by `EXT_REMAP`. Must open cleanly, and **Alt+F8 should list no macros**. | |
 | `xlsm_vba_realistic.xlsx` | Input `.xlsm` → output `.xlsx`. Cell values and formulas intact; no macros. **Expect a slow open** — `sheet1.xml` is ~29 MB of size-cap padding inside a 3 MB file. A pause is not a hang. | |
-| `xlsx_dde_formula.xlsx` | DDE formula neutralised; **other cell values must be intact**. | |
-| `pptx_activex.pptx` | ActiveX control removed; slides must still render. | |
 
 ### Priority 3 — PDF, in Acrobat
 
@@ -78,9 +76,31 @@ These probe the claim that `pdf.save()` collapses multi-revision containers into
 - A **password prompt** on `pdfc_encrypted_input.pdf` (encryption should have been stripped).
 - Anything that **launches a process**.
 
+## Already checked for you — LibreOffice, 2026-08-14
+
+Before you spend time in Word, a second *independent* Office engine has been run over the corpus: **LibreOffice 26.2.5.2**, headless, converting each sanitised file and inspecting the rendered text. This is not python-docx, so it is a genuine cross-implementation check.
+
+| File | LibreOffice result |
+|---|---|
+| `p55_realistic.docx` | Opens. Heading, bold run, **2×2 table** and closing line all render. |
+| `p55_default_dat.docx` | Opens. Field rendered as literal text. |
+| `p54_override_bin.docx` | Opens. Field rendered as literal text. |
+| `macro-sample.docx` | Opens. All five paragraphs intact. |
+| `xlsm_vba_realistic.xlsx` | Opens as a spreadsheet (converts to CSV). |
+
+**No rendered output contains `cmd.exe` or `system32`** — the DDE target is structurally gone, and LibreOffice prints the neutralised field as text rather than resolving it. Every field carrier in every output is `_CDR_REMOVED_`, with zero live `DDEAUTO`/`DDE` carriers in `w:instrText` or `w:fldSimple`.
+
+**What this does not settle, and why you are still needed.** A headless conversion never executes a DDE field, so a clean render proves the payload is *structurally* absent — not that an interactive viewer would decline to prompt. Word deciding whether to offer "update links" is exactly the behaviour no automated check here can reach. That question, and Word's own fidelity, is what the manual pass is for.
+
 ## Known exclusions
 
-Four repo fixtures (`docx_dde_field`, `docx_autoopen_field`, `docx_multithreat`, `docx_vba_macro`) are **deliberately excluded by the generator** — not omitted by hand, so a rebuild will not quietly reintroduce them. They are synthetic packages with no `officeDocument` relationship — python-docx cannot open the *inputs* either, so Word would reject them for a reason unrelated to CDR and produce a false alarm. They remain valid as unit-test fixtures; they are just not viewer-validation material. `p55_realistic.docx` was built specifically to cover what they cannot.
+Six repo fixtures are **excluded by the generator** — not omitted by hand, so a rebuild will not quietly reintroduce them:
+
+`docx_dde_field`, `docx_autoopen_field`, `docx_multithreat`, `docx_vba_macro`, `xlsx_dde_formula`, `pptx_activex`.
+
+All six are synthetic packages with an **empty `_rels/.rels`** — no `officeDocument` relationship, so nothing points from the package root to the document, workbook or presentation. python-docx cannot open the `.docx` ones and LibreOffice cannot load the `.xlsx`/`.pptx` ones. The decisive part: **the inputs fail identically**, so a viewer rejecting them tells you nothing about CDR. They remain valid unit-test fixtures; they are just not viewer-validation material.
+
+The last two were added on 2026-08-14. They had survived the first cut because python-docx only covers `.docx`, so the `.xlsx`/`.pptx` packages were never opened by any parser until LibreOffice was brought in — a reminder that an exclusion criterion needs applying across *every* type it logically covers, not just the one the available parser happened to check.
 
 ## Interpreting the outcome
 

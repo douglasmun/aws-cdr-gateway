@@ -73,17 +73,19 @@ emit("p55_default_dat", opc("word/doc.dat",
 
 # ── 2. Real fixtures already in the repo (fidelity, not just neutralisation) ──
 print("\n=== existing repo fixtures — does Word still render them? ===")
-# EXCLUDED on purpose: docx_dde_field, docx_autoopen_field, docx_multithreat and
-# docx_vba_macro are synthetic packages with no officeDocument relationship, so
-# python-docx cannot open the *inputs* either. Word would reject them for reasons
-# unrelated to CDR and produce a false alarm. p55_realistic.docx covers the same
-# ground with a genuine python-docx package. See CHECKLIST.md "Known exclusions".
+# EXCLUDED on purpose: docx_dde_field, docx_autoopen_field, docx_multithreat,
+# docx_vba_macro, xlsx_dde_formula and pptx_activex are synthetic packages with an
+# empty _rels/.rels — no officeDocument relationship, so nothing points from the
+# package root to the document/workbook/presentation. python-docx cannot open the
+# .docx ones and LibreOffice 26.2 cannot load the .xlsx/.pptx ones; crucially the
+# *inputs* fail identically, so a viewer rejecting them says nothing about CDR.
+# Confirmed 2026-08-14 by converting inputs and outputs with `soffice --headless`.
+# p55_realistic.docx covers the same ground with a genuine package.
+# See CHECKLIST.md "Known exclusions".
 for fn, note in [
     ("macro-sample.docm",     "MACRO-ENABLED input: output is .docx by EXT_REMAP. Word must open it "
                               "cleanly and offer NO macros (Alt+F8 should list none)"),
     ("xlsm_vba_realistic.xlsm","Excel: output is .xlsx. Cells/formulas must survive; no macros"),
-    ("xlsx_dde_formula.xlsx", "DDE formula neutralised; other cell values must be intact"),
-    ("pptx_activex.pptx",     "ActiveX control removed; slides must still render"),
 ]:
     p = os.path.join(FIX, fn)
     if not os.path.exists(p):

@@ -314,9 +314,27 @@ payload catalog and the sanitised output to the clean catalog; none follows an a
 branch. There is no evidence a reader exists that resolves these files differently, and the
 verdict continues to rest on the directly-verified fact that the rebuild emits one revision.
 
-The limit stands **in full for the Office paths**, which is where it matters most: both
-confirmed live bypasses (#54, #55) were OPC declaration bugs, and no equivalent
-independent-engine check has been run against Word, Excel or PowerPoint. See
+The Office paths are **partially** covered as of 2026-08-14. **LibreOffice 26.2.5.2** — an
+independent Office implementation, not python-docx — opens all four sanitised `.docx` outputs
+and the `.xlsx` output, renders them at full fidelity (`p55_realistic.docx` keeps its heading,
+bold run and 2×2 table), and no rendered output contains `cmd.exe` or `system32`. LibreOffice
+prints the neutralised field as literal text rather than resolving a DDE target, which
+corroborates the #54/#55 fixes against a second engine.
+
+Two caveats keep this short of closure. First, **a headless conversion never executes a DDE
+field**, so this establishes the payload is *structurally* absent, not that an interactive
+viewer would decline to prompt — Word offering "update links" is precisely the behaviour no
+automated check reaches. Second, `xlsx_dde_formula` and `pptx_activex` could not be loaded by
+LibreOffice **and neither could their inputs**: both are synthetic packages with an empty
+`_rels/.rels` and no `officeDocument` relationship, so nothing points from the package root to
+the workbook or presentation. They are now excluded from the corpus alongside the four `.docx`
+fixtures with the same defect — they had survived the first cut only because python-docx
+covers `.docx` alone, so those packages had never been opened by any parser. An exclusion
+criterion needs applying across every type it logically covers, not just the one the
+available parser happens to check.
+
+What remains genuinely untested is **Word, Excel and PowerPoint themselves**, and that is
+still where it matters most: both confirmed live bypasses were OPC declaration bugs. See
 `docs/viewer-validation/CHECKLIST.md` for the manual pass that would close it.
 
 ---
