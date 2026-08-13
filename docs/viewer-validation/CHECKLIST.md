@@ -37,16 +37,20 @@ These are the reason the corpus exists. Both were **live bypasses**: python-docx
 
 > **Expected residue — not a finding.** The scrubbed field reads `DDEAUTO _CDR_REMOVED_ "/c calc.exe"`. The *executable path* is replaced; the inert string `calc.exe` survives inside the quoted argument (pitfall #13). Word has no DDE target to resolve, so nothing launches. **Seeing `calc.exe` in the XML is expected; being *prompted* to update remote data is not.**
 
+> **Visible fixture prose — also not a finding.** `p55_default_dat.docx` and `p54_override_bin.docx` render the sentence *"…carried a DDEAUTO field code before sanitisation."* as ordinary body text. That is the fixture describing itself, not a live field — it is prose in a `<w:t>` run, not a `w:instrText`/`w:fldSimple` carrier, so there is nothing for Word to execute. Worth knowing because a naive check for the string `DDEAUTO` matches it: a scripted pre-check of this corpus reported both files as live bypasses for exactly this reason before the match was inspected in context. **The signal is a prompt, never the presence of a word.**
+
 ### Priority 2 — Office fidelity
 
 | File | What to check | Result |
 |---|---|---|
 | `macro-sample.docx` | Input was `.docm`; output is `.docx` by `EXT_REMAP`. Must open cleanly, and **Alt+F8 should list no macros**. | |
-| `xlsm_vba_realistic.xlsx` | Input `.xlsm` → output `.xlsx`. Cell values and formulas intact; no macros. | |
+| `xlsm_vba_realistic.xlsx` | Input `.xlsm` → output `.xlsx`. Cell values and formulas intact; no macros. **Expect a slow open** — `sheet1.xml` is ~29 MB of size-cap padding inside a 3 MB file. A pause is not a hang. | |
 | `xlsx_dde_formula.xlsx` | DDE formula neutralised; **other cell values must be intact**. | |
 | `pptx_activex.pptx` | ActiveX control removed; slides must still render. | |
 
 ### Priority 3 — PDF, in Acrobat
+
+> Several files here are ~3 MB because the source fixtures carry a deliberate padding stream (they double as size-cap tests). The padding is inert filler, not content — ignore the file sizes.
 
 | File | What to check | Result |
 |---|---|---|
