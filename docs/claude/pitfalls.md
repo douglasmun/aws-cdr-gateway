@@ -51,7 +51,7 @@ it is listed once, under the group whose code you would be editing.
 
 - [#25 — PDF AcroForm root `/AA` and page `/FileAttachment` are separate vectors](#25-pdf-acroform-root-aa-and-page-fileattachment-are-separate-vectors)
 - [#42 — PDF decoder-RCE image filters (JBIG2/JPX) are neutralised in-place, not rejected](#42-pdf-decoder-rce-image-filters-jbig2jpx-are-neutralised-in-place-not-rejected)
-- [#51 — A "no residuals" verdict is scoped to the taxonomy you audited against](#51-a-no-residuals-verdict-is-scoped-to-the-taxonomy-you-audited-against--re-audit-dont-re-read)
+- [#51 — A "no residuals" verdict is scoped to the taxonomy you audited against](#51-a-no-residuals-verdict-is-scoped-to-the-taxonomy-you-audited-against-re-audit-dont-re-read)
 
 **Images**
 
