@@ -3789,6 +3789,150 @@ class TestMaliciousPdfTaxonomyGaps:
             assert len(p.pages) == 1
 
 
+class TestInlineRiskyImageContainers:
+    """An inline image declaring a decoder-RCE filter (/JBIG2Decode, /JPXDecode) has no
+    stream object to rewrite, so cdr_pdf must REJECT the file. The sweep originally
+    walked only page content streams, one level of /XObject gated on /Subtype == /Form,
+    and /AP appearance streams — every other content-stream container was a live bypass.
+    Compounding it, a blanket `except Exception: continue` around the operand loop
+    swallowed the sweep's own rejection (pitfall #51c), so even reachable payloads
+    passed. All six containers below were confirmed to survive before the fix.
+    """
+
+    INLINE = b"BI /W 16 /H 16 /BPC 1 /CS /G /F /JBIG2Decode ID \x00\x00\x00\x00 EI\n"
+
+    @staticmethod
+    def _form(pdf, content, subtype="/Form", **extra):
+        stream = pdf.make_stream(content)
+        stream[pikepdf.Name("/Type")] = pikepdf.Name("/XObject")
+        if subtype is not None:
+            stream[pikepdf.Name("/Subtype")] = pikepdf.Name(subtype)
+        stream[pikepdf.Name("/BBox")] = pikepdf.Array([0, 0, 16, 16])
+        for key, value in extra.items():
+            stream[pikepdf.Name("/" + key.lstrip("/"))] = value
+        return stream
+
+    @staticmethod
+    def _serialise(pdf):
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+    def _resourced(self, resources):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.pages[0].Resources = resources(pdf)
+        return self._serialise(pdf)
+
+    def _assert_rejected(self, raw, label):
+        with pytest.raises(Exception) as excinfo:
+            cdr.cdr_pdf(raw)
+        assert "risky" in str(excinfo.value).lower() or "inline" in str(excinfo.value).lower(), \
+            f"{label}: rejected, but not by the inline risky-image sweep: {excinfo.value}"
+
+    def test_page_content_stream_rejected(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.pages[0].Contents = pdf.make_stream(self.INLINE)
+        self._assert_rejected(self._serialise(pdf), "page content stream")
+
+    def test_form_xobject_one_level_rejected(self):
+        raw = self._resourced(lambda pdf: pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(F0=pdf.make_indirect(self._form(pdf, self.INLINE)))))
+        self._assert_rejected(raw, "form XObject one level from the page")
+
+    def test_nested_form_xobject_rejected(self):
+        # The old sweep descended exactly one /XObject level from the page.
+        def resources(pdf):
+            inner = pdf.make_indirect(self._form(pdf, self.INLINE))
+            outer = self._form(pdf, b"/Inner Do\n", Resources=pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(Inner=inner)))
+            return pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(Outer=pdf.make_indirect(outer)))
+
+        self._assert_rejected(self._resourced(resources), "form nested inside a form")
+
+    def test_form_xobject_without_subtype_rejected(self):
+        # /Subtype is attacker-controlled: omitting it must not disable the sweep.
+        raw = self._resourced(lambda pdf: pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(
+                F0=pdf.make_indirect(self._form(pdf, self.INLINE, subtype=None)))))
+        self._assert_rejected(raw, "form XObject with no /Subtype")
+
+    def test_type3_charproc_rejected(self):
+        # Type3 glyph procedures are content streams reached via /Font, not /XObject.
+        def resources(pdf):
+            glyph = pdf.make_indirect(pdf.make_stream(self.INLINE))
+            return pikepdf.Dictionary(Font=pikepdf.Dictionary(
+                F1=pdf.make_indirect(pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"), Subtype=pikepdf.Name("/Type3"),
+                    FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0, 0]),
+                    CharProcs=pikepdf.Dictionary(a=glyph),
+                    Encoding=pikepdf.Dictionary()))))
+
+        self._assert_rejected(self._resourced(resources), "Type3 /CharProcs glyph")
+
+    def test_tiling_pattern_rejected(self):
+        def resources(pdf):
+            pattern = pdf.make_stream(self.INLINE)
+            for key, value in (("/PatternType", 1), ("/XStep", 16), ("/YStep", 16),
+                               ("/PaintType", 1), ("/TilingType", 1)):
+                pattern[pikepdf.Name(key)] = value
+            pattern[pikepdf.Name("/BBox")] = pikepdf.Array([0, 0, 16, 16])
+            return pikepdf.Dictionary(
+                Pattern=pikepdf.Dictionary(P0=pdf.make_indirect(pattern)))
+
+        self._assert_rejected(self._resourced(resources), "tiling /Pattern")
+
+    def test_extgstate_softmask_group_rejected(self):
+        def resources(pdf):
+            group = pdf.make_indirect(self._form(pdf, self.INLINE))
+            return pikepdf.Dictionary(ExtGState=pikepdf.Dictionary(
+                GS0=pikepdf.Dictionary(S=pikepdf.Name("/Luminosity"),
+                                       SMask=pikepdf.Dictionary(
+                                           S=pikepdf.Name("/Luminosity"), G=group))))
+
+        self._assert_rejected(self._resourced(resources), "ExtGState /SMask /G group")
+
+    def test_annotation_appearance_stream_rejected(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        appearance = pdf.make_indirect(self._form(pdf, self.INLINE))
+        pdf.pages[0].obj["/Annots"] = pikepdf.Array([pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Annot"), Subtype=pikepdf.Name("/Widget"),
+            Rect=pikepdf.Array([0, 0, 16, 16]),
+            AP=pikepdf.Dictionary(N=appearance)))])
+        self._assert_rejected(self._serialise(pdf), "annotation /AP /N")
+
+    def test_binary_stream_does_not_break_the_sweep(self):
+        # The sweep now walks EVERY stream, including embedded-file streams whose bytes
+        # are not content-stream operators at all. Decoding those raised UnicodeDecodeError
+        # mid-sweep; the fix tolerates the junk without also swallowing real rejections.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        binary = pdf.make_stream(bytes(range(256)) * 4)
+        binary[pikepdf.Name("/Type")] = pikepdf.Name("/EmbeddedFile")
+        pdf.Root[pikepdf.Name("/Names")] = pikepdf.Dictionary(
+            EmbeddedFiles=pikepdf.Dictionary(Names=pikepdf.Array([
+                pikepdf.String("blob.bin"),
+                pdf.make_indirect(pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Filespec"), F=pikepdf.String("blob.bin"),
+                    EF=pikepdf.Dictionary(F=pdf.make_indirect(binary)))),
+            ])))
+        clean, _ = cdr.cdr_pdf(self._serialise(pdf))
+        assert clean, "a binary stream broke the inline risky-image sweep"
+
+    def test_ordinary_inline_image_preserved(self):
+        # False-positive guard: inline images are commonplace. Only the risky decoder
+        # filters trigger rejection; a plain uncompressed inline image must pass.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.pages[0].Contents = pdf.make_stream(
+            b"BI /W 2 /H 2 /BPC 8 /CS /G ID \x00\xff\xff\x00 EI\n")
+        clean, _ = cdr.cdr_pdf(self._serialise(pdf))
+        assert clean, "an ordinary inline image was rejected"
+
+
 class TestAnnotationActionCoverageClaims:
     """Pin the action types claimed as covered by the *unconditional* annotation
     `/A`//`/AA` delete in `_strip_pdf_page`, rather than by any per-type denylist.
