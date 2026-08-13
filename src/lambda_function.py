@@ -44,6 +44,7 @@ import warnings
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timezone
+from collections.abc import Iterable
 from typing import Optional
 
 import boto3
@@ -574,16 +575,32 @@ def handler(event: dict, context) -> dict:
 
 # ── Office CDR ─────────────────────────────────────────────────────────────────
 
-def _postscript_override_parts(ct_xml: bytes) -> set[str]:
-    """Parse ``[Content_Types].xml`` and return the set of normalised part names (lower,
-    leading '/' stripped) declared with a PostScript/EPS content type via an ``Override``.
+def _is_xml_ct(ct: str) -> bool:
+    """True when a content type's media subtype is XML. ``+xml`` covers the OOXML family
+    (…wordprocessingml.document.main+xml, …drawing+xml, …); ``text/xml`` and
+    ``application/xml`` cover the plain forms."""
+    ct = ct.strip().lower()
+    return ct.endswith("+xml") or ct in ("text/xml", "application/xml")
 
-    This is the authoritative signal for the part-byte strip: an OOXML ``Override`` binds a
-    content type to an exact PartName regardless of file extension, so an EPS payload can be
-    declared PostScript while stored as ``word/media/image1.png``. The ``.eps``/``.ps``
-    suffix rule in STRIP_ZIP_ENTRIES would miss that; this closes the bypass. Returns an
-    empty set on unparseable XML (the ZIP validator already requires a present, well-formed
-    Content-Types part, and the suffix rule remains as a backstop)."""
+
+def _declared_parts(ct_xml: bytes, entry_names: Iterable[str],
+                    matches_ct) -> set[str]:
+    """Return the normalised part names (lower, leading '/' stripped) that
+    ``[Content_Types].xml`` declares with a content type satisfying ``matches_ct``.
+
+    OPC offers **two** declaration mechanisms and both are authoritative:
+
+    * ``Override`` binds a content type to one exact PartName, and
+    * ``Default`` binds it to *every* part whose extension matches.
+
+    Resolving only ``Override`` (pitfall #54) left the ``Default`` half open: a package
+    declaring ``<Default Extension="dat" ContentType="…wordprocessingml.document.main+xml"/>``
+    with the officeDocument relationship pointing at ``word/doc.dat`` needs no Override at
+    all, and python-docx opened the sanitised output and still saw a live DDEAUTO payload
+    (pitfall #55). ``Default`` is resolved against the real ZIP entry names because it binds
+    by extension rather than by name.
+
+    Returns an empty set on unparseable XML — the suffix rules remain the backstop."""
     parts: set[str] = set()
     _reject_xml_doctype(ct_xml, "[Content_Types].xml")
     try:
@@ -591,50 +608,50 @@ def _postscript_override_parts(ct_xml: bytes) -> set[str]:
     except ET.ParseError:
         return parts
     ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+    default_exts: set[str] = set()
     for child in root:
-        if child.tag != f"{{{ns}}}Override":
+        if not matches_ct(child.get("ContentType", "")):
             continue
-        if not _is_postscript_ct(child.get("ContentType", "")):
-            continue
-        pn = child.get("PartName", "").replace("\\", "/").lstrip("/").lower()
-        if pn:
-            parts.add(pn)
+        if child.tag == f"{{{ns}}}Override":
+            pn = child.get("PartName", "").replace("\\", "/").lstrip("/").lower()
+            if pn:
+                parts.add(pn)
+        elif child.tag == f"{{{ns}}}Default":
+            ext = child.get("Extension", "").strip().lstrip(".").lower()
+            if ext:
+                default_exts.add(ext)
+    if default_exts:
+        for name in entry_names:
+            norm = name.replace("\\", "/").lstrip("/").lower()
+            _, _, ext = norm.rpartition(".")
+            if ext and ext in default_exts:
+                # Both spellings: callers match this set against the plain lowered name in
+                # one place and against the posixpath-canonical form in another, and a
+                # part named "./word/doc.dat" must be caught either way.
+                parts.add(norm)
+                parts.add(posixpath.normpath(norm).lstrip("/"))
     return parts
 
 
-def _xml_override_parts(ct_xml: bytes) -> set[str]:
-    """Return the normalised part names that ``[Content_Types].xml`` declares as XML via an
-    ``Override``, whatever their filename suffix.
+def _postscript_override_parts(ct_xml: bytes,
+                               entry_names: Iterable[str] = ()) -> set[str]:
+    """Part names declared with a PostScript/EPS content type in ``[Content_Types].xml``.
 
-    Same authority argument as ``_postscript_override_parts``, applied to the XML macro
-    scrub: a real OOXML consumer locates the main document part by following the package
+    The declaration is the authoritative signal for the part-byte strip: an EPS payload can
+    be declared PostScript while stored as ``word/media/image1.png``, which the ``.eps``/
+    ``.ps`` suffix rule in STRIP_ZIP_ENTRIES would miss. Covers both declaration forms —
+    see ``_declared_parts``."""
+    return _declared_parts(ct_xml, entry_names, _is_postscript_ct)
+
+
+def _xml_override_parts(ct_xml: bytes, entry_names: Iterable[str] = ()) -> set[str]:
+    """Part names ``[Content_Types].xml`` declares as XML, whatever their filename suffix.
+
+    A real OOXML consumer locates the main document part by following the package
     relationship and reads it as XML because the *content type* says so — the ``.xml``
-    suffix is a convention, not the binding. Dispatching the scrub on ``name.endswith
-    (".xml")`` therefore missed a document part stored as ``word/document.bin`` with an
-    Override declaring the wordprocessingml content type: python-docx opened the sanitised
-    output and still saw the live payload, while ``removed`` was empty (pitfall #54).
-
-    Returns an empty set on unparseable XML — the suffix rule remains the backstop."""
-    parts: set[str] = set()
-    _reject_xml_doctype(ct_xml, "[Content_Types].xml")
-    try:
-        root = ET.fromstring(ct_xml)
-    except ET.ParseError:
-        return parts
-    ns = "http://schemas.openxmlformats.org/package/2006/content-types"
-    for child in root:
-        if child.tag != f"{{{ns}}}Override":
-            continue
-        ct = child.get("ContentType", "").lower()
-        # Any content type whose media subtype is XML — "+xml" covers the OOXML family
-        # (…wordprocessingml.document.main+xml, …drawing+xml, …), "text/xml" and
-        # "application/xml" cover the plain forms.
-        if not (ct.endswith("+xml") or ct in ("text/xml", "application/xml")):
-            continue
-        pn = child.get("PartName", "").replace("\\", "/").lstrip("/").lower()
-        if pn:
-            parts.add(pn)
-    return parts
+    suffix is a convention, not the binding. Covers both declaration forms — see
+    ``_declared_parts``."""
+    return _declared_parts(ct_xml, entry_names, _is_xml_ct)
 
 
 # Relationship types (local name) whose Target is a sheet part. `xlBinaryIndex` is the
@@ -713,19 +730,20 @@ def cdr_office(data: bytes, ext: str) -> tuple[bytes, dict]:
     budget = _DecompressionBudget()
 
     with zipfile.ZipFile(io.BytesIO(data), "r") as src:
-        # Pre-pass: resolve which parts [Content_Types].xml declares as PostScript via an
-        # Override on an arbitrary PartName. infolist() order is not guaranteed, so this
-        # must run before the main loop to drop such parts wherever they appear.
-        # The same pre-pass also resolves parts declared XML by an Override, so the macro
-        # scrub below dispatches on the declared content type as well as the suffix.
+        # Pre-pass: resolve which parts [Content_Types].xml declares as PostScript, and
+        # which it declares as XML, via either OPC declaration form (Override on an exact
+        # PartName, or Default on an extension). infolist() order is not guaranteed, so
+        # this must run before the main loop to catch such parts wherever they appear.
+        # The entry names are passed in because Default binds by extension, not by name.
         ps_parts: set[str] = set()
         xml_parts: set[str] = set()
+        entry_names = [i.filename for i in src.infolist()]
         for item in src.infolist():
             if item.filename.replace("\\", "/").lower() == "[content_types].xml":
                 try:
                     ct_raw = _read_zip_entry_safe(src, item, budget)
-                    ps_parts = _postscript_override_parts(ct_raw)
-                    xml_parts = _xml_override_parts(ct_raw)
+                    ps_parts = _postscript_override_parts(ct_raw, entry_names)
+                    xml_parts = _xml_override_parts(ct_raw, entry_names)
                 except ValueError:
                     # Bomb-guard trip; suffix rules remain the backstop.
                     ps_parts = set()

@@ -1011,6 +1011,123 @@ class TestXmlPartResolvedViaContentType:
         assert cdr._xml_override_parts(content_types) == {"word/doc.bin"}
 
 
+class TestDefaultExtensionDeclaration:
+    """OPC declares content types through **two** mechanisms, and both are authoritative:
+    `Override` binds one exact PartName, `Default` binds every part with a given extension.
+    Pitfall #54 closed the Override half and left the Default half open — a package needs no
+    Override at all to bind a document part, just
+    `<Default Extension="dat" ContentType="…wordprocessingml.document.main+xml"/>` plus an
+    officeDocument relationship pointing at `word/doc.dat`. python-docx opened the sanitised
+    output and still saw a live DDEAUTO payload (pitfall #55)."""
+
+    NS_MAIN = ("application/vnd.openxmlformats-officedocument"
+               ".wordprocessingml.document.main+xml")
+    PAYLOAD = ('<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org'
+               '/wordprocessingml/2006/main"><w:body><w:p><w:r><w:instrText>'
+               'DDEAUTO c:\\\\windows\\\\system32\\\\cmd.exe "/c calc.exe"'
+               '</w:instrText></w:r></w:p></w:body></w:document>')
+
+    def _package(self, part_name, declaration, rel_target=None, body=None):
+        content_types = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package'
+            '.relationships+xml"/>'
+            f'{declaration}</Types>'
+        )
+        root_rels = (
+            '<?xml version="1.0"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+            'relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats'
+            '.org/officeDocument/2006/relationships/officeDocument" '
+            f'Target="{rel_target or part_name}"/></Relationships>'
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", content_types)
+            z.writestr("_rels/.rels", root_rels)
+            z.writestr(part_name, self.PAYLOAD if body is None else body)
+        return buf.getvalue()
+
+    @pytest.mark.parametrize("part_name,ext", [
+        ("word/doc.dat", "dat"),
+        ("word/doc.bin", "bin"),
+    ])
+    def test_default_declared_xml_part_is_scrubbed(self, part_name, ext):
+        raw = self._package(
+            part_name, f'<Default Extension="{ext}" ContentType="{self.NS_MAIN}"/>')
+        assert b"cmd.exe" in raw
+        clean, report = cdr.cdr_office(raw, "docx")
+        assert b"cmd.exe" not in clean, \
+            f"{part_name}: Default-declared XML part skipped the macro scrub"
+        assert any("field code" in r for r in report["removed"])
+
+    @pytest.mark.parametrize("target", [
+        "/word/doc.dat",          # absolute form
+        "word/./doc.dat",         # dot segment
+        "word/sub/../doc.dat",    # dotdot segment
+    ])
+    def test_default_declared_part_scrubbed_whatever_the_rel_spelling(self, target):
+        # The declaration binds by extension, so the rel Target spelling cannot matter —
+        # every one of these resolves to the same part for a real consumer.
+        raw = self._package(
+            "word/doc.dat", f'<Default Extension="dat" ContentType="{self.NS_MAIN}"/>',
+            rel_target=target)
+        clean, _ = cdr.cdr_office(raw, "docx")
+        assert b"cmd.exe" not in clean
+
+    def test_sanitised_output_is_clean_to_an_independent_parser(self):
+        # A byte check only proves the bytes changed; this proves the consumer that would
+        # execute the payload no longer sees it.
+        docx = pytest.importorskip("docx")
+        raw = self._package(
+            "word/doc.dat", f'<Default Extension="dat" ContentType="{self.NS_MAIN}"/>')
+        assert "DDEAUTO" in docx.Document(io.BytesIO(raw)).element.xml
+        clean, _ = cdr.cdr_office(raw, "docx")
+        assert "cmd.exe" not in docx.Document(io.BytesIO(clean)).element.xml
+
+    def test_default_declared_postscript_part_is_dropped(self):
+        # Same two-mechanism argument on the EPS part-strip half.
+        eps = b"%!PS-Adobe-3.0 EPSF-3.0\n(payload) show\nshowpage\n"
+        raw = self._package(
+            "word/media/logo.img",
+            '<Default Extension="img" ContentType="application/postscript"/>'
+            f'<Override PartName="/word/document.xml" ContentType="{self.NS_MAIN}"/>',
+            rel_target="word/document.xml", body=eps)
+        buf = io.BytesIO(raw)
+        with zipfile.ZipFile(buf, "a") as z:
+            z.writestr("word/document.xml", "<w:document/>")
+        clean, report = cdr.cdr_office(buf.getvalue(), "docx")
+        with zipfile.ZipFile(io.BytesIO(clean)) as out:
+            assert "word/media/logo.img" not in out.namelist()
+
+    def test_default_extension_xml_does_not_widen_to_unrelated_parts(self):
+        # False-positive guard: real packages carry <Default Extension="xml"…>, which must
+        # bind only parts that actually end .xml — a .png must not be pulled into the scrub
+        # set by an unrelated Default.
+        content_types = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '</Types>'
+        ).encode()
+        resolved = cdr._xml_override_parts(
+            content_types, ["word/document.xml", "word/media/image1.png"])
+        assert "word/media/image1.png" not in resolved
+        assert "word/document.xml" in resolved
+
+    def test_declared_parts_empty_without_entry_names(self):
+        # Default binds by extension, so it can only be resolved against real entries.
+        content_types = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="dat" ContentType="application/xml"/>'
+            '</Types>'
+        ).encode()
+        assert cdr._xml_override_parts(content_types) == set()
+        assert cdr._xml_override_parts(content_types, ["word/doc.dat"]) == {"word/doc.dat"}
+
+
 class TestContentTypeRealOfficeTypes:
     """Validate MACRO_CONTENT_TYPE_REMAP against the actual content type strings
     that Microsoft Office writes into [Content_Types].xml for every macro-enabled format.

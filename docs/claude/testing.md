@@ -2,7 +2,7 @@
 
 > Extracted from CLAUDE.md. Authoritative testing reference; CLAUDE.md points here.
 
-Tests (377 in `test_cdr.py` + 50 in `test_cdr_local.py` = **427 total**) construct malicious fixtures entirely in-memory — no fixture files on disk. S3/SNS calls are patched with `unittest.mock`. Required env vars are set automatically via `os.environ.setdefault`. `src/test_cdr.py` covers the CDR Lambda; `src/test_cdr_local.py` covers the pure `cdr_dispatch` core and the local FastAPI service (`app.py`), reusing the same in-memory fixtures. Run: `cd src && pytest test_cdr.py test_cdr_local.py -v`.
+Tests (386 in `test_cdr.py` + 50 in `test_cdr_local.py` = **436 total**) construct malicious fixtures entirely in-memory — no fixture files on disk. S3/SNS calls are patched with `unittest.mock`. Required env vars are set automatically via `os.environ.setdefault`. `src/test_cdr.py` covers the CDR Lambda; `src/test_cdr_local.py` covers the pure `cdr_dispatch` core and the local FastAPI service (`app.py`), reusing the same in-memory fixtures. Run: `cd src && pytest test_cdr.py test_cdr_local.py -v`.
 
 > **Run it bare — do not export AWS env vars around it.** `src/conftest.py` sets the
 > credentials/region and `test_cdr.py` sets the bucket and topic names, both via
