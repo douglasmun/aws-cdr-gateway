@@ -9,6 +9,9 @@ actually does, to find blind spots.
 > enumeration. It is not a coverage guarantee and has not been re-run end-to-end since.
 > Sections whose claims later proved incomplete carry inline `Superseded` notes; the
 > closing section records what changed. See pitfall #51 for why that distinction matters.
+> **Read the dated updates at the end before relying on any verdict here** — they record
+> the bypasses found since (#54, #55) and the 2026-08-14 container-layer sweep, which
+> covers an axis this report does not address at all.
 
 **Method.** For each technique: is it caught? where in the code? and — for the
 non-obvious cases — an *empirical* check (a crafted fixture run through the real
@@ -165,8 +168,11 @@ data appended after the central directory, duplicate names.
   from the central directory. Bytes *appended after* the archive, or a prepended polyglot,
   are not explicitly inspected. However: `cdr_office` **rebuilds** the archive entry-by-entry
   into a fresh ZIP, so appended/prepended junk is **not carried into the output** — the
-  output contains only the re-emitted entries. *Confirm this holds* (the rebuild is the
-  mitigation, not the validator). **Likely no gap, but worth a regression fixture.**
+  output contains only the re-emitted entries. **Confirmed empirically 2026-08-14** (see the
+  container-layer sweep below): appended-after-EOCD, 4096 bytes prepended, an entry present
+  in the local headers but omitted from the central directory, NUL-truncatable and
+  trailing-space entry names, and backslash separators were all probed against the real
+  `cdr_office`; none reached the output. The rebuild is indeed the mitigation.
 - **Nested ZIP inside an OOXML part** (e.g. a `.zip` stored as an embedded object). Embedded
   objects under `embeddings/` are dropped; a nested ZIP stored under an *unknown* part name
   would be re-emitted as opaque bytes. It cannot execute on its own (it's just a file inside
@@ -237,11 +243,58 @@ skipped the scrub entirely — python-docx opened the *sanitised* file and still
 something the attacker writes (a `/Subtype`, a filename suffix) or enumerating containers
 instead of walking the graph.
 
+**Update (2026-08-14) — the container layer, swept as a taxonomy in its own right.** Every
+audit up to this point (this report, jonaslejon/malicious-pdf, ClamAV, DocBleach) targets
+document *content*. The **package/container layer** — which bytes constitute the document at
+all — had never been swept deliberately; #54 surfaced from it only incidentally. Sweeping it
+produced one live bypass and one clean bill of health, and the contrast between them is the
+useful result.
+
+*OOXML/OPC container — one live bypass (#55, PR #91).* OPC declares content types through
+**two** elements, both authoritative: `Override` binds one exact PartName, `Default` binds
+every part with a given extension. Pitfall #54 closed the `Override` half and left `Default`
+entirely unguarded. A package with **no `Override` at all** — just
+`<Default Extension="dat" ContentType="…wordprocessingml.document.main+xml"/>` plus an
+`officeDocument` relationship pointing at `word/doc.dat` — skipped the XML macro scrub, and
+python-docx opened the *sanitised* output and still saw a live `DDEAUTO … cmd.exe` payload.
+Five variants bypassed. Fixed by resolving both elements through one shared
+`_declared_parts()`, so the PostScript and XML halves can no longer drift.
+
+*PDF container — no bypass found; structurally immune.* Probed with the payload as a
+reachable `/OpenAction` JavaScript action: incremental updates repointing `/Root` at a
+payload catalog, a stale payload catalog left in the file, **hybrid-reference `/XRefStm`**
+files where a classic-xref reader and an xref-stream reader resolve the same object number
+to different offsets, two `%PDF-` headers in either order, ObjStm/xref-stream containers,
+linearised files, and encrypted files. All cleaned. The reason is `cdr_pdf`'s closing
+`pdf.save()`: it rebuilds from the reachable object graph and emits **one revision**
+(verified — single `startxref`, single `%%EOF`). Every attack in this class works by leaving
+*two* candidate documents in one file and steering which the reader picks; a rebuild that
+emits one document destroys the primitive by construction. Two incidental confirmations:
+encryption is **stripped** rather than propagated (sanitised output is never an opaque blob
+to downstream scanners), a password-protected PDF raises `PasswordError` and is quarantined
+to `error/` rather than passed through, and the documented "header within the first 1024
+bytes" rule matches the code exactly (≤1024 accepted and cleaned, beyond → `CdrReject`).
+
+**The generalisable finding is the contrast, not either verdict.** `cdr_pdf` rebuilds the
+*document*; `cdr_image` rebuilds *pixels*; both are immune to their whole container bug
+class. `cdr_office` rebuilds the ZIP **entry-by-entry, preserving part bytes**, which is
+deliberate (rebuild-don't-rewrite, so nothing untouched is mangled) but leaves the package
+layer attacker-influenced — which is why declaration bugs like #54 and #55 are reachable
+there and nowhere else. **When auditing a new subsystem, ask what its rebuild strategy
+reconstructs; that predicts which bug classes can exist at all.** No code or tests were added
+for the PDF sweep: there is no defect, and pinning behaviour supplied by a third-party
+rebuild would test QPDF rather than this codebase.
+
 **Known limits of every claim in this document.** Verification here is against **pikepdf,
 python-docx, openpyxl and Pillow** — not Acrobat or Word. That is strong evidence a real
-consumer behaves the same way, and it is what confirmed the #54 bypass was live rather than
-inert, but it is not proof. Divergence between those parsers and the shipping viewers would
-not be caught by anything in this report or the test suite.
+consumer behaves the same way, and it is what confirmed the #54 and #55 bypasses were live
+rather than inert, but it is not proof. Divergence between those parsers and the shipping
+viewers would not be caught by anything in this report or the test suite. This bites hardest
+on the PDF container verdict above: the "classic-only reader" in the hybrid-reference case is
+**hypothetical**. The probe asserted that the two xref views resolve to different offsets in
+the input; it did not demonstrate a real legacy viewer following the payload branch. The
+verdict rests on the rebuild emitting one revision, which is directly verified, rather than
+on any claim about what other readers do.
 
 ---
 
