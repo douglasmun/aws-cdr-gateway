@@ -285,16 +285,39 @@ reconstructs; that predicts which bug classes can exist at all.** No code or tes
 for the PDF sweep: there is no defect, and pinning behaviour supplied by a third-party
 rebuild would test QPDF rather than this codebase.
 
+*Cross-engine confirmation (2026-08-14).* The sweep's verdicts were re-run against mupdf,
+poppler and pdf.js — three engines independent of pikepdf/QPDF. All agree: the inputs carry
+live JavaScript, the sanitised outputs carry none. Details and the retraction of the
+"classic-only reader" framing are under **Known limits** below.
+
 **Known limits of every claim in this document.** Verification here is against **pikepdf,
 python-docx, openpyxl and Pillow** — not Acrobat or Word. That is strong evidence a real
 consumer behaves the same way, and it is what confirmed the #54 and #55 bypasses were live
 rather than inert, but it is not proof. Divergence between those parsers and the shipping
-viewers would not be caught by anything in this report or the test suite. This bites hardest
-on the PDF container verdict above: the "classic-only reader" in the hybrid-reference case is
-**hypothetical**. The probe asserted that the two xref views resolve to different offsets in
-the input; it did not demonstrate a real legacy viewer following the payload branch. The
-verdict rests on the rebuild emitting one revision, which is directly verified, rather than
-on any claim about what other readers do.
+viewers would not be caught by anything in this report or the test suite.
+
+This limit **no longer applies to the PDF verdicts**, which were cross-checked on 2026-08-14
+against three engines sharing no code with pikepdf/QPDF: **mupdf 1.28.2**, **poppler**
+(`pdfinfo`/`pdftotext`) and **pdf.js 4** — the last being what ships in Firefox. All eight
+sanitised PDFs in `docs/viewer-validation/` are clean in all three (no JavaScript, no
+`/OpenAction`, no attachments), and a positive control confirms the probes detect the payloads
+in 7 of the 8 corresponding inputs, so the clean result is a real signal rather than a broken
+probe. The eighth, `pdf_lejon_multithreat`, carries `/GoToR` as its only vector — present in
+the input, absent from the output — and scored zero only because the mupdf grep pattern
+omitted that key.
+
+**The "classic-only reader" concern is retired, and it was misstated.** The incremental-update
+fixture puts the JavaScript in the **newer** revision (`/Root 5 0 R`); the older catalog is
+clean. A reader honouring the latest `startxref` — i.e. any modern parser — is therefore the
+one that reaches the payload, not a legacy one. All four engines resolve the input to the
+payload catalog and the sanitised output to the clean catalog; none follows an alternate
+branch. There is no evidence a reader exists that resolves these files differently, and the
+verdict continues to rest on the directly-verified fact that the rebuild emits one revision.
+
+The limit stands **in full for the Office paths**, which is where it matters most: both
+confirmed live bypasses (#54, #55) were OPC declaration bugs, and no equivalent
+independent-engine check has been run against Word, Excel or PowerPoint. See
+`docs/viewer-validation/CHECKLIST.md` for the manual pass that would close it.
 
 ---
 
