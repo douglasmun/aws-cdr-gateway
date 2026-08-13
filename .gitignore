@@ -57,6 +57,13 @@ override.tf.json
 docs/test-corpus/clean/
 docs/test-corpus/adversarial/
 
+# Viewer-validation corpus binaries. `originals/` holds LIVE malicious payloads
+# (DDE field codes, PDF JavaScript) and must never reach the public repo; the
+# sanitised outputs are large (~21 MB of fixture padding) and regenerable. The
+# generators + CHECKLIST.md are committed — run build_corpus.py to rebuild.
+docs/viewer-validation/originals/
+docs/viewer-validation/sanitised/
+
 # Local-only AI-agent instruction files — kept for reference, never published.
 CLAUDE.md
 AGENTS.md
