@@ -48,7 +48,7 @@ Run this checklist before considering any change complete. Each item maps to a c
 
 ### Test invariants — verify coverage was not regressed
 
-- [ ] **410 tests pass** (all passed) — `cd src && pytest test_cdr.py test_cdr_local.py -v` shows no failures.
+- [ ] **420 tests pass** (all passed) — `cd src && pytest test_cdr.py test_cdr_local.py -v` shows no failures.
 - [ ] **No routing/disarm logic duplicated into a front-end** — `handler` and `app.py` both delegate to `cdr_dispatch`; a security decision must live in exactly one place (pitfall #41).
 - [ ] **Every new CDR path has a test** — if you add a new strip rule, add a fixture that carries that threat and assert it is removed.
 - [ ] **Every new try/except warn-and-continue block has a failure-path test** — prove the success path completes even when the wrapped operation throws.

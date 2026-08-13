@@ -1461,20 +1461,31 @@ def _neutralise_pdf_risky_image_filters(pdf) -> list[str]:
 
 
 def _reject_inline_risky_images(pdf) -> list[str]:
-    """Scan every content stream (pages, form XObjects, annotation appearance streams) for
-    an inline image declaring a risky filter. Such an image bypasses the object-level sweep
-    entirely (it lives in operator tokens, not a stream object) and survives ``pdf.save()``.
-    Hard-reject the PDF if one is found — fail closed."""
+    """Scan every reachable stream for an inline image declaring a risky filter. Such an
+    image bypasses the object-level sweep entirely (it lives in operator tokens, not a
+    stream object) and survives ``pdf.save()``. Hard-reject the PDF if one is found — fail
+    closed. Walks the whole object graph rather than enumerating known containers: see the
+    note at the loop below for the six container shapes that enumeration missed."""
     def _check(obj, where: str) -> None:
         try:
             ops = pikepdf.parse_content_stream(obj)
         except Exception:
             return  # not a content stream / unparseable — object sweep covers real streams
         for operands, operator in ops:
-            if str(operator) != "INLINE IMAGE":
+            # Now that every reachable stream is scanned, `ops` can come from a stream that
+            # merely *looked* parseable — an embedded file, a font program — whose operator
+            # tokens are arbitrary binary. str() on those raises UnicodeDecodeError, which
+            # must not abort the sweep. Only the risky-filter raise below may propagate.
+            try:
+                if str(operator) != "INLINE IMAGE":
+                    continue
+                filter_lists = [
+                    [str(f) for f in getattr(operand, "filters", [])]
+                    for operand in operands
+                ]
+            except Exception:
                 continue
-            for operand in operands:
-                filters = [str(f) for f in getattr(operand, "filters", [])]
+            for filters in filter_lists:
                 if _RISKY_IMAGE_FILTERS.intersection(filters):
                     raise ValueError(
                         f"inline image with decoder-RCE filter "
@@ -1482,50 +1493,20 @@ def _reject_inline_risky_images(pdf) -> list[str]:
                         f"— rejected (cannot be safely neutralised in place)"
                     )
 
-    def _check_appearance(ap_entry, where: str) -> None:
-        # /AP/N (etc.) is either a single stream, or a sub-dictionary of streams keyed by
-        # appearance state (e.g. checkbox /On, /Off). pikepdf.Stream also exposes .items()
-        # (over its metadata dict), so a stream must be checked directly, not iterated.
-        if isinstance(ap_entry, pikepdf.Stream):
-            _check(ap_entry, where)
-        elif hasattr(ap_entry, "items"):
-            for state, stream in ap_entry.items():
-                _check_appearance(stream, f"{where}/{state}")
-
+    # Pages first, so the common case reports a page-shaped location.
     for page_num, page in enumerate(pdf.pages):
         _check(page, f"page[{page_num}] content stream")
-        # Form XObjects referenced by the page can carry their own content streams.
-        try:
-            xobjects = page.get("/Resources", {}).get("/XObject", {})
-        except Exception:
-            xobjects = {}
-        for name, xobj in (xobjects.items() if hasattr(xobjects, "items") else []):
-            try:
-                if xobj.get("/Subtype") == pikepdf.Name("/Form"):
-                    _check(xobj, f"page[{page_num}] form XObject {name}")
-            except Exception:
-                continue
-        # Annotation appearance streams (/AP /N, /D, /R) are their own content streams and
-        # are invisible to both the page-content walk above and the object-level sweep in
-        # _neutralise_pdf_risky_image_filters when the inline image lives in operator
-        # tokens rather than a stream object — same bypass as page content, different home.
-        try:
-            annots = page.get("/Annots", [])
-        except Exception:
-            annots = []
-        for annot_num, annot in enumerate(annots):
-            try:
-                ap = annot.get("/AP")
-            except Exception:
-                continue
-            if not ap:
-                continue
-            for ap_key in ("/N", "/D", "/R"):
-                if ap_key in ap:
-                    _check_appearance(
-                        ap[ap_key],
-                        f"page[{page_num}] annot[{annot_num}] appearance {ap_key}",
-                    )
+
+    # Then EVERY reachable stream. Enumerating specific containers (form XObjects one
+    # level deep, /AP appearances) missed inline images in nested form XObjects, Type3
+    # /CharProcs glyph procedures, tiling /Pattern streams and ExtGState /SMask /G groups
+    # — all content streams, none reachable through the old page→/XObject→/AP traversal.
+    # Gating on /Subtype == /Form was the same attacker-controlled-discriminator mistake as
+    # pitfall #51a: dropping /Subtype walked the payload straight through. parse_content_
+    # stream simply fails on a non-content stream, so scanning everything costs nothing.
+    for obj in _walk_pdf_nodes(pdf):
+        if isinstance(obj, pikepdf.Stream):
+            _check(obj, f"stream {obj.objgen}")
     return []
 
 
