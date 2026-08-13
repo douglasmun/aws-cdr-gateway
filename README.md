@@ -100,7 +100,7 @@ python3.12 -m venv .venv && source .venv/bin/activate
 # Install dependencies (Lambda + local-service + test-only deps)
 pip install -r src/requirements.txt -r src/requirements-local.txt -r src/requirements-dev.txt
 
-# Run the full test suite (405 tests: 355 CDR Lambda + 50 local variant)
+# Run the full test suite (410 tests: 360 CDR Lambda + 50 local variant)
 cd src && pytest test_cdr.py test_cdr_local.py -v
 
 # Run one class or test
