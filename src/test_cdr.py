@@ -3624,6 +3624,72 @@ class TestMaliciousPdfTaxonomyGaps:
             obj[pikepdf.Name(key)] = value
         return obj
 
+    @pytest.mark.parametrize("subtype", ["/Type3", "/Type1", None])
+    def test_direct_font_dict_fontmatrix_neutralised(self, subtype):
+        # pitfall #52: pdf.objects enumerates only *indirect* objects. A font dictionary
+        # written inline under /Resources /Font — never make_indirect'd — is invisible to
+        # it, so a sweep built on pdf.objects is bypassed by simply not using an object
+        # reference. The sweep must walk the reachable graph instead.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        font = pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"),
+            FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0,
+                                      pikepdf.String("0);DIRECTFONT=1;//")]))
+        if subtype is not None:
+            font[pikepdf.Name("/Subtype")] = pikepdf.Name(subtype)
+        pdf.pages[0].Resources = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(F1=font))
+        buf = io.BytesIO()
+        pdf.save(buf, compress_streams=False)
+        raw = buf.getvalue()
+        assert b"DIRECTFONT" in raw  # precondition: payload really is in the input
+        clean, report = cdr.cdr_pdf(raw)
+        assert b"DIRECTFONT" not in clean, "direct (inline) font dict bypassed the sweep"
+        assert any("/FontMatrix" in r for r in report["removed"])
+
+    def test_walk_reaches_inline_nodes_on_cold_open(self):
+        # Pins two walker invariants that a payload-survival test cannot catch reliably,
+        # because both failure modes depend on allocator/GC timing:
+        #   * direct objects must not be keyed by id() — pikepdf returns a fresh wrapper
+        #     per access, so a collected wrapper's address gets reused and an unvisited
+        #     node collides with a `seen` entry and is silently skipped;
+        #   * the page tree must be materialised before seeding, or an inline /Resources
+        #     under an untouched page is not yet reachable.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.pages[0].Resources = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(F1=pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"),
+                FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0, 0]))))
+        buf = io.BytesIO()
+        pdf.save(buf, compress_streams=False)
+
+        # Cold open: nothing has touched pdf.pages, so the walk must materialise it itself.
+        with pikepdf.open(io.BytesIO(buf.getvalue())) as cold:
+            reached = [n for n in cdr._walk_pdf_nodes(cold) if "/FontMatrix" in n]
+        assert reached, "walk missed an inline dict on a cold open"
+
+    def test_embedded_only_alternates_preserved(self):
+        # False-positive guard: /Alternates whose images are all embedded streams is
+        # legitimate fidelity data. Only subtrees that actually name an external file
+        # get removed, so this one must survive untouched.
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        alternate = self._image_xobject(pdf)  # fully self-contained: no /F anywhere
+        base = self._image_xobject(pdf, **{"/Alternates": pikepdf.Array([
+            pikepdf.Dictionary(Image=pdf.make_indirect(alternate),
+                               DefaultForPrinting=True)])})
+        pdf.pages[0].Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=base))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        clean, report = cdr.cdr_pdf(buf.getvalue())
+        assert not any("/Alternates" in r for r in report["removed"]), \
+            "embedded-only /Alternates was stripped as an external reference"
+        with pikepdf.open(io.BytesIO(clean)) as out:
+            xobjects = out.pages[0].obj["/Resources"]["/XObject"]
+            assert "/Alternates" in xobjects["/Im0"]
+
     def test_image_alternates_external_ref_removed(self):
         # /Alternates holds replacement images the viewer may fetch instead of the
         # embedded one — the same fetch-on-open shape as /F, one level of indirection out.

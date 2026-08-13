@@ -1529,6 +1529,86 @@ def _reject_inline_risky_images(pdf) -> list[str]:
     return []
 
 
+# pdf.objects enumerates only *indirect* objects. A dictionary written inline — e.g. a
+# Type3 font sitting directly in /Resources /Font /F1 rather than behind an object
+# reference — is never visited by it, so any sweep built on pdf.objects alone is bypassed
+# by the attacker simply not making their payload indirect (pitfall #52). Walk the
+# reachable graph instead: the object *tree*, not the object *table*.
+_PDF_WALK_MAX_NODES = 500_000
+
+
+def _walk_pdf_nodes(pdf):
+    """Yield every dictionary and stream reachable from the document root.
+
+    Covers direct (inline) objects, which ``pdf.objects`` omits, as well as every indirect
+    object still referenced from the catalog. Indirect objects are additionally seeded from
+    ``pdf.objects`` so an orphan that is not reachable from the root — but is still present
+    in the file, and so still parsed by a lenient viewer — is not skipped either.
+
+    Cycles are broken with a seen-set keyed on ``objgen`` for indirect objects and on the
+    node's *path from the root* for direct ones. ``id()`` must not be used as that key:
+    pikepdf hands back a fresh Python wrapper on every access, so a temporary wrapper can
+    be collected and its address reused by the next one, which would make an unvisited node
+    collide with a ``seen`` entry and be silently skipped. ``_PDF_WALK_MAX_NODES`` bounds a
+    hostile file that nests direct dictionaries deeply enough to make the walk itself the
+    denial of service."""
+    seen: set = set()
+    stack: list = []
+
+    def key_of(node, path):
+        objgen = getattr(node, "objgen", None)
+        # (0, 0) is pikepdf's sentinel for a direct object: not a real object number, and
+        # shared by every direct object in the file — so key those by path instead.
+        if objgen and objgen != (0, 0):
+            return ("i", objgen)
+        return ("d", path)
+
+    def push(node, path):
+        if isinstance(node, (pikepdf.Dictionary, pikepdf.Array, pikepdf.Stream)):
+            stack.append((node, path))
+
+    try:
+        push(pdf.Root, "/Root")
+    except Exception as exc:
+        logger.debug("Could not seed /Root for PDF walk: %s", exc)
+    # Materialise the page tree before seeding: pikepdf builds page objects lazily, and an
+    # inline /Resources dictionary under a page that has never been touched is not yet
+    # reachable through the handles the walk sees.
+    try:
+        for page_index, page in enumerate(pdf.pages):
+            push(page.obj, f"/Page[{page_index}]")
+    except Exception as exc:
+        logger.debug("Could not seed pages for PDF walk: %s", exc)
+    for obj_index, obj in enumerate(pdf.objects):
+        push(obj, f"/Objects[{obj_index}]")
+
+    visited = 0
+    while stack:
+        node, path = stack.pop()
+        node_key = key_of(node, path)
+        if node_key in seen:
+            continue
+        seen.add(node_key)
+        visited += 1
+        if visited > _PDF_WALK_MAX_NODES:
+            logger.warning("PDF object walk hit the %d-node cap; truncating",
+                           _PDF_WALK_MAX_NODES)
+            return
+        if isinstance(node, pikepdf.Array):
+            try:
+                for element_index, element in enumerate(node):
+                    push(element, f"{path}[{element_index}]")
+            except Exception as exc:
+                logger.debug("Could not iterate array during PDF walk: %s", exc)
+            continue
+        yield node
+        try:
+            for name, value in node.items():
+                push(value, f"{path}{name}")
+        except Exception as exc:
+            logger.debug("Could not iterate dict during PDF walk: %s", exc)
+
+
 # A stream's /F key is an *external file specification*: the viewer fetches the stream's
 # data from that path instead of using the embedded bytes. Pointed at a UNC share
 # (\\host\share) it leaks NTLM credentials on open, with no action object anywhere in the
@@ -1536,6 +1616,39 @@ def _reject_inline_risky_images(pdf) -> list[str]:
 # Office-path UNC handling (see the WEBSERVICE/HYPERLINK notes above), different container.
 # /Alternates and /OPI are the same fetch-on-open shape for image XObjects.
 _EXTERNAL_STREAM_REF_KEYS = ("/F", "/Alternates", "/OPI")
+
+# /F on a stream is *always* an external fetch, so it goes unconditionally. /Alternates and
+# /OPI are only dangerous when something underneath them names an external file: an
+# /Alternates array whose images are all embedded streams is legitimate fidelity data, and
+# deleting it degrades the file for no security gain. These two are therefore scoped to
+# subtrees that actually carry an /F.
+_CONDITIONAL_EXTERNAL_REF_KEYS = ("/Alternates", "/OPI")
+_EXTERNAL_REF_SCAN_MAX_NODES = 10_000
+
+
+def _subtree_has_external_ref(node, depth: int = 0, budget: list | None = None) -> bool:
+    """True if any dictionary under ``node`` carries an external file spec.
+
+    Fails *closed*: anything unreadable, cyclic beyond the budget, or deeper than the cap
+    counts as external, so an obfuscated subtree is removed rather than kept."""
+    if budget is None:
+        budget = [_EXTERNAL_REF_SCAN_MAX_NODES]
+    budget[0] -= 1
+    if budget[0] <= 0 or depth > 64:
+        return True
+    try:
+        if isinstance(node, pikepdf.Array):
+            return any(_subtree_has_external_ref(e, depth + 1, budget) for e in node)
+        if isinstance(node, (pikepdf.Dictionary, pikepdf.Stream)):
+            # /F here means the same thing it means on a stream: fetch from elsewhere.
+            # (On a file-spec dictionary it is the path itself; either way it is external.)
+            if "/F" in node or "/UF" in node or "/URL" in node:
+                return True
+            return any(_subtree_has_external_ref(v, depth + 1, budget)
+                       for v in node.values())
+    except Exception:
+        return True
+    return False
 
 
 def _strip_pdf_external_stream_refs(pdf) -> list[str]:
@@ -1547,15 +1660,33 @@ def _strip_pdf_external_stream_refs(pdf) -> list[str]:
     construction — an embedded stream that needs an external fetch is already outside what
     we are willing to pass through. The stream's own bytes are left intact, so a legitimate
     file simply renders from the data it already carries."""
+    streams = [o for o in _walk_pdf_nodes(pdf) if isinstance(o, pikepdf.Stream)]
+
+    # Decide the conditional keys up front, against the *untouched* document. Stripping /F
+    # from a nested alternate image would otherwise make its parent's /Alternates subtree
+    # look clean by the time we reach it, so whether the parent is kept would depend on
+    # traversal order. Snapshot the verdicts first, then mutate.
+    doomed: set = set()
+    for obj in streams:
+        for key in _CONDITIONAL_EXTERNAL_REF_KEYS:
+            try:
+                if key in obj and _subtree_has_external_ref(obj[key]):
+                    doomed.add((obj.objgen, key))
+            except Exception as exc:
+                raise ValueError(
+                    f"Could not inspect {key} on a PDF stream"
+                ) from exc
+
     removed: list[str] = []
-    for obj in pdf.objects:
-        if not isinstance(obj, pikepdf.Stream):
-            continue
+    for obj in streams:
         # Per-key try, not per-stream: a single malformed key must not abort the sweep of
         # the remaining keys on the same stream and leave a live /F behind.
         for key in _EXTERNAL_STREAM_REF_KEYS:
             try:
                 if key not in obj:
+                    continue
+                if (key in _CONDITIONAL_EXTERNAL_REF_KEYS
+                        and (obj.objgen, key) not in doomed):
                     continue
                 del obj[key]
                 # /FDecodeParms and /FFilter only have meaning alongside /F; leaving
@@ -1566,7 +1697,12 @@ def _strip_pdf_external_stream_refs(pdf) -> list[str]:
                             del obj[companion]
                 removed.append(f"stream external file ref {key}")
             except Exception as exc:
-                logger.debug("Skipped %s during external-ref sweep: %s", key, exc)
+                # Fail closed. Reaching here means the key was present and the delete
+                # failed, so a live external-fetch reference is still on the stream;
+                # swallowing that would pass a credential-leaking file off as sanitised.
+                raise ValueError(
+                    f"Could not remove external file reference {key} from PDF stream"
+                ) from exc
     return removed
 
 
@@ -1601,30 +1737,37 @@ def _strip_pdf_fontmatrix(pdf) -> list[str]:
     Any dictionary carrying a ``/FontMatrix`` is checked; a well-formed one is untouched,
     so the broader scope costs nothing on legitimate files."""
     removed: list[str] = []
-    for obj in pdf.objects:
-        if not isinstance(obj, pikepdf.Dictionary):
+    for obj in _walk_pdf_nodes(pdf):
+        if not isinstance(obj, (pikepdf.Dictionary, pikepdf.Stream)):
             continue
         try:
             if "/FontMatrix" not in obj:
                 continue
             matrix = obj["/FontMatrix"]
-            numeric = True
-            try:
-                if len(matrix) != 6:
-                    numeric = False
-                else:
-                    for element in matrix:
-                        if not _is_pdf_number(element):
-                            numeric = False
-                            break
-            except TypeError:
-                numeric = False  # not even an array — spec-violating
-            if numeric:
-                continue
-            obj["/FontMatrix"] = pikepdf.Array(_DEFAULT_FONT_MATRIX)
-            removed.append("/FontMatrix (non-numeric, reset to default)")
         except Exception as exc:
-            logger.debug("Skipped object during /FontMatrix sweep: %s", exc)
+            # Probing the key failed, so we cannot show the matrix is safe. Treat an
+            # unreadable /FontMatrix as hostile rather than assuming it is absent.
+            raise ValueError("Could not inspect /FontMatrix on a PDF object") from exc
+        numeric = True
+        try:
+            if len(matrix) != 6:
+                numeric = False
+            else:
+                for element in matrix:
+                    if not _is_pdf_number(element):
+                        numeric = False
+                        break
+        except TypeError:
+            numeric = False  # not even an array — spec-violating
+        if numeric:
+            continue
+        try:
+            obj["/FontMatrix"] = pikepdf.Array(_DEFAULT_FONT_MATRIX)
+        except Exception as exc:
+            # Fail closed: a risky /FontMatrix was positively identified and the reset
+            # did not take, so the CVE-2024-4367 payload is still in the output.
+            raise ValueError("Could not neutralise a malformed PDF /FontMatrix") from exc
+        removed.append("/FontMatrix (non-numeric, reset to default)")
     return removed
 
 
