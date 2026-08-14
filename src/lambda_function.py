@@ -578,8 +578,14 @@ def handler(event: dict, context) -> dict:
 def _is_xml_ct(ct: str) -> bool:
     """True when a content type's media subtype is XML. ``+xml`` covers the OOXML family
     (…wordprocessingml.document.main+xml, …drawing+xml, …); ``text/xml`` and
-    ``application/xml`` cover the plain forms."""
-    ct = ct.strip().lower()
+    ``application/xml`` cover the plain forms.
+
+    Any ``;`` parameter is discarded before the suffix test. OPC declares a bare media
+    type, so ``…main+xml; charset=utf-8`` is malformed and both LibreOffice and
+    python-docx refuse the package outright — the parameter is stripped for robustness,
+    not to close a live bypass (see pitfall #58). Without it the trailing parameter moves
+    ``+xml`` off the end of the string and the part is never classified as XML."""
+    ct = ct.split(";", 1)[0].strip().lower()
     return ct.endswith("+xml") or ct in ("text/xml", "application/xml")
 
 
