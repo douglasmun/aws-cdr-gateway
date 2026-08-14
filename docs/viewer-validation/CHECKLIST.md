@@ -58,7 +58,7 @@ These are the reason the corpus exists. Both were **live bypasses**: python-docx
 | `pdf_acroform_js.pdf` | Form fields render; no JS on focus/calculate. `/AcroForm` is *present* by design — field geometry is kept, actions stripped. | |
 | `pdf_embedded_file.pdf` | **Attachments pane must be empty.** | |
 | `pdf_multithreat.pdf` | Several vectors stripped at once; page still renders. | |
-| `pdf_lejon_multithreat.pdf` | malicious-pdf taxonomy sample. | |
+| `pdf_lejon_multithreat.pdf` | malicious-pdf taxonomy sample — `/Threads`, a `GoToR` UNC link, a poisoned `/FontMatrix` and two external-stream `/F` refs. Page renders; **no prompt to open a network location**. | |
 | `pdf_javascript_realistic.pdf` | 24-page realistic document — the fidelity stress case. Renders fully, no script. | |
 
 ### Priority 4 — PDF container layer (the 2026-08-14 sweep)
@@ -69,6 +69,16 @@ These probe the claim that `pdf.save()` collapses multi-revision containers into
 |---|---|---|
 | `pdfc_incremental_update.pdf` | Input had two revisions, the newer pointing at a JavaScript catalog. Output must show **no JS alert** — confirms the rebuild collapsed them. | |
 | `pdfc_encrypted_input.pdf` | Input was **encrypted**; output should open with **no password prompt** (encryption is stripped by design) and no JS alert. | |
+
+### What pikepdf already says about these eight — and why that is not the answer
+
+Re-checked 2026-08-14, before the Acrobat pass, so you know what a disagreement would look like. By pikepdf all eight are clean: **no `/OpenAction`, no catalog `/AA`, no `/Names/JavaScript`, no `/Names/EmbeddedFiles`, no page `/AA`, no annotation actions, zero `/JS` tokens, zero `/Filespec` or `/EmbeddedFile` tokens, and none still encrypted.** `/AcroForm` survives in `pdf_acroform_js.pdf` and `pdf_multithreat.pdf` by design — field geometry is kept, actions stripped — and neither retains `/XFA`.
+
+`pdf_lejon_multithreat.pdf` was verified separately because its vectors are different in kind: **8 vector tokens in the input, 1 benign structure out.** `/Threads`, the `/Type /Thread` object, the `GoToR` UNC link, both `attacker.invalid` external-stream `/F` refs and the `CDR_TEST_MULTI_PWNED` marker are all gone. `/FontMatrix` remains — it is a legitimate Type3 font key — but now holds six numbers, the injected `(0);globalThis…//` string having been stripped from element 5 with the structure intact. The link annotation keeps its `/Rect` and loses its `/A`.
+
+**This is the oracle with the known blind spot, so it settles nothing on its own.** It is recorded here for one reason: if Acrobat prompts on any of these, the disagreement is the finding, and knowing pikepdf saw nothing is what makes it diagnosable.
+
+> **A probe gap found while writing this, worth repeating.** The first sweep reported all eight clean *and* the positive control fired on only 7 of 8 — `in_pdf_lejon_multithreat.pdf` showed nothing even as a malicious input. The probe was looking for `/JS`, `/OpenAction` and `/Filespec`; that fixture carries none of them. Its threats are `/Threads`, `GoToR`, `/FontMatrix` and external `/F` refs, so the probe was blind to the entire file and its silence read exactly like a clean result. **A positive control that fires on most inputs is not a passing control** — the one row that stays quiet is the one to chase, because it means the probe and the fixture disagree about what the threat even is.
 
 ## Red flags — report immediately
 
