@@ -333,9 +333,18 @@ covers `.docx` alone, so those packages had never been opened by any parser. An 
 criterion needs applying across every type it logically covers, not just the one the
 available parser happens to check.
 
-What remains genuinely untested is **Word, Excel and PowerPoint themselves**, and that is
-still where it matters most: both confirmed live bypasses were OPC declaration bugs. See
-`docs/viewer-validation/CHECKLIST.md` for the manual pass that would close it.
+**Closed for Word and Excel, 2026-08-14.** The manual pass has since been run: all five Office
+outputs were opened in Word and Excel themselves, 5 of 5 pass. The two confirmed live bypasses
+are the load-bearing results — Word rendered a part named `.bin` (resolving it via the
+`Override`, not the suffix) and a part declared solely by `<Default Extension="dat">`, and in
+both cases **executed nothing**: no remote-data prompt, no repair prompt. So the interactive
+viewer agrees with the Python-parser verdict on exactly the bug class where they could most
+plausibly have diverged.
+
+What remains untested is **PowerPoint and Acrobat**. PowerPoint has no corpus file at all —
+`pptx_activex` is one of the excluded empty-`_rels` fixtures above — so closing it means
+building a loadable `.pptx` fixture first, not just opening one. See
+`docs/viewer-validation/CHECKLIST.md`.
 
 ---
 

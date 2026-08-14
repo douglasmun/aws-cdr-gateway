@@ -4,7 +4,9 @@
 
 This corpus closes that gap the only way it can be closed: **a human opens the sanitised files in the real viewers.**
 
-Everything here has already been checked with the Python parsers and is payload-free by that measure. What is unverified — and what you are being asked to check — is whether **Word, Excel, PowerPoint and Acrobat agree**.
+Everything here has already been checked with the Python parsers and is payload-free by that measure. What is unverified — and what you are being asked to check — is whether the **real viewers agree**.
+
+**Status, 2026-08-14: the Office half is done.** All five `.docx`/`.xlsx` files have been opened in Word and Excel themselves — 5 of 5 PASS, including both live-bypass mechanisms from pitfalls #54 and #55. See the Word and Excel sections below. **The eight PDFs remain unchecked in Acrobat**, and that is what is still being asked for.
 
 ## How to run it
 
@@ -31,9 +33,9 @@ These are the reason the corpus exists. Both were **live bypasses**: python-docx
 
 | File | What to check | Result |
 |---|---|---|
-| `p55_realistic.docx` | **Highest-value file here.** A real python-docx document (heading, styled runs, 2×2 table) whose main part was relocated to `word/doc.dat` and declared solely by `<Default Extension="dat">`. Word must render heading, bold run, and table, with **no DDE/remote-data prompt**. | |
-| `p55_default_dat.docx` | Minimal version of the same #55 vector — declared by `Default Extension`, no `Override` at all. | |
-| `p54_override_bin.docx` | Pitfall #54: document part named `.bin`, declared XML via an `Override`. | |
+| `p55_realistic.docx` | **Highest-value file here.** A real python-docx document (heading, styled runs, 2×2 table) whose main part was relocated to `word/doc.dat` and declared solely by `<Default Extension="dat">`. Word must render heading, bold run, and table, with **no DDE/remote-data prompt**. | **PASS — Word, 2026-08-14.** Full fidelity: Title style, all four paragraphs, bold run, 2×2 table with all cells. No repair prompt. **No remote-data prompt and nothing launched.** The `DDEAUTO _CDR_REMOVED_ "/c calc.exe"` line rendered as **plain prose**, not a resolved field — pitfall #13 residue behaving exactly as designed. |
+| `p55_default_dat.docx` | Minimal version of the same #55 vector — declared by `Default Extension`, no `Override` at all. | **PASS — Word, 2026-08-14.** Opens cleanly, no repair prompt, both paragraphs render. **No remote-data prompt and nothing launched.** Word resolved the `Default`-declared part (it displayed the content) yet executed nothing; both the self-describing prose and the `_CDR_REMOVED_` residue rendered as plain text. |
+| `p54_override_bin.docx` | Pitfall #54: document part named `.bin`, declared XML via an `Override`. | **PASS — Word, 2026-08-14.** Opens cleanly, no repair prompt, both paragraphs render. **No remote-data prompt and nothing launched.** Word rendered the part despite its `.bin` name — so it honoured the `Override` rather than the suffix — and still executed nothing. |
 
 > **Expected residue — not a finding.** The scrubbed field reads `DDEAUTO _CDR_REMOVED_ "/c calc.exe"`. The *executable path* is replaced; the inert string `calc.exe` survives inside the quoted argument (pitfall #13). Word has no DDE target to resolve, so nothing launches. **Seeing `calc.exe` in the XML is expected; being *prompted* to update remote data is not.**
 
@@ -43,8 +45,8 @@ These are the reason the corpus exists. Both were **live bypasses**: python-docx
 
 | File | What to check | Result |
 |---|---|---|
-| `macro-sample.docx` | Input was `.docm`; output is `.docx` by `EXT_REMAP`. Must open cleanly, and **Alt+F8 should list no macros**. | |
-| `xlsm_vba_realistic.xlsx` | Input `.xlsm` → output `.xlsx`. Cell values and formulas intact; no macros. **Expect a slow open** — `sheet1.xml` is ~29 MB of size-cap padding inside a 3 MB file. A pause is not a hang. | |
+| `macro-sample.docx` | Input was `.docm`; output is `.docx` by `EXT_REMAP`. Must open cleanly, and **Alt+F8 should list no macros**. | **PASS — Word, 2026-08-14.** Heading 1 styled, all four paragraphs render, no repair prompt. **Alt+F8 lists no macros** — the `.docm`'s `vbaProject.bin` is gone and Word has nothing to offer. |
+| `xlsm_vba_realistic.xlsx` | Input `.xlsm` → output `.xlsx`. Cell values and formulas intact; no macros. **Expect a slow open** — `sheet1.xml` is ~29 MB of size-cap padding inside a 3 MB file. A pause is not a hang. | **PASS — Excel, 2026-08-14.** Opens with no repair prompt; header styling and all ten columns render. `I2` shows `=G2*H2` in the formula bar, so formulas survive as formulas rather than frozen values. `Summary` opens and its cross-sheet `SUMIF` resolves — no `#REF!`. **Alt+F8 lists no macros.** Corroborated structurally: both worksheet parts are byte-identical to the input, and `xl/vbaProject.bin` is the only ZIP entry CDR removed. |
 
 ### Priority 3 — PDF, in Acrobat
 
@@ -101,6 +103,24 @@ Six repo fixtures are **excluded by the generator** — not omitted by hand, so 
 All six are synthetic packages with an **empty `_rels/.rels`** — no `officeDocument` relationship, so nothing points from the package root to the document, workbook or presentation. python-docx cannot open the `.docx` ones and LibreOffice cannot load the `.xlsx`/`.pptx` ones. The decisive part: **the inputs fail identically**, so a viewer rejecting them tells you nothing about CDR. They remain valid unit-test fixtures; they are just not viewer-validation material.
 
 The last two were added on 2026-08-14. They had survived the first cut because python-docx only covers `.docx`, so the `.xlsx`/`.pptx` packages were never opened by any parser until LibreOffice was brought in — a reminder that an exclusion criterion needs applying across *every* type it logically covers, not just the one the available parser happened to check.
+
+## Word — complete, 2026-08-14
+
+All four `.docx` files were opened in **Word itself**, the parser whose disagreement with python-docx defined pitfalls #54 and #55. **4 of 4 PASS**, fidelity and security.
+
+The decisive results are the two live-bypass mechanisms. In `p54_override_bin.docx` Word rendered a part named `.bin`, so it resolved it through the `Override` rather than the file suffix; in `p55_default_dat.docx` and `p55_realistic.docx` Word resolved a part declared solely by `<Default Extension="dat">`. In every case Word reached the part **and executed nothing** — no remote-data prompt, no repair prompt. That is the specific question a headless LibreOffice render could not answer, and it now has an answer for Word.
+
+`macro-sample.docx` adds the macro check: **Alt+F8 lists no macros**, so the `.docm`'s `vbaProject.bin` is genuinely absent rather than merely unreferenced.
+
+Word's verdicts therefore corroborate the Python-parser verdicts rather than contradicting them.
+
+## Excel — complete, 2026-08-14
+
+`xlsm_vba_realistic.xlsx` opened in **Excel itself**: no repair prompt, formulas intact as formulas (`I2` = `=G2*H2`), the `Summary` sheet's cross-sheet `SUMIF` resolving, and **no macros under Alt+F8**.
+
+This file tests the opposite risk from the Word set, and it is worth being explicit about which claim it settles. The Word files asked whether a *real* viewer executes a part the Python parser thought was scrubbed. Here CDR removed exactly one ZIP entry — `xl/vbaProject.bin` — and rewrote nothing: both worksheet parts are byte-identical to the input. So the security claim was nearly settled by the entry list alone, and the open risk was **over-stripping** — Excel rejecting the rebuilt package, or recalculating on open and finding the cross-sheet reference broken. Neither happened. Excel therefore confirms fidelity; it does not add an independent security data point the way Word did.
+
+**Office is now complete: 5 of 5 PASS.** PowerPoint has no corpus file (`pptx_activex` is an excluded dead fixture, see below), so the remaining gap is **Acrobat** — the eight PDF files in Priorities 3 and 4.
 
 ## Interpreting the outcome
 
