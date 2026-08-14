@@ -6,9 +6,9 @@ This corpus closes that gap the only way it can be closed: **a human opens the s
 
 Everything here has already been checked with the Python parsers and is payload-free by that measure. What is unverified — and what you are being asked to check — is whether the **real viewers agree**.
 
-**Status, 2026-08-14: the manual pass is COMPLETE — 13 of 13 PASS.** All five Office outputs were opened in **Word and Excel** and all eight PDFs in **Acrobat**. No repair prompt, no macro warning, no remote-data or DDE prompt, no JavaScript alert, no attachment, no network-location prompt, no password prompt, and nothing launched — in the real viewers, not just the Python parsers. Details in the Word, Excel and Acrobat sections below.
+**Status, 2026-08-14: the manual pass is COMPLETE — 14 of 14 PASS, across every target engine.** Six Office outputs were opened in **Word, Excel and PowerPoint** and all eight PDFs in **Acrobat**. No repair prompt, no macro warning, no remote-data or DDE prompt, no remote-template prompt, no JavaScript alert, no attachment, no network-location prompt, no password prompt, and nothing launched — in the real viewers, not just the Python parsers. Details in the sections below.
 
-**One file is now waiting on you: `pptm_vba_realistic.pptx`.** PowerPoint was the last unverified engine, and it could not be checked at all because the corpus had no loadable `.pptx` — `pptx_activex` is an excluded empty-`_rels` fixture whose *input* no engine can open. A genuine presentation carrying a VBA project and a remote-template link has now been built for it (Priority 2b below), so the gap is a viewer check rather than a missing fixture.
+**No engine is left unverified.** PowerPoint was the last gap and could not be checked at all until a fixture existed for it: the corpus had no loadable `.pptx`, only `pptx_activex`, an excluded empty-`_rels` package whose *input* no engine can open. A genuine presentation carrying a VBA project and a remote-template link was built to close it (Priority 2b below) and has now been opened in PowerPoint itself.
 
 ## How to run it
 
@@ -56,7 +56,7 @@ Built to close the last engine gap. The repo's `pptx_activex` fixture could not 
 
 | File | What to check | Result |
 |---|---|---|
-| `pptm_vba_realistic.pptx` | Input was `.pptm`; output is `.pptx` by `EXT_REMAP`. **Both text boxes must render.** No macro warning (Developer → Macros lists none), and **no prompt to fetch a remote template**. | |
+| `pptm_vba_realistic.pptx` | Input was `.pptm`; output is `.pptx` by `EXT_REMAP`. **Both text boxes must render.** No macro warning (Developer → Macros lists none), and **no prompt to fetch a remote template**. | **PASS — PowerPoint, 2026-08-14.** Both text boxes rendered. No macro warning. **No prompt to fetch the remote template.** |
 
 Verified before asking: CDR reports removing the `vbaProject` content type, the macro-enabled `main+xml` content type, the `vbaProject` and `attachedTemplate` rels, and `ppt/vbaProject.bin`. **6 threat indicators in the input, 0 in the output, slide text preserved**, and both input and output load in LibreOffice. The generator asserts each of those, so a regression fails the build rather than quietly emitting a useless fixture.
 
@@ -140,7 +140,7 @@ All six are synthetic packages with an **empty `_rels/.rels`** — no `officeDoc
 
 The last two were added on 2026-08-14. They had survived the first cut because python-docx only covers `.docx`, so the `.xlsx`/`.pptx` packages were never opened by any parser until LibreOffice was brought in — a reminder that an exclusion criterion needs applying across *every* type it logically covers, not just the one the available parser happened to check.
 
-**Excluding `pptx_activex` left PowerPoint with no coverage at all**, which is a gap rather than a resolution. `pptm_vba_realistic` (Priority 2b) was built to fill it: same threat classes, in a package a viewer will actually open. Excluding an unloadable fixture is correct; leaving the format unrepresented afterwards is not.
+**Excluding `pptx_activex` left PowerPoint with no coverage at all**, which was a gap rather than a resolution. `pptm_vba_realistic` (Priority 2b) was built to fill it — same threat classes, in a package a viewer will actually open — and has since passed in PowerPoint itself. Excluding an unloadable fixture is correct; leaving the format unrepresented afterwards is not.
 
 ## Word — complete, 2026-08-14
 
@@ -158,7 +158,15 @@ Word's verdicts therefore corroborate the Python-parser verdicts rather than con
 
 This file tests the opposite risk from the Word set, and it is worth being explicit about which claim it settles. The Word files asked whether a *real* viewer executes a part the Python parser thought was scrubbed. Here CDR removed exactly one ZIP entry — `xl/vbaProject.bin` — and rewrote nothing: both worksheet parts are byte-identical to the input. So the security claim was nearly settled by the entry list alone, and the open risk was **over-stripping** — Excel rejecting the rebuilt package, or recalculating on open and finding the cross-sheet reference broken. Neither happened. Excel therefore confirms fidelity; it does not add an independent security data point the way Word did.
 
-**Office is complete: 5 of 5 PASS.**
+## PowerPoint — complete, 2026-08-14
+
+`pptm_vba_realistic.pptx` opened in **PowerPoint itself**: both text boxes rendered, **no macro warning**, and **no prompt to fetch the remote template**.
+
+That last check is why this fixture had to exist, and it is the one no other engine could make. LibreOffice loading the file proves the `attachedTemplate` relationship is structurally gone; it cannot prove PowerPoint declines to *act* on one, because a headless render never attempts the fetch in the first place. The remote-template link is a fetch-on-open mechanism — a live `\\attacker.invalid\share\evil.potm` reference — so the only instrument that can confirm silence is the application that would otherwise reach for the network. Same reasoning that made Word, not LibreOffice, the engine that settled DDE for #54/#55.
+
+The VBA side is the weaker of the two claims, and worth labelling as such: CDR removed `ppt/vbaProject.bin` outright along with its content type and rel, so the absence of a macro warning was strongly implied by the entry list before PowerPoint was opened. The remote-template result is the one that was genuinely open.
+
+**Office is complete: 6 of 6 PASS, across Word, Excel and PowerPoint.**
 
 ## Acrobat — complete, 2026-08-14
 

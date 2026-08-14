@@ -350,10 +350,18 @@ catalog reachable, and `pdfc_encrypted_input.pdf` opens with **no password promp
 encryption is genuinely stripped. `pdf_javascript_realistic.pdf` kept all 24 pages and all
 55,422 content bytes while losing all 9 `/JS` tokens.
 
-That puts the manual pass at **13 of 13** across Word, Excel and Acrobat. What remains untested
-is **PowerPoint**, and it is a fixture problem rather than a viewer one: there is no `.pptx` in
-the corpus at all — `pptx_activex` is one of the excluded empty-`_rels` fixtures above, whose
-input no engine can load — so closing it means building a loadable package first. See
+**PowerPoint closed last, same date**, and it was a fixture problem before it was a viewer one:
+there was no `.pptx` in the corpus at all — `pptx_activex` is one of the excluded empty-`_rels`
+fixtures above, whose input no engine can load — so a loadable package had to be built first.
+`pptm_vba_realistic.pptx` carries a VBA project and an external `attachedTemplate` rel pointing
+at a remote `.potm`. Both text boxes render, Developer → Macros lists none, and there is **no
+prompt to fetch the remote template**. That last result is the one only PowerPoint could
+produce: a headless render never *attempts* a template fetch, so LibreOffice could show the
+relationship was structurally gone but never that the application declines to reach for the
+network — the same limit that made Word, not LibreOffice, decisive for DDE.
+
+That puts the manual pass at **14 of 14**, with **no engine left unverified**: Word, Excel and
+PowerPoint on the Office side, Acrobat on the PDF side. See
 `docs/viewer-validation/CHECKLIST.md`.
 
 ---
