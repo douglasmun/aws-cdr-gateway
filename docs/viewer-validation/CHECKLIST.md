@@ -67,10 +67,10 @@ These are the reason the corpus exists. Both were **live bypasses**: python-docx
 | File | What to check | Result |
 |---|---|---|
 | `pdf_openaction_js.pdf` | Opens with **no JavaScript alert**. **A blank white page is the correct result** — see note below; do not read it as over-stripping. | **PASS — Acrobat, 2026-08-14.** Opens, blank white page, **no JavaScript alert**. The `/OpenAction` JS that Acrobat would have run on open is gone. Blank is expected: the input has no `/Contents` either (verified), so there was never any page content to lose. |
-| `pdf_acroform_js.pdf` | Form fields render; no JS on focus/calculate. `/AcroForm` is *present* by design — field geometry is kept, actions stripped. | |
-| `pdf_embedded_file.pdf` | **Attachments pane must be empty.** | |
-| `pdf_multithreat.pdf` | Several vectors stripped at once; page still renders. | |
-| `pdf_lejon_multithreat.pdf` | malicious-pdf taxonomy sample — `/Threads`, a `GoToR` UNC link, a poisoned `/FontMatrix` and two external-stream `/F` refs. Page renders; **no prompt to open a network location**. | |
+| `pdf_acroform_js.pdf` | Blank page expected. No JS on open/focus/calculate. `/AcroForm` is *present* by design — field geometry is kept, actions stripped. | **PASS — Acrobat, 2026-08-14.** Opens blank, no JavaScript alert. The 4 `/JS` tokens in the input are gone while `/AcroForm` survives with no `/XFA`. |
+| `pdf_embedded_file.pdf` | Blank page expected. **No attachment offered.** | **PASS — Acrobat, 2026-08-14.** Opens blank, nothing offered. Structurally confirmed: `/Names/EmbeddedFiles` is gone and `/Filespec`+`/EmbeddedFile` tokens drop 3→0, so the pane has nothing to list. |
+| `pdf_multithreat.pdf` | Blank page expected. Several vectors stripped at once — no alert, no attachment. | **PASS — Acrobat, 2026-08-14.** Opens blank, no alert, nothing offered. `/OpenAction` and `/Names/EmbeddedFiles` gone, 4 `/JS` and 3 `/Filespec`/`/EmbeddedFile` tokens → 0; `/AcroForm` retained by design. |
+| `pdf_lejon_multithreat.pdf` | Blank page expected. malicious-pdf taxonomy sample — `/Threads`, a `GoToR` UNC link, a poisoned `/FontMatrix` and two external-stream `/F` refs. **No prompt to open a network location.** | **PASS — Acrobat, 2026-08-14.** Opens blank, no network-location prompt. 8 vector tokens in the input → 1 benign structure out; the `GoToR` UNC target and both `attacker.invalid` external-stream refs are gone, and `/FontMatrix` is six clean numbers. |
 | `pdf_javascript_realistic.pdf` | 24-page realistic document — the fidelity stress case. Renders fully, no script. | |
 
 ### Priority 4 — PDF container layer (the 2026-08-14 sweep)
@@ -79,8 +79,8 @@ These probe the claim that `pdf.save()` collapses multi-revision containers into
 
 | File | What to check | Result |
 |---|---|---|
-| `pdfc_incremental_update.pdf` | Input had two revisions, the newer pointing at a JavaScript catalog. Output must show **no JS alert** — confirms the rebuild collapsed them. | |
-| `pdfc_encrypted_input.pdf` | Input was **encrypted**; output should open with **no password prompt** (encryption is stripped by design) and no JS alert. | |
+| `pdfc_incremental_update.pdf` | Input had two revisions, the newer pointing at a JavaScript catalog. Output must show **no JS alert** — confirms the rebuild collapsed them. | **PASS — Acrobat, 2026-08-14.** Renders (near-blank, 51 bytes of content preserved exactly), **no JavaScript alert**. Acrobat resolves one document, so `pdf.save()` did collapse the revisions rather than leaving the newer JS catalog reachable — the specific claim this file exists to test. |
+| `pdfc_encrypted_input.pdf` | Input was **encrypted**; output should open with **no password prompt** (encryption is stripped by design) and no JS alert. | **PASS — Acrobat, 2026-08-14.** Opens straight to a blank page — **no password prompt**, no JavaScript alert. Encryption stripped as designed and the `/OpenAction` JS gone with it. |
 
 ### What pikepdf already says about these eight — and why that is not the answer
 
