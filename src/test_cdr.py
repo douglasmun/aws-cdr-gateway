@@ -4083,6 +4083,74 @@ class TestMaliciousPdfTaxonomyGaps:
             reached = [n for n in cdr._walk_pdf_nodes(cold) if "/FontMatrix" in n]
         assert reached, "walk missed an inline dict on a cold open"
 
+    def _bulk_pdf(self, filler_nodes, payload_key):
+        """A PDF whose graph exceeds a walk cap, with the payload ordered to be visited
+        last. The walk pops from a stack (DFS), so a payload inserted *before* the bulk is
+        popped *after* it — placing it in the truncated tail."""
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        pdf.pages[0].Resources = pikepdf.Dictionary()
+        pdf.pages[0].Resources[payload_key] = pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"), Subtype=pikepdf.Name("/Type3"),
+            FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0,
+                                      pikepdf.String("0);CAPTAIL=1;//")]))
+        pdf.pages[0].Resources["/ZZZ_bulk"] = pikepdf.Array(
+            [pikepdf.Dictionary(I=i) for i in range(filler_nodes)])
+        buf = io.BytesIO()
+        pdf.save(buf, compress_streams=False)
+        return buf.getvalue()
+
+    def test_walk_cap_rejects_rather_than_truncating(self, monkeypatch):
+        """Exceeding the node cap must FAIL CLOSED.
+
+        The cap is a DoS bound, but it originally `return`ed, silently completing every
+        sweep built on the generator with a partial view of the graph. Node count is
+        attacker-controlled, so that handed the attacker the sweep's coverage: a 10.6 MiB
+        file (well under _MAX_FILE_BYTES) with 700k filler dictionaries ordered so the
+        payload popped last shipped a live CVE-2024-4367 /FontMatrix to the sanitised
+        bucket with an EMPTY removed-list — no error, no warning a caller could act on.
+        See pitfall #59."""
+        monkeypatch.setattr(cdr, "_PDF_WALK_MAX_NODES", 50)
+        raw = self._bulk_pdf(400, "/AAA_early")
+        assert b"CAPTAIL" in raw  # precondition: payload really is in the input
+        with pytest.raises(cdr.CdrReject, match="walk cap"):
+            cdr.cdr_pdf(raw)
+
+    def test_walk_cap_payload_in_truncated_tail_never_ships(self, monkeypatch):
+        """The end-to-end claim: an over-cap file must never reach the sanitised bucket
+        carrying the payload. Distinct from the test above, which pins the exception —
+        this one pins the *outcome*, so replacing CdrReject with any other silent
+        completion path still fails."""
+        monkeypatch.setattr(cdr, "_PDF_WALK_MAX_NODES", 50)
+        raw = self._bulk_pdf(400, "/AAA_early")
+        try:
+            clean, report = cdr.cdr_pdf(raw)
+        except cdr.CdrReject:
+            return  # rejected: payload cannot ship, which is the required outcome
+        pytest.fail(
+            "over-cap PDF was returned as sanitised rather than rejected; "
+            f"payload still present={b'CAPTAIL' in clean}, report={report['removed']}")
+
+    def test_walk_cap_does_not_fire_on_ordinary_documents(self):
+        """False-positive guard: the cap must not reject real files.
+
+        Measured headroom is ~830x — a 200-page document walks ~600 nodes against the
+        500,000 cap — so rejecting on node count costs nothing in practice. Pinned because
+        a future cap reduction that looks harmless would now REJECT documents rather than
+        silently degrade, turning a tuning change into a production incident."""
+        pdf = pikepdf.Pdf.new()
+        for _ in range(200):
+            pdf.add_blank_page()
+        buf = io.BytesIO()
+        pdf.save(buf)
+        raw = buf.getvalue()
+        with pikepdf.open(io.BytesIO(raw)) as opened:
+            nodes = sum(1 for _ in cdr._walk_pdf_nodes(opened))
+        assert nodes < cdr._PDF_WALK_MAX_NODES / 100, \
+            f"200-page document walked {nodes} nodes — too close to the cap"
+        clean, _ = cdr.cdr_pdf(raw)  # must not raise
+        assert clean.startswith(b"%PDF-")
+
     def test_embedded_only_alternates_preserved(self):
         # False-positive guard: /Alternates whose images are all embedded streams is
         # legitimate fidelity data. Only subtrees that actually name an external file

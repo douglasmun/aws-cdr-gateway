@@ -1612,7 +1612,8 @@ def _walk_pdf_nodes(pdf):
     be collected and its address reused by the next one, which would make an unvisited node
     collide with a ``seen`` entry and be silently skipped. ``_PDF_WALK_MAX_NODES`` bounds a
     hostile file that nests direct dictionaries deeply enough to make the walk itself the
-    denial of service."""
+    denial of service; exceeding it raises ``CdrReject`` rather than truncating, because a
+    partial walk silently narrows every sweep built on this generator (pitfall #59)."""
     seen: set = set()
     stack: list = []
 
@@ -1652,9 +1653,20 @@ def _walk_pdf_nodes(pdf):
         seen.add(node_key)
         visited += 1
         if visited > _PDF_WALK_MAX_NODES:
-            logger.warning("PDF object walk hit the %d-node cap; truncating",
+            # FAIL CLOSED. This cap is a DoS bound, but truncating the walk silently
+            # completes every sweep built on it with a partial view: whichever nodes had
+            # not been popped yet are never examined, cdr_pdf reports nothing unusual, and
+            # the file shipped to SANITISED_BUCKET carries whatever was in the unvisited
+            # tail. Verified: a 10.6 MiB file (well under _MAX_FILE_BYTES) with 700k filler
+            # dictionaries ordered so the payload pops last left a live CVE-2024-4367
+            # /FontMatrix at /Page[0]/Resources/AAA_early in the output with an EMPTY
+            # removed-list. Node count is attacker-controlled, so a `return` here hands the
+            # attacker the sweep's coverage. See pitfall #59.
+            logger.warning("PDF object walk hit the %d-node cap; rejecting",
                            _PDF_WALK_MAX_NODES)
-            return
+            raise CdrReject(
+                f"PDF object graph exceeds the {_PDF_WALK_MAX_NODES}-node walk cap; "
+                "cannot prove the whole graph was swept")
         if isinstance(node, pikepdf.Array):
             try:
                 for element_index, element in enumerate(node):
