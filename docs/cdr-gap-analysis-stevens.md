@@ -333,9 +333,28 @@ covers `.docx` alone, so those packages had never been opened by any parser. An 
 criterion needs applying across every type it logically covers, not just the one the
 available parser happens to check.
 
-What remains genuinely untested is **Word, Excel and PowerPoint themselves**, and that is
-still where it matters most: both confirmed live bypasses were OPC declaration bugs. See
-`docs/viewer-validation/CHECKLIST.md` for the manual pass that would close it.
+**Closed for Word and Excel, 2026-08-14.** The manual pass has since been run: all five Office
+outputs were opened in Word and Excel themselves, 5 of 5 pass. The two confirmed live bypasses
+are the load-bearing results — Word rendered a part named `.bin` (resolving it via the
+`Override`, not the suffix) and a part declared solely by `<Default Extension="dat">`, and in
+both cases **executed nothing**: no remote-data prompt, no repair prompt. So the interactive
+viewer agrees with the Python-parser verdict on exactly the bug class where they could most
+plausibly have diverged.
+
+**Acrobat is closed too, same date.** All eight PDFs were opened in Acrobat: 8 of 8 pass, no
+JavaScript alert, no attachment, no network-location prompt, no password prompt. The two
+container-layer claims are the ones worth naming, because pikepdf was the only witness to
+either before now — `pdfc_incremental_update.pdf` resolves as **one** document, confirming
+`pdf.save()` collapses a multi-revision container instead of leaving the newer JavaScript
+catalog reachable, and `pdfc_encrypted_input.pdf` opens with **no password prompt**, so
+encryption is genuinely stripped. `pdf_javascript_realistic.pdf` kept all 24 pages and all
+55,422 content bytes while losing all 9 `/JS` tokens.
+
+That puts the manual pass at **13 of 13** across Word, Excel and Acrobat. What remains untested
+is **PowerPoint**, and it is a fixture problem rather than a viewer one: there is no `.pptx` in
+the corpus at all — `pptx_activex` is one of the excluded empty-`_rels` fixtures above, whose
+input no engine can load — so closing it means building a loadable package first. See
+`docs/viewer-validation/CHECKLIST.md`.
 
 ---
 
