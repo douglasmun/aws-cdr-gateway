@@ -2485,9 +2485,18 @@ class TestPptxRemoteTemplateAndVba:
             z.writestr("_rels/.rels", _minimal_rels())
             z.writestr("ppt/_rels/presentation.xml.rels", pres_rels)
             z.writestr("ppt/presentation.xml", "<p:presentation/>")
+            # The onAction attribute is a macro invocation on a slide shape. It matters
+            # here because it is scrubbed IN PLACE on a part CDR keeps — unlike the VBA
+            # markers, which vanish only because ppt/vbaProject.bin is deleted wholesale.
+            # Without it the marker sweep below would exercise whole-part deletion three
+            # times over and content scrubbing only once (via the rels target).
             z.writestr("ppt/slides/slide1.xml",
-                       '<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
-                       '><a:t>CDR_TEST_SLIDE_TEXT</a:t></p:sld>')
+                       '<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+                       'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
+                       '<a:t>CDR_TEST_SLIDE_TEXT</a:t>'
+                       '<p:cNvPr id="2" name="Btn">'
+                       '<a:hlinkClick onAction="CDR_TEST_ONACTION_MACRO.Evil"/>'
+                       '</p:cNvPr></p:sld>')
             z.writestr("ppt/vbaProject.bin",
                        b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
                        b'CDR_TEST_PPTX_VBA_MARKER Sub Auto_Open() Shell "calc.exe" End Sub')
@@ -2516,10 +2525,17 @@ class TestPptxRemoteTemplateAndVba:
 
     def test_pptm_threat_markers_absent_from_decompressed_entries(self):
         """Scan DECOMPRESSED entries — a raw-byte grep over a deflated OOXML package
-        reports every marker absent, which reads exactly like a clean result."""
+        reports every marker absent, which reads exactly like a clean result.
+
+        Note the markers do not all vanish by the same mechanism, and the count alone
+        overstates what this proves: the three VBA markers go only because
+        ppt/vbaProject.bin is deleted wholesale, which the entry-list test already
+        covers. Content scrubbing on a SURVIVING part is carried by exactly two —
+        attacker.invalid (rels target) and CDR_TEST_ONACTION_MACRO (slide XML), the
+        latter asserted directly in test_pptm_onaction_scrubbed_from_surviving_slide."""
         src = self._make_pptm()
         markers = [b"CDR_TEST_PPTX_VBA_MARKER", b"Auto_Open", b"calc.exe",
-                   b"attacker.invalid"]
+                   b"attacker.invalid", b"CDR_TEST_ONACTION_MACRO"]
 
         def present(data: bytes) -> set[bytes]:
             found = set()
@@ -2536,6 +2552,27 @@ class TestPptxRemoteTemplateAndVba:
 
         clean, _ = cdr.cdr_office(src, "pptm")
         assert present(clean) == set(), f"threat markers survived CDR: {present(clean)}"
+
+    def test_pptm_onaction_scrubbed_from_surviving_slide(self):
+        """The onAction macro reference must be scrubbed from a slide part CDR KEEPS.
+
+        This is the one assertion in the class that tests content scrubbing rather than
+        whole-part deletion: the slide survives, so the marker can only disappear because
+        the attribute was neutralised in place. Deleting the slide instead would be
+        over-stripping, and is rejected here rather than counted as a pass."""
+        src = self._make_pptm()
+        clean, report = cdr.cdr_office(src, "pptm")
+        with zipfile.ZipFile(io.BytesIO(clean)) as z:
+            assert "ppt/slides/slide1.xml" in z.namelist(), \
+                "slide part was deleted — cannot demonstrate in-place scrubbing"
+            slide = z.read("ppt/slides/slide1.xml")
+        assert b"CDR_TEST_ONACTION_MACRO" not in slide, \
+            "onAction macro reference survived on a kept slide part"
+        assert b"onAction" not in slide, "onAction attribute survived"
+        assert b"CDR_TEST_SLIDE_TEXT" in slide, \
+            "slide text lost — the scrub removed more than the action attribute"
+        assert any("action attribute" in r for r in report["removed"]), \
+            "CDR report did not record the action-attribute removal"
 
     def test_pptm_slide_text_preserved(self):
         """Fidelity: disarming must not gut the slide body."""
