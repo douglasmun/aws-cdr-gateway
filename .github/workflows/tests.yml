@@ -92,6 +92,17 @@ jobs:
         # contract: ~90 `pitfall #N` references point at these headings.
         run: python scripts/check_pitfalls_index.py
 
+      - name: Sweep OPC declaration mechanisms for unscrubbed parts
+        working-directory: ${{ github.workspace }}
+        # Regression harness for the bug class that produced pitfalls #54 and #55: OPC
+        # binds a part to a content type by several mechanisms, and any one cdr_office
+        # fails to resolve is live content a real consumer executes. #55 sat one layer
+        # below the #54 fix precisely because nothing re-asked the question after it.
+        # Judges each case by an independent parser (python-docx, from requirements-dev)
+        # rather than a byte grep, and exits non-zero on a bypass (1) or on any case that
+        # reaches no verdict (2) — an inert probe must never read as a clean sweep.
+        run: python tools/opc_declaration_sweep.py
+
   build-package:
     # Verify the Lambda deployment package builds with Linux wheels. Runs on Linux so the
     # manylinux wheels are the native platform; catches dependency/packaging breakage.
