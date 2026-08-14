@@ -12,7 +12,6 @@ import os
 import time
 import xml.etree.ElementTree as ET
 import zipfile
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import openpyxl
@@ -26,8 +25,6 @@ os.environ.setdefault("QUARANTINE_BUCKET", "test-quarantine")
 os.environ.setdefault("RESULT_TOPIC_ARN",  "arn:aws:sns:us-east-1:123456789012:test")
 
 import lambda_function as cdr
-
-FIXTURES = Path(__file__).parent / "fixtures"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
