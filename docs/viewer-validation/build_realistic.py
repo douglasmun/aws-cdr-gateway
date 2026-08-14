@@ -12,8 +12,9 @@ Two cases:
    external attachedTemplate rel. This exists because the repo's pptx_activex
    fixture has an empty _rels/.rels: no engine can load the *input*, so opening
    it in PowerPoint would say nothing about CDR. The loadability of both input
-   and output is asserted here (see check_loads) rather than assumed — that
-   assumption is exactly what made the older fixture useless.
+   and output is asserted at the call site of check_loads — not merely printed —
+   because an unenforced check is the assumption that made the older fixture
+   useless, wearing the costume of a test.
 """
 import io,os,sys,zipfile,shutil,subprocess,tempfile
 sys.path.insert(0,"/Users/douglasmun/Develop/aws-cdr-gateway/src")
@@ -260,19 +261,28 @@ def build():
     return b.getvalue()
 
 def check_loads(path, label):
-    """Assert a real engine loads the package. The whole point of this fixture is
-    that its predecessor could not be loaded, so this must never be assumed."""
+    """Return True if a real engine loads the package, False if it does not, and
+    None only when no engine is installed to ask.
+
+    The caller MUST act on the result -- see the assert at the call site. An
+    earlier version of this returned the verdict and the caller discarded it, so
+    a package no engine could open still produced a green run and a written
+    fixture. That is precisely the pptx_activex defect this fixture exists to
+    avoid, and it would have regressed in silence."""
     if shutil.which("soffice") is None:
         print(f"  {label}: soffice absent - LOADABILITY UNVERIFIED")
         return None
     with tempfile.TemporaryDirectory() as td:
         shutil.copy(path, os.path.join(td, os.path.basename(path)))
         # Impress has no txt filter; convert to PDF and confirm a page came out.
-        subprocess.run(["soffice", "--headless", "--convert-to", "pdf",
-                        "--outdir", td, os.path.join(td, os.path.basename(path))],
-                       capture_output=True, timeout=180)
+        proc = subprocess.run(["soffice", "--headless", "--convert-to", "pdf",
+                               "--outdir", td, os.path.join(td, os.path.basename(path))],
+                              capture_output=True, timeout=180)
         pdf = os.path.join(td, os.path.splitext(os.path.basename(path))[0] + ".pdf")
         ok = os.path.exists(pdf) and os.path.getsize(pdf) > 0
+        if not ok and proc.returncode != 0:
+            print(f"  {label}: soffice exit={proc.returncode} "
+                  f"stderr={proc.stderr.decode('utf-8', 'replace')[:200]}")
         print(f"  {label}: LibreOffice load = {'OK' if ok else 'FAILED'}")
         return ok
 
@@ -316,7 +326,16 @@ post, post_text = threat_tokens(res["data"])
 print("  OUTPUT threats:", {k: v for k, v in post.items()})
 assert not any(post.values()), f"THREAT SURVIVED: {post}"
 assert post_text, "slide text lost - CDR over-stripped the presentation"
-print("  6 threat indicators in, 0 out; slide text preserved")
+# Count derived from the probe, never hardcoded: a literal drifts the moment a
+# token is added or removed, and this number gets quoted in CHECKLIST.md and PR
+# bodies as if it were measured. It said 6 while the probe checked 5.
+print(f"  {sum(pre.values())} threat indicators in, {sum(post.values())} out; "
+      "slide text preserved")
 
-check_loads(f"{OUT}/originals/in_pptm_vba_realistic.pptm", "input ")
-check_loads(out_path, "output")
+loads_in = check_loads(f"{OUT}/originals/in_pptm_vba_realistic.pptm", "input ")
+loads_out = check_loads(out_path, "output")
+# Act on the verdict. A fixture no engine can open is worthless for viewer
+# validation -- that is the whole reason this file exists. None means soffice
+# is absent, which is unverified rather than failed, so it does not fail here.
+assert loads_in is not False, "INPUT does not load in LibreOffice - fixture is defective"
+assert loads_out is not False, "OUTPUT does not load in LibreOffice - CDR broke the package"
