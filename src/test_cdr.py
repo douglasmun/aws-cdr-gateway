@@ -755,6 +755,34 @@ class TestImageCDR:
         with Image.open(io.BytesIO(clean)) as out:
             assert getattr(out, "n_frames", 1) == 1
 
+    @pytest.mark.parametrize("fmt,ext", [("JPEG", "jpg"), ("PNG", "png")])
+    def test_metadata_report_is_conditional_not_decorative(self, fmt, ext):
+        """The report must reflect what was actually found, not fire unconditionally.
+
+        Every other assertion in this class is satisfied by Pillow's re-encode alone:
+        a bare `Image.open(...).save(...)` with no CDR logic whatsoever drops EXIF just
+        as completely, so an absence check would still pass if the metadata sweep were
+        deleted outright. That is not a security hole — the output is clean either way —
+        but it means those tests cannot distinguish the sweep working from the sweep
+        being absent.
+
+        A conditional report can only come from real detection, so this is the one
+        claim about cdr_image that the re-encode cannot satisfy on its own: silent on
+        an image that never carried EXIF, and naming it on one that did."""
+        clean_src = io.BytesIO()
+        Image.new("RGB", (8, 8), (255, 0, 0)).save(clean_src, format=fmt)
+        _, clean_report = cdr.cdr_image(clean_src.getvalue(), ext)
+        assert "EXIF" not in clean_report["removed"], \
+            f"CDR claimed EXIF removal on an image that never had EXIF: {clean_report['removed']}"
+
+        # Positive control: the same code path DOES report EXIF when it is present, so a
+        # pass above cannot come from a report that is simply always empty.
+        exif_src = _make_image_with_exif(fmt)
+        assert b"Camera" in exif_src, "fixture is defective — no EXIF in the input"
+        _, exif_report = cdr.cdr_image(exif_src, ext)
+        assert "EXIF" in exif_report["removed"], \
+            "CDR did not report EXIF removal on an image that carried EXIF"
+
 
 class TestContentTypesSanitisation:
 
