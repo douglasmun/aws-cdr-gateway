@@ -84,6 +84,16 @@ jobs:
         # behind the tested versions exactly this way.
         run: python scripts/check_lambda_requirements.py
 
+      - name: Check every fail-closed rejection is pinned by a test
+        working-directory: ${{ github.workspace }}
+        # Pitfall #59: a resource cap that `return`ed instead of raising shipped a live
+        # payload to the sanitised bucket, and the whole suite stayed green — nothing
+        # asserted the bound was load-bearing. This mutates each `raise CdrReject` to a
+        # silent `pass` and re-runs the suite; a rejection nothing notices the removal of
+        # is decorative and can be refactored away silently. Slower than the other guards
+        # (one suite run per rejection), which is why it sits behind the main test step.
+        run: python scripts/check_fail_closed.py
+
       - name: Check the pitfalls index covers every entry
         working-directory: ${{ github.workspace }}
         # docs/claude/pitfalls.md is the reference every CDR change is read against. Its

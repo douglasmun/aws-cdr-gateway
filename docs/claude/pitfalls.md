@@ -93,6 +93,7 @@ it is listed once, under the group whose code you would be editing.
 - [#57 — A check whose result is discarded is an assumption wearing the costume of a test](#57-a-check-whose-result-is-discarded-is-an-assumption-wearing-the-costume-of-a-test)
 - [#58 — A MIME parameter defeats a `+xml` suffix test — and the OPC container-layer sweep that found nothing else](#58-a-mime-parameter-defeats-a-xml-suffix-test-and-the-opc-container-layer-sweep-that-found-nothing-else)
 - [#59 — A resource cap that `return`s hands the attacker the sweep's coverage — bound the work, but fail closed](#59-a-resource-cap-that-returns-hands-the-attacker-the-sweeps-coverage-bound-the-work-but-fail-closed)
+- [#60 — Auditing every cap's failure direction, and making "fail closed" a CI guard instead of a habit](#60-auditing-every-caps-failure-direction-and-making-fail-closed-a-ci-guard-instead-of-a-habit)
 
 **Multi-bug audit batches**
 
@@ -376,3 +377,26 @@ Verified end to end: a **10.6 MiB** file (against a 100 MB `_MAX_FILE_BYTES` —
 **Two instrument defects from this probe, both re-finding lessons already in this file.** (a) The verification step iterated `q.objects` to look for a surviving `/FontMatrix` and reported "none" while the raw bytes plainly contained the payload — **exactly the `pdf.objects`-is-not-the-graph error #52 exists to document**, committed inside the tool built to check #52's fix. The payload was a *direct* object, so only structural resolution through `q.pages[0].Resources[...]` saw it. (b) The same run showed a byte-grep and a parser disagreeing; the grep was right and the parser probe was broken — the *opposite* of the usual direction (#H7 in this sweep needed semantic verification precisely because a deflated object stream defeats grep). **Neither byte-grep nor parser-probe is authoritative on its own; when they disagree, resolve the node by path before believing either.**
 
 **General rule: every resource bound needs an explicit failure direction, chosen deliberately.** `return`, `break`, `continue` and a bare `except` around a bounded loop all *look* like bounding the work and all actually mean "ship whatever was inspected so far." If a cap can be reached by attacker-controlled input, reaching it is a verdict — `CdrReject` — not a truncation. Audit every `_MAX_`/budget constant for which of the two it does. Pinned by `test_walk_cap_rejects_rather_than_truncating` and `test_walk_cap_payload_in_truncated_tail_never_ships` (mutation-tested: both fail against the pre-fix `return`), plus `test_walk_cap_does_not_fire_on_ordinary_documents` as the false-positive guard. Related: #42 and #52a (fail-open `except`), #53 (a docstring claiming FAIL CLOSED while the code did not), #57 (a check whose result is discarded).
+
+### 60. Auditing every cap's failure direction, and making "fail closed" a CI guard instead of a habit
+The direct follow-up to #59: if one resource cap silently truncated, the others needed checking, and the checking itself needed to outlive the session that did it.
+
+**Every remaining cap audited — no second instance.** Ten constants, each verified by *running* it (monkeypatched low, hostile input, observe the verdict) rather than by reading the code, since #53 is a docstring that claimed FAIL CLOSED while the code did not:
+
+| Cap | On exceeding | Correct? |
+|---|---|---|
+| `_PDF_WALK_MAX_NODES` | `CdrReject` | fixed in #59 |
+| `_EXTERNAL_REF_SCAN_MAX_NODES` | `return True` (= "is external", so the subtree is removed) | yes — closed by design |
+| `_DecompressionBudget` / `_MAX_TOTAL_ENTRY_BYTES` | `CdrReject` | yes |
+| `_MAX_ZIP_ENTRIES` | `_validate_zip_structure` hard-fail verdict | yes |
+| `_MAX_ENTRY_BYTES`, `_MAX_FILE_BYTES` | reject | yes |
+| `_MAX_IMAGE_FRAMES`, `_MAX_TOTAL_IMAGE_PIXELS` | `CdrReject` | yes |
+| `_SNS_REMOVED_BYTE_BUDGET` | **truncates**, with an explicit `... and N more (truncated)` marker | yes — and it must |
+
+That last row is why this guard is mutation-based rather than a grep for `return`/`break` inside a bounded loop. `_SNS_REMOVED_BYTE_BUDGET` caps a *report about an already-sanitised file*; rejecting there would discard a successful sanitisation over a long removed-list. **The failure direction is a judgement call about what the bound protects, so no syntactic rule decides it** — a linter would flag the one cap that is right to truncate.
+
+**What is not a judgement call: whether a rejection that exists is load-bearing.** `scripts/check_fail_closed.py` mutates each `raise CdrReject` into a silent `pass` and re-runs the suite. A rejection whose removal the suite does not notice is decorative — nothing proves it fires, and a future refactor deletes it silently, which is exactly how #59 shipped. All 9 sites currently fail their mutant, so the existing coverage was sound; the guard exists so that stays true for rejections added later. Wired into `tests.yml` after the main test step (it costs one suite run per rejection).
+
+**Two things the guard needed in order not to become the very defect it checks for.** (a) **A baseline green run before any mutant means anything** — without it a broken checkout reports every mutant "caught" and the guard passes vacuously (#57). This fired immediately and usefully: the first version exported `SANITISED_BUCKET`/`QUARANTINE_BUCKET`, which the test module defaults with `os.environ.setdefault` — that *yields* to the environment, so five tests asserting the literal `test-sanitised`/`test-quarantine` names failed. The documented "run pytest BARE" rule, rediscovered by writing a tool that broke it. (b) **A negative control on the guard itself**: a deliberately unpinned `raise CdrReject` was injected and the guard correctly named it by line. A checker never shown failing is an assumption (#57 again).
+
+**General rule: when a review finds a bug class rather than a bug, the deliverable is the executable check, not the fixed instance.** This repo already had that instinct for docs (`check_test_count.py`, `check_cap_defaults.py`, `check_pitfalls_index.py`, `check_iac_parity.py`); security invariants deserve it more, because a doc drifting is embarrassing and a fail-open shipping is not. Related: #59 (the bug), #57 (instrument discipline), #53 (docstring vs behaviour).
