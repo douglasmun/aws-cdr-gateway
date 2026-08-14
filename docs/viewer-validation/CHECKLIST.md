@@ -8,7 +8,7 @@ Everything here has already been checked with the Python parsers and is payload-
 
 **Status, 2026-08-14: the manual pass is COMPLETE — 13 of 13 PASS.** All five Office outputs were opened in **Word and Excel** and all eight PDFs in **Acrobat**. No repair prompt, no macro warning, no remote-data or DDE prompt, no JavaScript alert, no attachment, no network-location prompt, no password prompt, and nothing launched — in the real viewers, not just the Python parsers. Details in the Word, Excel and Acrobat sections below.
 
-**The one gap left is PowerPoint, and it is not a matter of opening a file** — no `.pptx` exists in the corpus. `pptx_activex` is an excluded empty-`_rels` fixture whose *input* no engine can load, so closing that gap means building a loadable ActiveX fixture in `build_corpus.py` first.
+**One file is now waiting on you: `pptm_vba_realistic.pptx`.** PowerPoint was the last unverified engine, and it could not be checked at all because the corpus had no loadable `.pptx` — `pptx_activex` is an excluded empty-`_rels` fixture whose *input* no engine can open. A genuine presentation carrying a VBA project and a remote-template link has now been built for it (Priority 2b below), so the gap is a viewer check rather than a missing fixture.
 
 ## How to run it
 
@@ -49,6 +49,18 @@ These are the reason the corpus exists. Both were **live bypasses**: python-docx
 |---|---|---|
 | `macro-sample.docx` | Input was `.docm`; output is `.docx` by `EXT_REMAP`. Must open cleanly, and **Alt+F8 should list no macros**. | **PASS — Word, 2026-08-14.** Heading 1 styled, all four paragraphs render, no repair prompt. **Alt+F8 lists no macros** — the `.docm`'s `vbaProject.bin` is gone and Word has nothing to offer. |
 | `xlsm_vba_realistic.xlsx` | Input `.xlsm` → output `.xlsx`. Cell values and formulas intact; no macros. **Expect a slow open** — `sheet1.xml` is ~29 MB of size-cap padding inside a 3 MB file. A pause is not a hang. | **PASS — Excel, 2026-08-14.** Opens with no repair prompt; header styling and all ten columns render. `I2` shows `=G2*H2` in the formula bar, so formulas survive as formulas rather than frozen values. `Summary` opens and its cross-sheet `SUMIF` resolves — no `#REF!`. **Alt+F8 lists no macros.** Corroborated structurally: both worksheet parts are byte-identical to the input, and `xl/vbaProject.bin` is the only ZIP entry CDR removed. |
+
+### Priority 2b — PowerPoint (added 2026-08-14)
+
+Built to close the last engine gap. The repo's `pptx_activex` fixture could not do it: its `_rels/.rels` is empty, so **no engine can load the input** and PowerPoint rejecting it would say nothing about CDR. `pptm_vba_realistic.pptx` is a genuine presentation — real `officeDocument` relationship, slide master, layout, theme and actual slide text — carrying a **VBA project** and an **external `attachedTemplate`** rel.
+
+| File | What to check | Result |
+|---|---|---|
+| `pptm_vba_realistic.pptx` | Input was `.pptm`; output is `.pptx` by `EXT_REMAP`. **Both text boxes must render.** No macro warning (Developer → Macros lists none), and **no prompt to fetch a remote template**. | |
+
+Verified before asking: CDR reports removing the `vbaProject` content type, the macro-enabled `main+xml` content type, the `vbaProject` and `attachedTemplate` rels, and `ppt/vbaProject.bin`. **6 threat indicators in the input, 0 in the output, slide text preserved**, and both input and output load in LibreOffice. The generator asserts each of those, so a regression fails the build rather than quietly emitting a useless fixture.
+
+> **A probe bug worth not repeating.** The first version of that check scanned the **raw ZIP bytes** and reported every marker absent — from the *input* as well. The entries are deflated, so a byte grep finds nothing and the file reads perfectly clean. Decompress the parts before scanning. This is the same shape as the `pdf_lejon_multithreat.pdf` blind spot below: **the probe, not the file, was clean.**
 
 ### Priority 3 — PDF, in Acrobat
 
@@ -127,6 +139,8 @@ Six repo fixtures are **excluded by the generator** — not omitted by hand, so 
 All six are synthetic packages with an **empty `_rels/.rels`** — no `officeDocument` relationship, so nothing points from the package root to the document, workbook or presentation. python-docx cannot open the `.docx` ones and LibreOffice cannot load the `.xlsx`/`.pptx` ones. The decisive part: **the inputs fail identically**, so a viewer rejecting them tells you nothing about CDR. They remain valid unit-test fixtures; they are just not viewer-validation material.
 
 The last two were added on 2026-08-14. They had survived the first cut because python-docx only covers `.docx`, so the `.xlsx`/`.pptx` packages were never opened by any parser until LibreOffice was brought in — a reminder that an exclusion criterion needs applying across *every* type it logically covers, not just the one the available parser happened to check.
+
+**Excluding `pptx_activex` left PowerPoint with no coverage at all**, which is a gap rather than a resolution. `pptm_vba_realistic` (Priority 2b) was built to fill it: same threat classes, in a package a viewer will actually open. Excluding an unloadable fixture is correct; leaving the format unrepresented afterwards is not.
 
 ## Word — complete, 2026-08-14
 
