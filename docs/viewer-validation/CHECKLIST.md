@@ -52,9 +52,21 @@ These are the reason the corpus exists. Both were **live bypasses**: python-docx
 
 > Several files here are ~3 MB because the source fixtures carry a deliberate padding stream (they double as size-cap tests). The padding is inert filler, not content — ignore the file sizes.
 
+> **A blank page is not automatically a fidelity failure here.** Most of these are *synthetic* fixtures: built to carry one payload in the PDF structure, with no page content ever authored. Their `/Contents` is absent in the **input** too, so a blank render means nothing was there to begin with, not that CDR ate it. The way to tell the difference is always the same — **compare against the input**, never against an assumption about what a document "should" look like.
+>
+> Measured across all eight (total page-content-stream bytes, input → output, 2026-08-14), so it does not need re-deriving file by file:
+>
+> | File | In → Out | Meaning |
+> |---|---|---|
+> | `pdf_javascript_realistic.pdf` | 55,422 → 55,422 | **the real fidelity test** — a genuine 24-page document, preserved byte for byte. A blank or truncated render *here* is a finding |
+> | `pdfc_incremental_update.pdf` | 51 → 51 | content preserved |
+> | the other six | 0 → 0 | **blank by design** — no content in the input either |
+>
+> So for six of eight, a blank white page is the expected outcome and only the security question is live.
+
 | File | What to check | Result |
 |---|---|---|
-| `pdf_openaction_js.pdf` | Opens with **no JavaScript alert**; page renders. | |
+| `pdf_openaction_js.pdf` | Opens with **no JavaScript alert**. **A blank white page is the correct result** — see note below; do not read it as over-stripping. | **PASS — Acrobat, 2026-08-14.** Opens, blank white page, **no JavaScript alert**. The `/OpenAction` JS that Acrobat would have run on open is gone. Blank is expected: the input has no `/Contents` either (verified), so there was never any page content to lose. |
 | `pdf_acroform_js.pdf` | Form fields render; no JS on focus/calculate. `/AcroForm` is *present* by design — field geometry is kept, actions stripped. | |
 | `pdf_embedded_file.pdf` | **Attachments pane must be empty.** | |
 | `pdf_multithreat.pdf` | Several vectors stripped at once; page still renders. | |
