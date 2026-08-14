@@ -63,6 +63,8 @@ Run this checklist before considering any change complete. Each item maps to a c
 - [ ] **Every new try/except warn-and-continue block has a failure-path test** — prove the success path completes even when the wrapped operation throws.
 - [ ] **No new `src.read(name)` calls** — always use `_read_zip_entry_safe(src, item)`.
 - [ ] **New regex patterns are tested with both quote styles** — single-quoted and double-quoted XML attribute values.
+- [ ] **Every probe/canary/precondition has its result ASSERTED, not printed** — a bare `check_something(...)` whose return value is discarded passes silently on the exact defect it was written to catch (pitfall #57). Keep "could not verify" (tool absent) distinct from "verified clean", and mutation-test the guard by reintroducing that defect on purpose.
+- [ ] **Counts and measurements in output are derived, never typed** — a hardcoded `"6 indicators"` drifts from the probe and then gets quoted downstream as if measured (pitfall #57).
 
 ### Infrastructure invariants — verify both IaC paths stay in step
 

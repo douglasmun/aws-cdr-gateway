@@ -8,7 +8,7 @@ A small number of entries (currently **#56**) record a **non-finding** instead: 
 
 ## Index by subsystem
 
-Fifty-six entries is more than anyone reads top-to-bottom, so start here: find the group
+Fifty-seven entries is more than anyone reads top-to-bottom, so start here: find the group
 matching what you are about to touch and read those entries first.
 
 **Numbers are permanent identifiers.** 91 `pitfall #N` references across the code, the
@@ -90,6 +90,7 @@ it is listed once, under the group whose code you would be editing.
 - [#18 — Infrastructure-dependent tasks cannot be completed without live credentials](#18-infrastructure-dependent-tasks-cannot-be-completed-without-live-credentials)
 - [#30 — Any independently-imported module needs its OWN test file](#30-any-independently-imported-module-needs-its-own-test-file)
 - [#56 — `a:fld` is NOT a field-code carrier — a payload the format never evaluates is not a finding](#56-afld-is-not-a-field-code-carrier-a-payload-the-format-never-evaluates-is-not-a-finding)
+- [#57 — A check whose result is discarded is an assumption wearing the costume of a test](#57-a-check-whose-result-is-discarded-is-an-assumption-wearing-the-costume-of-a-test)
 
 **Multi-bug audit batches**
 
@@ -337,3 +338,15 @@ The control settles it in one step, and it is the control #55 already tells you 
 The declaration machinery is in fact **format-agnostic and already covers pptx**: `_is_xml_ct` matches any `+xml` subtype and never mentions wordprocessingml, and `_declared_parts` matches on content type and never on a `word/` prefix. Demonstrated end-to-end rather than argued from the source — the *real* PowerPoint OLE/DDE vector (an `oleObject` rel plus `ppt/embeddings/oleObject1.bin` payload bytes) carried on a `.dat`-named slide part declared solely by `<Default Extension="dat">` is fully disarmed: `removed: ['rel:rId2 type=oleobject', 'ppt/embeddings/oleObject1.bin']`, with both indicators asserted present in the input first.
 
 **General rule: a positive control proves the payload is *present*; it does not prove the payload is *executable*. Before reporting a survival as a bypass, establish that the format actually evaluates the construct you put it in — otherwise you have measured your own fixture.** This is #55's "when the control also reports a bypass, the probe is wrong, not the code" in a new costume: there the control was another undeclared blob, here it is a normally-declared part. Both times the tell was the same, and both times it was available *before* the finding was announced. No code change; no test added, since there is no behaviour here to pin.
+
+### 57. A check whose result is discarded is an assumption wearing the costume of a test
+Found by auditing this repo's own verification tooling — `docs/viewer-validation/build_realistic.py`, which builds the fixtures the manual viewer pass depends on. Two defects, neither in CDR:
+
+1. **`check_loads()` computed a correct verdict and both call sites threw it away.** It returned `True`/`False` and was invoked as a bare statement, so the result was *printed* and never acted on. A package no engine could open still wrote the fixture, printed a success line and exited 0. That is precisely the `pptx_activex` defect the fixture exists to avoid — an unloadable package whose *input* proves nothing — reintroduced inside the tool built to prevent it. The file's own docstring claimed loadability "is asserted here", which is how it survived review: **I read the docstring, not the call site.**
+2. **A hardcoded `"6 threat indicators"` while the probe checked 5.** The literal drifted from `threat_tokens()` and was then quoted in `CHECKLIST.md` and two PR bodies as though it were a measurement. Now derived with `sum(pre.values())`.
+
+Fix: assert on the returned verdict, keeping `None` (engine not installed → *unverified*) distinct from `False` (engine rejected it → *failed*), so a missing toolchain does not silently become a pass. Mutation-tested, which is the only thing that proves a guard guards: rebuilding with an empty `_rels/.rels` now aborts on the input assertion, where before the identical mutant completed green.
+
+**A false negative in a verification tool is worse than one in the code under test, because it does not fail — it congratulates you, and the false confidence then propagates.** Defect 2 shows the mechanism: a number that was never measured got restated downstream as if it had been. Both defects were in the *verification* layer while CDR itself was correct, which is the same shape as #56 and the #55 probe rounds. **The instrument keeps being the weak link, not the code.**
+
+**General rule: a check that only prints is not a check. Any probe, canary or precondition must (a) have its result asserted at the call site, (b) distinguish "could not verify" from "verified clean", and (c) be mutation-tested against the exact defect it exists to catch — if you cannot make it fail on purpose, it is not protecting you.** Corollary for numbers: **derive counts from the probe, never type them** — a literal cannot drift silently, but it can and did drift loudly into three documents. See #55 (probe preconditions), #56 (control ordering); no test added here, since the generator is the test.
