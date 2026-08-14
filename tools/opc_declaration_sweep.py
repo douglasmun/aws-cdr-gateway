@@ -18,10 +18,20 @@ probe lies to you:
   1. PRECONDITION: can an independent parser (python-docx) see the payload in
      the *input*? A package no consumer can open proves nothing about CDR, and
      several synthetic fixtures fail here for unrelated reasons.
-  2. Does CDR report scrubbing it?
-  3. EXPLOITABILITY: can python-docx still see the payload in the *sanitised*
+  2. EXPLOITABILITY: can python-docx still see the payload in the *sanitised*
      output? Surviving bytes in an unreachable part are inert dead weight, not
      a finding. Only a payload an independent parser resolves is a bypass.
+  3. ATTRIBUTION: did CDR actually report removing something? If the marker
+     vanished while CDR reported no removal, something other than the scrub ate
+     the payload and the audit record cannot be trusted.
+
+Only a case that answers all three reports PASS. Anything the harness cannot
+prove — a crash, an unparseable output, an unopenable input — is ERROR or SKIP
+and fails the run with exit 2. Translating "could not prove" into "clean" is the
+one failure mode that makes an audit tool worse than no tool at all. In
+particular only `CdrReject` counts as fail-closed: the handler routes it to
+quarantine/rejected, whereas a generic exception goes to quarantine/error, so
+conflating the two would report a crash regression as a clean sweep.
 
 The payload marker is DDEPAYLOADMARK, not DDEAUTO: the scrub deliberately
 neutralises the executable path and leaves the inert DDEAUTO keyword behind
@@ -100,28 +110,56 @@ def visible_to_parser(raw):
         return None
 
 
+PASS, BYPASS, SKIP, ERROR = "PASS", "BYPASS", "SKIP", "ERROR"
+
+
 def check(label, raw):
+    """Judge one case. Anything the harness cannot prove is ERROR, never PASS."""
     if visible_to_parser(raw) is not True:
         print(f"  SKIP     {label}")
         print("           input not resolvable by python-docx - proves nothing")
-        return None
+        return SKIP
 
     try:
         clean, report = cdr.cdr_office(raw, "docx")
-    except Exception as exc:
+    except cdr.CdrReject as exc:
+        # Only a deliberate reject is fail-closed. The handler routes CdrReject to
+        # quarantine/rejected but a generic exception to quarantine/error, so
+        # conflating them would report a crash regression as a clean audit.
         print(f"  PASS     {label}")
-        print(f"           rejected fail-closed ({type(exc).__name__})")
-        return False
+        print(f"           rejected fail-closed (CdrReject: {exc})")
+        return PASS
+    except Exception as exc:
+        print(f"  ERROR    {label}")
+        print(f"           cdr_office crashed: {type(exc).__name__}: {exc}")
+        print("           NOT a clean result - the payload was never scrubbed")
+        return ERROR
 
-    if visible_to_parser(clean) is True:
+    visible = visible_to_parser(clean)
+    if visible is True:
         print(f"  BYPASS   {label}")
         print(f"           python-docx still resolves {MARK} in the OUTPUT")
         print(f"           report: {report.get('removed', [])!r}")
-        return True
+        return BYPASS
+    if visible is None:
+        # The oracle failed, so exploitability is unknown. A corrupt output, or one
+        # python-docx rejects while another Office consumer opens, must not read as
+        # clean - parser disagreement is this project's recurring bug class.
+        print(f"  ERROR    {label}")
+        print("           python-docx could not parse the OUTPUT - exploitability unknown")
+        return ERROR
+
+    removed = report.get("removed", [])
+    if not removed:
+        # The marker vanished but CDR claims it removed nothing. Something other than
+        # the scrub ate the payload, so the audit record cannot be trusted.
+        print(f"  ERROR    {label}")
+        print("           payload gone but CDR reported no removal - unexplained")
+        return ERROR
 
     print(f"  PASS     {label}")
-    print(f"           payload no longer resolvable; removed={len(report.get('removed', []))}")
-    return False
+    print(f"           payload no longer resolvable; removed={len(removed)}")
+    return PASS
 
 
 CASES = [
@@ -143,11 +181,32 @@ CASES = [
         f'<Default Extension="dat" ContentType="{WML}"/>',
         "word/document.dat",
     ),
+    # Rel-target spelling cases MUST use a non-.xml part. On word/document.xml the
+    # suffix rule scrubs the part regardless, so the case passes even when
+    # declaration-driven resolution is entirely disabled - proving nothing.
     (
-        "rel Target spelled ./-relative vs ZIP entry",
-        "word/document.xml",
-        f'<Override PartName="/word/document.xml" ContentType="{WML}"/>',
-        "./word/document.xml",
+        "rel Target ./-relative, Default-declared .dat",
+        "word/doc.dat",
+        f'<Default Extension="dat" ContentType="{WML}"/>',
+        "./word/doc.dat",
+    ),
+    (
+        "rel Target absolute, Default-declared .dat",
+        "word/doc.dat",
+        f'<Default Extension="dat" ContentType="{WML}"/>',
+        "/word/doc.dat",
+    ),
+    (
+        "rel Target with sub/.. traversal, Default .dat",
+        "word/doc.dat",
+        f'<Default Extension="dat" ContentType="{WML}"/>',
+        "word/sub/../doc.dat",
+    ),
+    (
+        "Override on a part with NO suffix",
+        "word/document",
+        f'<Override PartName="/word/document" ContentType="{WML}"/>',
+        "word/document",
     ),
     (
         "conventional .xml part (control - must PASS)",
@@ -164,19 +223,23 @@ def main():
 
     results = [check(label, build(part, ct, target)) for label, part, ct, target in CASES]
 
-    bypasses = results.count(True)
-    skipped = results.count(None)
-    print(f"\n{len(results)} cases: {results.count(False)} pass, "
-          f"{bypasses} bypass, {skipped} skipped")
+    passed = results.count(PASS)
+    bypasses = results.count(BYPASS)
+    skipped = results.count(SKIP)
+    errors = results.count(ERROR)
+    print(f"\n{len(results)} cases: {passed} pass, {bypasses} bypass, "
+          f"{skipped} skipped, {errors} error")
 
-    if skipped == len(results):
-        print("\nALL cases skipped - the harness is broken, not the code. "
-              "A green run here would be meaningless.")
-        return 2
     if bypasses:
         print("\nA bypass means an independent parser executes content CDR "
               "believed it had scrubbed. Add a pitfall entry and a regression test.")
         return 1
+    # Every case must reach a verdict. A skipped or errored case proves nothing, and
+    # counting it toward a green run is the exact failure this tool exists to prevent.
+    if skipped or errors:
+        print(f"\n{skipped + errors} case(s) reached no verdict. This is NOT a clean "
+              "result - fix the harness or the code before trusting a green run.")
+        return 2
     return 0
 
 
