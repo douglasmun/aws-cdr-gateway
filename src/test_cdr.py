@@ -1152,6 +1152,43 @@ class TestDefaultExtensionDeclaration:
         assert cdr._xml_override_parts(content_types) == set()
         assert cdr._xml_override_parts(content_types, ["word/doc.dat"]) == {"word/doc.dat"}
 
+    @pytest.mark.parametrize("suffix", ["; charset=utf-8", ";charset=utf-8", " ;charset=UTF-8"])
+    def test_content_type_mime_parameter_still_classified_xml(self, suffix):
+        """A `;` parameter must not move `+xml` off the end of the string.
+
+        `_is_xml_ct` tested `endswith("+xml")` after `.strip()`, which handles trailing
+        whitespace but not a trailing MIME parameter — so `…main+xml; charset=utf-8`
+        classified as non-XML and the part was never scrubbed. This is hardening, not a
+        live-bypass fix: OPC declares a bare media type, so the parameterised form is
+        malformed and both LibreOffice and python-docx refuse the package (pitfall #58).
+        Pinned so the classifier cannot silently narrow again."""
+        assert cdr._is_xml_ct(self.NS_MAIN + suffix), \
+            "MIME parameter defeated the +xml suffix test"
+        content_types = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            f'<Override PartName="/word/doc.dat" ContentType="{self.NS_MAIN}{suffix}"/>'
+            '</Types>'
+        ).encode()
+        assert cdr._xml_override_parts(content_types, ["word/doc.dat"]) == {"word/doc.dat"}
+
+    def test_mime_parameter_does_not_widen_to_non_xml_types(self):
+        """False-positive guard: stripping the parameter must not turn a non-XML type XML.
+
+        Without this, `split(";")` could be mistaken for a general permissiveness fix; the
+        parameter is discarded, but the media type itself is still required to be XML."""
+        assert not cdr._is_xml_ct("application/octet-stream; charset=utf-8")
+        assert not cdr._is_xml_ct("image/png;charset=utf-8")
+        assert not cdr._is_xml_ct("application/xml-dtd")
+        content_types = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Override PartName="/word/doc.dat" '
+            'ContentType="application/octet-stream; charset=utf-8"/>'
+            '</Types>'
+        ).encode()
+        assert cdr._xml_override_parts(content_types, ["word/doc.dat"]) == set()
+
 
 class TestContentTypeRealOfficeTypes:
     """Validate MACRO_CONTENT_TYPE_REMAP against the actual content type strings
