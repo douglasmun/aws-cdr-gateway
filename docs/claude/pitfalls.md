@@ -4,9 +4,11 @@
 
 Bugs that have been found and fixed. Each entry states the correct pattern so future code can be written right the first time.
 
+A small number of entries (currently **#56**) record a **non-finding** instead: something audited, reported as a bug, and shown not to be one. They are here because an unrecorded non-finding gets rediscovered and re-reported — the cost is a wasted audit cycle and, worse, a "fix" to code that was already correct. Such entries say so in their first line.
+
 ## Index by subsystem
 
-Fifty entries is more than anyone reads top-to-bottom, so start here: find the group
+Fifty-six entries is more than anyone reads top-to-bottom, so start here: find the group
 matching what you are about to touch and read those entries first.
 
 **Numbers are permanent identifiers.** 91 `pitfall #N` references across the code, the
@@ -87,6 +89,7 @@ it is listed once, under the group whose code you would be editing.
 - [#12 — Writing security tests that manipulate file internals without understanding format validation](#12-writing-security-tests-that-manipulate-file-internals-without-understanding-format-validation)
 - [#18 — Infrastructure-dependent tasks cannot be completed without live credentials](#18-infrastructure-dependent-tasks-cannot-be-completed-without-live-credentials)
 - [#30 — Any independently-imported module needs its OWN test file](#30-any-independently-imported-module-needs-its-own-test-file)
+- [#56 — `a:fld` is NOT a field-code carrier — a payload the format never evaluates is not a finding](#56-afld-is-not-a-field-code-carrier-a-payload-the-format-never-evaluates-is-not-a-finding)
 
 **Multi-bug audit batches**
 
@@ -323,3 +326,14 @@ Fix: one shared `_declared_parts(ct_xml, entry_names, matches_ct)` resolves **bo
 **The sibling sweep, and why it found nothing.** The same container-layer question was then asked of the **PDF** path: incremental updates repointing `/Root`, stale payload catalogs, hybrid-reference `/XRefStm` files (where a classic-xref reader and an xref-stream reader resolve the same object number to different offsets), double `%PDF-` headers, ObjStm/xref-stream and linearised containers, encrypted files. **No bypass** — `cdr_pdf` ends in `pdf.save()`, which rebuilds from the reachable object graph and emits *one* revision (verified: single `startxref`, single `%%EOF`). Every attack in that class works by leaving two candidate documents in one file and steering which the reader picks; a rebuild that emits one document destroys the primitive by construction. **Ask what a subsystem's rebuild reconstructs — it predicts which bug classes can exist there at all.** `cdr_pdf` rebuilds the *document* and `cdr_image` rebuilds *pixels* (both immune); `cdr_office` rebuilds the ZIP *entry-by-entry, preserving part bytes* — deliberate, but it is precisely why declaration bugs are reachable in the Office path and nowhere else. Recorded in `docs/cdr-gap-analysis-stevens.md`; no tests were added, since pinning behaviour supplied by QPDF's rebuild would test the dependency rather than this codebase.
 
 **General rule: when a format offers more than one way to declare the same thing, enumerate the mechanisms from the spec — closing one and calling the class fixed is how #54 became #55.** Pinned by `TestDefaultExtensionDeclaration` (9 tests: both extension variants, all three rel spellings, the independent-parser confirmation, the PostScript half, and two false-positive guards asserting `Default Extension="xml"` binds only real `.xml` parts and that `Default` resolves to nothing without entry names). Mutation-tested: dropping the `Default` branch fails all 9.
+
+### 56. `a:fld` is NOT a field-code carrier — a payload the format never evaluates is not a finding
+**No bug here; this entry exists to stop the next audit re-reporting a non-finding.** Chasing an apparent coverage asymmetry — the `.docx` corpus exercises both #54 and #55 declaration shapes, the `.pptx` corpus exercises neither — I built two PowerPoint packages with the main part named `.bin`/`.dat` and declared by `Override`/`Default Extension`, each carrying `<a:fld …><a:t>DDEAUTO … cmd.exe "/c calc.exe"</a:t></a:fld>`. Both came back with `removed: []` and the `DDEAUTO` string intact in the output. I reported it as a live bypass. **It is not one.**
+
+`a:fld` is DrawingML, not WordprocessingML, and it holds **presentation-generated placeholder values only** — slide number, date, time — selected by a fixed `type` enumeration (`slidenum`, `datetime1`, …). It has no instruction-string grammar. The `<a:t>` child is a *cached rendering* of the generated value, not an instruction PowerPoint parses. Writing `DDEAUTO …` into it produces literal text on the slide. The payload was inert; it only looked dangerous to a grep, because I had chosen the string to match what a Word field code looks like.
+
+The control settles it in one step, and it is the control #55 already tells you to run: a **conventionally-named `.xml` slide part with an ordinary `Override`** is equally untouched. That case has nothing to do with #54/#55, so the declaration mechanism was never the variable — the scrub simply does not treat `a:fld` as a carrier, by the deliberate scoping in #40 (`w:instrText` / `w:fldSimple` only, never raw XML, because raw-XML scanning corrupts legitimate markup). The comment on `_FIELD_KEYWORD_ARG_RE` says "the only places **Word** evaluates a field code," and that is precisely accurate.
+
+The declaration machinery is in fact **format-agnostic and already covers pptx**: `_is_xml_ct` matches any `+xml` subtype and never mentions wordprocessingml, and `_declared_parts` matches on content type and never on a `word/` prefix. Demonstrated end-to-end rather than argued from the source — the *real* PowerPoint OLE/DDE vector (an `oleObject` rel plus `ppt/embeddings/oleObject1.bin` payload bytes) carried on a `.dat`-named slide part declared solely by `<Default Extension="dat">` is fully disarmed: `removed: ['rel:rId2 type=oleobject', 'ppt/embeddings/oleObject1.bin']`, with both indicators asserted present in the input first.
+
+**General rule: a positive control proves the payload is *present*; it does not prove the payload is *executable*. Before reporting a survival as a bypass, establish that the format actually evaluates the construct you put it in — otherwise you have measured your own fixture.** This is #55's "when the control also reports a bypass, the probe is wrong, not the code" in a new costume: there the control was another undeclared blob, here it is a normally-declared part. Both times the tell was the same, and both times it was available *before* the finding was announced. No code change; no test added, since there is no behaviour here to pin.
