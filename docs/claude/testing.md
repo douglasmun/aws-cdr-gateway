@@ -13,9 +13,11 @@
 > resolved through the `Override` and `Default Extension` mechanisms respectively and still
 > executed nothing. That closes the gap the headless check could not: a headless render never
 > *executes* a DDE field, so a clean conversion shows structural absence, not that an
-> interactive viewer declines to prompt. **PowerPoint and Acrobat remain unverified** (there is
-> no `.pptx` corpus file; the eight PDFs are unchecked in Acrobat). See
-> `docs/viewer-validation/CHECKLIST.md`.
+> interactive viewer declines to prompt. The eight PDFs have likewise been opened in **Acrobat**
+> — 8 of 8 pass, so the manual pass now stands at **13 of 13** across Word, Excel and Acrobat.
+> **PowerPoint is the one engine still unverified**, and closing it needs a fixture built first:
+> there is no `.pptx` in the corpus, only an excluded package whose *input* no engine can load.
+> See `docs/viewer-validation/CHECKLIST.md`.
 
 Tests (386 in `test_cdr.py` + 50 in `test_cdr_local.py` = **436 total**) construct malicious fixtures entirely in-memory — no fixture files on disk. S3/SNS calls are patched with `unittest.mock`. Required env vars are set automatically via `os.environ.setdefault`. `src/test_cdr.py` covers the CDR Lambda; `src/test_cdr_local.py` covers the pure `cdr_dispatch` core and the local FastAPI service (`app.py`), reusing the same in-memory fixtures. Run: `cd src && pytest test_cdr.py test_cdr_local.py -v`.
 

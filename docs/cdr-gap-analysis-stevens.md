@@ -341,9 +341,19 @@ both cases **executed nothing**: no remote-data prompt, no repair prompt. So the
 viewer agrees with the Python-parser verdict on exactly the bug class where they could most
 plausibly have diverged.
 
-What remains untested is **PowerPoint and Acrobat**. PowerPoint has no corpus file at all —
-`pptx_activex` is one of the excluded empty-`_rels` fixtures above — so closing it means
-building a loadable `.pptx` fixture first, not just opening one. See
+**Acrobat is closed too, same date.** All eight PDFs were opened in Acrobat: 8 of 8 pass, no
+JavaScript alert, no attachment, no network-location prompt, no password prompt. The two
+container-layer claims are the ones worth naming, because pikepdf was the only witness to
+either before now — `pdfc_incremental_update.pdf` resolves as **one** document, confirming
+`pdf.save()` collapses a multi-revision container instead of leaving the newer JavaScript
+catalog reachable, and `pdfc_encrypted_input.pdf` opens with **no password prompt**, so
+encryption is genuinely stripped. `pdf_javascript_realistic.pdf` kept all 24 pages and all
+55,422 content bytes while losing all 9 `/JS` tokens.
+
+That puts the manual pass at **13 of 13** across Word, Excel and Acrobat. What remains untested
+is **PowerPoint**, and it is a fixture problem rather than a viewer one: there is no `.pptx` in
+the corpus at all — `pptx_activex` is one of the excluded empty-`_rels` fixtures above, whose
+input no engine can load — so closing it means building a loadable package first. See
 `docs/viewer-validation/CHECKLIST.md`.
 
 ---

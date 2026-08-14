@@ -6,7 +6,9 @@ This corpus closes that gap the only way it can be closed: **a human opens the s
 
 Everything here has already been checked with the Python parsers and is payload-free by that measure. What is unverified — and what you are being asked to check — is whether the **real viewers agree**.
 
-**Status, 2026-08-14: the Office half is done.** All five `.docx`/`.xlsx` files have been opened in Word and Excel themselves — 5 of 5 PASS, including both live-bypass mechanisms from pitfalls #54 and #55. See the Word and Excel sections below. **The eight PDFs remain unchecked in Acrobat**, and that is what is still being asked for.
+**Status, 2026-08-14: the manual pass is COMPLETE — 13 of 13 PASS.** All five Office outputs were opened in **Word and Excel** and all eight PDFs in **Acrobat**. No repair prompt, no macro warning, no remote-data or DDE prompt, no JavaScript alert, no attachment, no network-location prompt, no password prompt, and nothing launched — in the real viewers, not just the Python parsers. Details in the Word, Excel and Acrobat sections below.
+
+**The one gap left is PowerPoint, and it is not a matter of opening a file** — no `.pptx` exists in the corpus. `pptx_activex` is an excluded empty-`_rels` fixture whose *input* no engine can load, so closing that gap means building a loadable ActiveX fixture in `build_corpus.py` first.
 
 ## How to run it
 
@@ -71,7 +73,7 @@ These are the reason the corpus exists. Both were **live bypasses**: python-docx
 | `pdf_embedded_file.pdf` | Blank page expected. **No attachment offered.** | **PASS — Acrobat, 2026-08-14.** Opens blank, nothing offered. Structurally confirmed: `/Names/EmbeddedFiles` is gone and `/Filespec`+`/EmbeddedFile` tokens drop 3→0, so the pane has nothing to list. |
 | `pdf_multithreat.pdf` | Blank page expected. Several vectors stripped at once — no alert, no attachment. | **PASS — Acrobat, 2026-08-14.** Opens blank, no alert, nothing offered. `/OpenAction` and `/Names/EmbeddedFiles` gone, 4 `/JS` and 3 `/Filespec`/`/EmbeddedFile` tokens → 0; `/AcroForm` retained by design. |
 | `pdf_lejon_multithreat.pdf` | Blank page expected. malicious-pdf taxonomy sample — `/Threads`, a `GoToR` UNC link, a poisoned `/FontMatrix` and two external-stream `/F` refs. **No prompt to open a network location.** | **PASS — Acrobat, 2026-08-14.** Opens blank, no network-location prompt. 8 vector tokens in the input → 1 benign structure out; the `GoToR` UNC target and both `attacker.invalid` external-stream refs are gone, and `/FontMatrix` is six clean numbers. |
-| `pdf_javascript_realistic.pdf` | 24-page realistic document — the fidelity stress case. Renders fully, no script. | |
+| `pdf_javascript_realistic.pdf` | **The fidelity stress case** — a genuine 24-page document, and the one file here where a blank render would be a finding. All pages render, no script. | **PASS — Acrobat, 2026-08-14.** Renders as a real document: "Quarterly Business Review" heading plus body text per page, pages sequential. **No JavaScript alert.** Byte-level confirmation: 24 pages in → 24 out, all 24 headings and all 55,422 content-stream bytes preserved exactly, while the 9 `/JS` tokens drop to 0 and `/OpenAction` + `/AA` are gone. `/Names` survives as an **empty** dictionary — the `/JavaScript` name tree holding the `app.alert` payload is gone, and an empty `/Names` gives Acrobat nothing to enumerate. |
 
 ### Priority 4 — PDF container layer (the 2026-08-14 sweep)
 
@@ -142,7 +144,19 @@ Word's verdicts therefore corroborate the Python-parser verdicts rather than con
 
 This file tests the opposite risk from the Word set, and it is worth being explicit about which claim it settles. The Word files asked whether a *real* viewer executes a part the Python parser thought was scrubbed. Here CDR removed exactly one ZIP entry — `xl/vbaProject.bin` — and rewrote nothing: both worksheet parts are byte-identical to the input. So the security claim was nearly settled by the entry list alone, and the open risk was **over-stripping** — Excel rejecting the rebuilt package, or recalculating on open and finding the cross-sheet reference broken. Neither happened. Excel therefore confirms fidelity; it does not add an independent security data point the way Word did.
 
-**Office is now complete: 5 of 5 PASS.** PowerPoint has no corpus file (`pptx_activex` is an excluded dead fixture, see below), so the remaining gap is **Acrobat** — the eight PDF files in Priorities 3 and 4.
+**Office is complete: 5 of 5 PASS.**
+
+## Acrobat — complete, 2026-08-14
+
+All eight PDFs opened in **Acrobat**. **8 of 8 PASS**: no JavaScript alert anywhere, no attachment offered, no network-location prompt, no password prompt.
+
+Three results carry more weight than the absence of an alert:
+
+- **`pdfc_encrypted_input.pdf` opened with no password prompt.** Encryption is genuinely stripped, not re-applied — which also means the sanitised output is inspectable by downstream tooling rather than opaque.
+- **`pdfc_incremental_update.pdf` resolved as a single document.** This is the actual confirmation that `pdf.save()` collapses a multi-revision container rather than leaving the newer JavaScript catalog reachable. It had only ever been checked against pikepdf, and it is precisely the container-layer claim a second parser could have contradicted.
+- **`pdf_javascript_realistic.pdf` kept every byte of its 24 pages** while losing all 9 `/JS` tokens. Full fidelity and full disarmament in the same file, in the viewer the format is named for.
+
+Two checks were settled structurally rather than by eye, because a blank page cannot show whether an attachment pane is populated: `/Names/EmbeddedFiles` is absent from both `pdf_embedded_file.pdf` and `pdf_multithreat.pdf`, with `/Filespec`+`/EmbeddedFile` token counts falling to zero, so Acrobat has nothing to enumerate. Where a payload container survives at all it survives **empty** — `pdf_javascript_realistic.pdf` keeps `/Names` as an empty dictionary, and the two `/AcroForm` files keep field geometry with no `/XFA` and no actions. That is the intended shape: structure preserved, behaviour removed.
 
 ## Interpreting the outcome
 
