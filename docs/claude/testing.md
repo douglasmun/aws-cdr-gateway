@@ -21,7 +21,7 @@
 > produce, since it never attempts the fetch. The manual pass therefore stands at **14 of 14 with
 > no engine unverified**. See `docs/viewer-validation/CHECKLIST.md`.
 
-Tests (397 in `test_cdr.py` + 50 in `test_cdr_local.py` = **447 total**) construct malicious fixtures entirely in-memory — no fixture files on disk. S3/SNS calls are patched with `unittest.mock`. Required env vars are set automatically via `os.environ.setdefault`. `src/test_cdr.py` covers the CDR Lambda; `src/test_cdr_local.py` covers the pure `cdr_dispatch` core and the local FastAPI service (`app.py`), reusing the same in-memory fixtures. Run: `cd src && pytest test_cdr.py test_cdr_local.py -v`.
+Tests (400 in `test_cdr.py` + 50 in `test_cdr_local.py` = **450 total**) construct malicious fixtures entirely in-memory — no fixture files on disk. S3/SNS calls are patched with `unittest.mock`. Required env vars are set automatically via `os.environ.setdefault`. `src/test_cdr.py` covers the CDR Lambda; `src/test_cdr_local.py` covers the pure `cdr_dispatch` core and the local FastAPI service (`app.py`), reusing the same in-memory fixtures. Run: `cd src && pytest test_cdr.py test_cdr_local.py -v`.
 
 > **Run it bare — do not export AWS env vars around it.** `src/conftest.py` sets the
 > credentials/region and `test_cdr.py` sets the bucket and topic names, both via
