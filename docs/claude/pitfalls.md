@@ -94,6 +94,7 @@ it is listed once, under the group whose code you would be editing.
 - [#58 — A MIME parameter defeats a `+xml` suffix test — and the OPC container-layer sweep that found nothing else](#58-a-mime-parameter-defeats-a-xml-suffix-test-and-the-opc-container-layer-sweep-that-found-nothing-else)
 - [#59 — A resource cap that `return`s hands the attacker the sweep's coverage — bound the work, but fail closed](#59-a-resource-cap-that-returns-hands-the-attacker-the-sweeps-coverage-bound-the-work-but-fail-closed)
 - [#60 — Auditing every cap's failure direction, and making "fail closed" a CI guard instead of a habit](#60-auditing-every-caps-failure-direction-and-making-fail-closed-a-ci-guard-instead-of-a-habit)
+- [#61 — The #60 audit enumerated caps it already knew about — `_MAX_WALK_NODES` was never on the list, and truncated in two sweeps](#61-the-60-audit-enumerated-caps-it-already-knew-about-_max_walk_nodes-was-never-on-the-list-and-truncated-in-two-sweeps)
 
 **Multi-bug audit batches**
 
@@ -386,6 +387,7 @@ The direct follow-up to #59: if one resource cap silently truncated, the others 
 | Cap | On exceeding | Correct? |
 |---|---|---|
 | `_PDF_WALK_MAX_NODES` | `CdrReject` | fixed in #59 |
+| `_MAX_WALK_NODES` (outlines, AcroForm) | `continue` / `break` → truncate | **NO — missed by this audit, fixed in #61** |
 | `_EXTERNAL_REF_SCAN_MAX_NODES` | `return True` (= "is external", so the subtree is removed) | yes — closed by design |
 | `_DecompressionBudget` / `_MAX_TOTAL_ENTRY_BYTES` | `CdrReject` | yes |
 | `_MAX_ZIP_ENTRIES` | `_validate_zip_structure` hard-fail verdict | yes |
@@ -400,3 +402,12 @@ That last row is why this guard is mutation-based rather than a grep for `return
 **Two things the guard needed in order not to become the very defect it checks for.** (a) **A baseline green run before any mutant means anything** — without it a broken checkout reports every mutant "caught" and the guard passes vacuously (#57). This fired immediately and usefully: the first version exported `SANITISED_BUCKET`/`QUARANTINE_BUCKET`, which the test module defaults with `os.environ.setdefault` — that *yields* to the environment, so five tests asserting the literal `test-sanitised`/`test-quarantine` names failed. The documented "run pytest BARE" rule, rediscovered by writing a tool that broke it. (b) **A negative control on the guard itself**: a deliberately unpinned `raise CdrReject` was injected and the guard correctly named it by line. A checker never shown failing is an assumption (#57 again).
 
 **General rule: when a review finds a bug class rather than a bug, the deliverable is the executable check, not the fixed instance.** This repo already had that instinct for docs (`check_test_count.py`, `check_cap_defaults.py`, `check_pitfalls_index.py`, `check_iac_parity.py`); security invariants deserve it more, because a doc drifting is embarrassing and a fail-open shipping is not. Related: #59 (the bug), #57 (instrument discipline), #53 (docstring vs behaviour).
+
+### 61. The #60 audit enumerated caps it already knew about — `_MAX_WALK_NODES` was never on the list, and truncated in two sweeps
+An external review (Codex, 2026-08-17) found the exact bug class #59 documents and #60 claimed to have swept clean, in a constant the #60 table never mentions.
+
+`_strip_pdf_outlines` ended its walk with `continue` and `_strip_acroform_fields` with `break` on reaching `_MAX_WALK_NODES` (100,000). Both then returned normally and `cdr_pdf` shipped the file as sanitised. Reproduced end to end: a **12.2 MiB** PDF with a 100,002-node outline chain and a **10.6 MiB** PDF with a 100,002-node `/Kids` chain each came back "sanitised" carrying live actions — well under the 100 MB `_MAX_FILE_BYTES`, so no size guard is in the way. Fixed to `raise CdrReject`, matching `_walk_pdf_nodes`. Pinned by `test_outline_walk_cap_rejects_rather_than_truncating` / `test_acroform_walk_cap_rejects_rather_than_truncating` (exception) and the two `_payload_never_ships` tests (outcome), so any silent-completion replacement still fails.
+
+**Why #60 missed it, and the lesson that is not "audit harder".** #60's table is a *hand-written enumeration* — ten constants someone remembered. `_MAX_WALK_NODES` is a *shared* cap used by two functions and named nothing like `_PDF_WALK_MAX_NODES`, so it fell out of recall. `check_fail_closed.py` could not catch it either: that guard mutates rejections that **exist** and asks whether a test notices; it is structurally blind to a cap that never raises in the first place. **A guard that verifies existing invariants cannot find a missing one.** The complement to `check_fail_closed.py` is enumeration from the source, not from memory: `grep -n '_MAX_[A-Z_]*\|_BUDGET' src/lambda_function.py` yields the real list, and every hit must be traced to an explicit failure direction before the audit counts as complete.
+
+**General rule: when a review concludes "no second instance", state how the instances were enumerated.** "I checked the caps" and "I listed every `_MAX_`/budget constant in the module and traced each" are different claims with the same wording, and only the second one is falsifiable. Related: #59 (the bug class), #60 (the audit that missed this), #57 (a check that cannot fail is not a check).

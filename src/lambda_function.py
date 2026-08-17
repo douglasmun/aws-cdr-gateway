@@ -1930,7 +1930,17 @@ def _strip_pdf_outlines(catalog) -> list[str]:
 
     while stack:
         node = stack.pop()
-        if node is None or visited_count >= _MAX_WALK_NODES:
+        if visited_count >= _MAX_WALK_NODES:
+            # FAIL CLOSED (pitfall #59/#60): `continue`-ing here drains the stack without
+            # examining it, so outline items beyond the cap keep their /A /AA actions and
+            # cdr_pdf still returns a "sanitised" file. Node count is attacker-controlled
+            # — a 100_002-node outline tree fits well under _MAX_FILE_BYTES.
+            logger.warning("PDF outline walk hit the %d-node cap; rejecting",
+                           _MAX_WALK_NODES)
+            raise CdrReject(
+                f"PDF outline tree exceeds the {_MAX_WALK_NODES}-node walk cap; "
+                "cannot prove all outline actions were stripped")
+        if node is None:
             continue
         try:
             ident = node.objgen
@@ -1974,7 +1984,14 @@ def _strip_acroform_fields(fields) -> list[str]:
     while stack:
         field = stack.pop()
         if visited_count >= _MAX_WALK_NODES:
-            break
+            # FAIL CLOSED (pitfall #59/#60): `break`ing here abandons the rest of the
+            # field tree, leaving deeper /JS /A /AA live in a file that is then reported
+            # sanitised. See the identical bound in _walk_pdf_nodes.
+            logger.warning("PDF AcroForm walk hit the %d-node cap; rejecting",
+                           _MAX_WALK_NODES)
+            raise CdrReject(
+                f"PDF AcroForm field tree exceeds the {_MAX_WALK_NODES}-node walk cap; "
+                "cannot prove all field actions were stripped")
         try:
             try:
                 ident = field.objgen

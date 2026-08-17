@@ -242,12 +242,12 @@ aws events list-targets-by-rule \
   --query 'Targets[].Arn'
 ```
 
-**OpenTofu / Terraform** — the EventBridge rule is named `cdr-s3-object-created`:
+**OpenTofu / Terraform** — the EventBridge rule is named `${resource_prefix}-s3-object-created`, i.e. `$PREFIX-s3-object-created` (it is *not* the fixed string `cdr-s3-object-created` unless you deployed with the default prefix):
 ```bash
 ( cd terraform && tofu state list )          # resource inventory
 
 aws events list-targets-by-rule \
-  --rule cdr-s3-object-created \
+  --rule $PREFIX-s3-object-created \
   --query 'Targets[].Arn'
 ```
 
@@ -356,17 +356,25 @@ aws cloudwatch get-metric-statistics \
   --extended-statistics p50 p99 \
   --query 'Datapoints[0].{p50:ExtendedStatistics.p50,p99:ExtendedStatistics.p99}'
 
-# Max memory used
-aws cloudwatch get-metric-statistics \
-  --namespace AWS/Lambda \
-  --metric-name MaxMemoryUsed \
-  --dimensions Name=FunctionName,Value=$PREFIX-lambda \
-  --start-time $START \
-  --end-time   $END \
-  --period 600 \
-  --statistics Maximum \
-  --query 'Datapoints[0].Maximum'
+# Max memory used — NOT a CloudWatch metric. `MaxMemoryUsed` does not exist in the
+# AWS/Lambda namespace; querying it returns an empty Datapoints list, which reads as
+# "no memory pressure" when it actually means "no such metric". The number lives only
+# in the Lambda REPORT log line, so pull it from Logs Insights (this is what
+# docs/benchmark.py does):
+START_EPOCH=$(python3 -c "from datetime import datetime,timezone,timedelta; print(int((datetime.now(timezone.utc)-timedelta(minutes=10)).timestamp()))")
+END_EPOCH=$(python3   -c "from datetime import datetime,timezone; print(int(datetime.now(timezone.utc).timestamp()))")
+QID=$(aws logs start-query \
+  --log-group-name /aws/lambda/$PREFIX-lambda \
+  --start-time $START_EPOCH \
+  --end-time   $END_EPOCH \
+  --query-string 'filter @message like /REPORT/ | parse @message "Max Memory Used: * MB" as mem | stats max(mem) as max_mem' \
+  --query queryId --output text)
+sleep 5
+aws logs get-query-results --query-id "$QID" --query 'results[0][0].value'
 ```
+
+Or skip the manual queries entirely and run `python docs/benchmark.py --bucket <source-bucket>`,
+which reports p50/p99 duration, throttles and max memory in one pass.
 
 ### Tuning thresholds
 
@@ -374,7 +382,7 @@ aws cloudwatch get-metric-statistics \
 |---|---|---|
 | p99 Duration > 250 s | Timeout = 300 s | Increase `Timeout` in `template.yaml`; re-deploy |
 | p99 Duration > 200 s on PDFs | 1024 MB memory | Increase `MemorySize` (Lambda CPU scales with RAM) |
-| MaxMemoryUsed > 900 MB | 1024 MB memory | Increase `MemorySize` to 2048 MB |
+| Max Memory Used > 900 MB (REPORT log line) | 1024 MB memory | Increase `MemorySize` to 2048 MB |
 | Throttles > 0 | `ReservedConcurrentExecutions: 20` | Increase reservation if throughput SLA demands it |
 | DLQ depth > 0 | — | Inspect DLQ messages: `aws sqs receive-message --queue-url <DLQ_URL>` |
 
@@ -499,7 +507,7 @@ RULE_NAME=$(aws cloudformation describe-stack-resource \
 aws events describe-rule --name "$RULE_NAME"             --query 'State'
 
 # OpenTofu / Terraform:
-aws events describe-rule --name cdr-s3-object-created    --query 'State'
+aws events describe-rule --name $PREFIX-s3-object-created --query 'State'
 ```
 If disabled, enable it with `aws events enable-rule --name <rule>`.
 
