@@ -25,6 +25,15 @@ path** — only the deploy and teardown commands differ. Section 8 (cleanup) and
 > at `AWS::EarlyValidation::ResourceExistenceCheck`, choose a distinct prefix; never delete
 > the resource holding the name (see Section 9).
 >
+> **This is not hypothetical, and the failure is silent rather than loud** (verified in
+> ap-southeast-1, 2026-08-17): `cdr-lambda`, `cdr-alarm-topic`, `cdr-result-topic`,
+> `cdr-lambda-dlq` and the rule `cdr-s3-object-created` all already exist there, unmanaged
+> by CloudFormation, wired together and serving traffic. A verification command left at the
+> `cdr` default does **not** error — `describe-rule` on the default-prefix rule answers
+> `ENABLED` and targets that live function, so you get a green light about a stack that is
+> not yours. Confirm your prefix appears in the output before believing it.
+>
+
 > Every command below uses `$PREFIX`. Export it once, matching your deployed value:
 >
 > ```bash
