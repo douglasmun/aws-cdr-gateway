@@ -1801,6 +1801,45 @@ class TestAcroFormJSSweep:
         assert len(removed) == depth, \
             f"only {len(removed)}/{depth} fields swept — deep chain silently truncated"
 
+    def _kids_chain_pdf(self, depth):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        prev = None
+        for i in range(depth):
+            field = pdf.make_indirect(pikepdf.Dictionary(
+                T=pikepdf.String(f"f{i}"),
+                FT=pikepdf.Name("/Tx"),
+                JS=pikepdf.String("app.alert('CAPTAIL');"),
+            ))
+            if prev is not None:
+                field["/Kids"] = pikepdf.Array([prev])
+            prev = field
+        pdf.Root["/AcroForm"] = pikepdf.Dictionary(Fields=pikepdf.Array([prev]))
+        buf = io.BytesIO()
+        pdf.save(buf, compress_streams=False)
+        return buf.getvalue()
+
+    # ── Audit fix: the field-tree cap `break`ed, abandoning the rest of the /Kids chain
+    #    while cdr_pdf still reported the file sanitised. Same failure direction as the
+    #    outline cap and _walk_pdf_nodes — bound the work, but fail closed (pitfall #59) ──
+    def test_acroform_walk_cap_rejects_rather_than_truncating(self, monkeypatch):
+        monkeypatch.setattr(cdr, "_MAX_WALK_NODES", 10)
+        raw = self._kids_chain_pdf(40)
+        assert b"CAPTAIL" in raw  # precondition: payload really is in the input
+        with pytest.raises(cdr.CdrReject, match="walk cap"):
+            cdr.cdr_pdf(raw)
+
+    def test_acroform_walk_cap_payload_never_ships(self, monkeypatch):
+        """Pins the outcome, not the exception."""
+        monkeypatch.setattr(cdr, "_MAX_WALK_NODES", 10)
+        raw = self._kids_chain_pdf(40)
+        try:
+            clean, _ = cdr.cdr_pdf(raw)
+        except cdr.CdrReject:
+            return
+        assert b"CAPTAIL" not in clean, \
+            "over-cap AcroForm field actions survived into the sanitised output"
+
 
 class TestPdfNamesEmbeddedFiles:
     """PDF /Names./EmbeddedFiles is removed."""
@@ -3063,6 +3102,51 @@ class TestDenylistGaps:
             removed = cdr._strip_pdf_outlines(out.Root)
         assert len(removed) == depth, \
             f"only {len(removed)}/{depth} outline nodes swept — deep chain silently truncated"
+
+    def _outline_chain_pdf(self, depth):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page()
+        first = None
+        prev = None
+        for i in range(depth):
+            item = pdf.make_indirect(pikepdf.Dictionary(
+                Title=pikepdf.String(f"item{i}"),
+                A=pikepdf.Dictionary(S=pikepdf.Name("/JavaScript"),
+                                     JS=pikepdf.String("app.alert('CAPTAIL')")),
+            ))
+            if prev is not None:
+                prev["/Next"] = item
+            else:
+                first = item
+            prev = item
+        pdf.Root["/Outlines"] = pikepdf.Dictionary(
+            Type=pikepdf.Name("/Outlines"), First=first, Last=prev, Count=depth)
+        buf = io.BytesIO()
+        pdf.save(buf, compress_streams=False)
+        return buf.getvalue()
+
+    # ── Audit fix: the outline cap `continue`d, draining the stack without examining it,
+    #    so outline items past the cap kept their /A /AA and cdr_pdf still returned a
+    #    "sanitised" file. Node count is attacker-controlled (a 100_002-node outline tree
+    #    is ~12 MB, far under _MAX_FILE_BYTES) — the cap must fail closed (pitfall #59) ──
+    def test_outline_walk_cap_rejects_rather_than_truncating(self, monkeypatch):
+        monkeypatch.setattr(cdr, "_MAX_WALK_NODES", 10)
+        raw = self._outline_chain_pdf(40)
+        assert b"CAPTAIL" in raw  # precondition: payload really is in the input
+        with pytest.raises(cdr.CdrReject, match="walk cap"):
+            cdr.cdr_pdf(raw)
+
+    def test_outline_walk_cap_payload_never_ships(self, monkeypatch):
+        """Pins the outcome, not the exception: an over-cap outline tree must never reach
+        the sanitised bucket with live actions, whatever path replaces CdrReject."""
+        monkeypatch.setattr(cdr, "_MAX_WALK_NODES", 10)
+        raw = self._outline_chain_pdf(40)
+        try:
+            clean, _ = cdr.cdr_pdf(raw)
+        except cdr.CdrReject:
+            return
+        assert b"CAPTAIL" not in clean, \
+            "over-cap outline actions survived into the sanitised output"
 
     def test_pdf_goToE_annotation_action_stripped(self):
         """/GoToE (re-reaches embedded files) was not in the old denylist; the new
