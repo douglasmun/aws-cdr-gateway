@@ -102,6 +102,17 @@ jobs:
         # contract: ~90 `pitfall #N` references point at these headings.
         run: python scripts/check_pitfalls_index.py
 
+      - name: Check runbook commands do not hardcode a prefixed resource name
+        working-directory: ${{ github.workspace }}
+        # Lambda/topic/DLQ/rule/alarm names derive from ResourcePrefix, and the runbook
+        # tells operators NOT to deploy at the `cdr` default (a live askkaifbot service
+        # owns those names in ap-southeast-1). A command hardcoding `cdr-<suffix>` sends
+        # the reader at a resource they do not have — or at somebody else's production.
+        # That shipped twice for the EventBridge rule. Suffixes are derived from the IaC
+        # at runtime, never hand-listed (pitfall #61); deliberate literals declare
+        # themselves with a reasoned `<!-- prefix-literal-ok: … -->` marker.
+        run: python scripts/check_runbook_prefix.py
+
       - name: Sweep OPC declaration mechanisms for unscrubbed parts
         working-directory: ${{ github.workspace }}
         # Regression harness for the bug class that produced pitfalls #54 and #55: OPC
