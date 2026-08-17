@@ -477,6 +477,7 @@ fires when another stack — or another IaC tool entirely — holds them.
 it is unmanaged or unused: it may be a live service managed by Terraform/CDK from a
 different repo. Identify the owner before doing anything:
 
+<!-- prefix-literal-ok: this whole block investigates the FOREIGN cdr-lambda that already owns the name — $PREFIX would point at the reader's own stack and defeat the check -->
 ```bash
 # Is it serving traffic? Recent log activity is the fastest tell.
 aws logs tail /aws/lambda/cdr-lambda --since 30d --format short | tail -20
