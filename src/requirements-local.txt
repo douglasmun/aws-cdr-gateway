@@ -4,7 +4,7 @@
 # The Lambda build (template.yaml) uses requirements.txt only, so these never bloat the
 # deployed package.
 
-fastapi==0.141.1         # local HTTP CDR service framework
+fastapi==0.142.2         # local HTTP CDR service framework
 uvicorn==0.52.1          # ASGI server for app.py
 python-multipart==0.0.32 # multipart/form-data parsing for file uploads
 httpx2==2.10.0            # Starlette/FastAPI TestClient dependency (test_cdr_local.py); httpx is deprecated for the TestClient
